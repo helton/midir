@@ -52,6 +52,11 @@ cmd = "midir"
 help = "Run the regression suite (offline: scripted StackSpot, official SDKs; ~10 s)"
 cmd = "pytest -q"
 
+[tool.poe.tasks.test-mitm]
+help = "Check that the observability stack's mitmproxy streams SSE through (downloads mitmproxy with uvx on first use)"
+cmd = "pytest -q tests/test_mitm_stream.py"
+env = { MIDIR_TEST_MITM = "1" }
+
 [tool.poe.tasks.smoke]
 help = "Live acceptance against a running gateway with the official SDKs (25 checks; uses real StackSpot requests)"
 cmd = "python scripts/smoke.py --base ${base}"

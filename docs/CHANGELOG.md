@@ -5,6 +5,10 @@ release may change configuration or behavior.
 
 ## Unreleased
 
+- **Streaming through the observability stack fixed**: mitmproxy buffered whole responses, so on port 18880 tokens
+  and keepalives reached clients only when generation was over, and StackSpot's stream reached Midir the same way.
+  An addon (`docker/mitm/sse_stream.py`) streams `text/event-stream` responses through in both directions and keeps a
+  copy for mitmweb; `uv run poe test-mitm` checks it.
 - **Every build says what it is**: only a release reports the bare version; a `develop` snapshot is
   `0.0.1+dev.<commit>`, a local image `0.0.1+local.<commit>`, a source checkout `0.0.1+src.<commit>` (`.dirty` with
   uncommitted changes), shown by `midir --version`, the startup banner, `/health`, `/ready` and telemetry.

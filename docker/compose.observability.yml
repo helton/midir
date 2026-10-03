@@ -41,11 +41,13 @@ services:
       --set web_host=0.0.0.0 --set web_port=18882 --set web_password=gateway
       --mode reverse:http://midir:18880@18880
       --mode regular@8080
+      -s /addons/sse_stream.py
     ports:
       - "127.0.0.1:18880:18880"
       - "127.0.0.1:18882:18882"
     volumes:
       - ./data/mitm:/data/mitm   # the proxy's own data only (CA and config)
+      - ./mitm/sse_stream.py:/addons/sse_stream.py:ro   # streams SSE through instead of buffering it (keepalives, tokens)
     healthcheck:
       test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 18882), 2).close()"]
       interval: 5s
