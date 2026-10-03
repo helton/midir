@@ -47,13 +47,13 @@ class TextBackend(ABC):
 
     type: str = ""
 
-    def __init__(self, settings: BackendSettings, env: dict[str, str] | None = None, telemetry: Telemetry | None = None) -> None:
+    def __init__(self, settings: BackendSettings, env: dict[str, str] | None = None, telemetry: Telemetry | None = None, backoff_s: float = 1.0) -> None:
         self.name = settings.name
         self.settings = settings
         self.env = env or {}
         self.telemetry = telemetry or Telemetry()
         self.limiter = UpstreamLimiter(settings.limits, self.telemetry, backend=self.name)
-        self.retry: dict[str, Any] = dict(retry=retry_if_exception(is_retryable), stop=stop_after_attempt(4), wait=wait_exponential(multiplier=1, min=1, max=4),
+        self.retry: dict[str, Any] = dict(retry=retry_if_exception(is_retryable), stop=stop_after_attempt(4), wait=wait_exponential(multiplier=backoff_s, min=backoff_s, max=4 * backoff_s),
                                           before_sleep=self._log_retry, reraise=True)
 
     def _log_retry(self, state: RetryCallState) -> None:

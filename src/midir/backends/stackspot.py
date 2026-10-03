@@ -65,8 +65,8 @@ class StackSpotBackend(TextBackend):
 
     type = "stackspot"
 
-    def __init__(self, settings: BackendSettings, env: dict[str, str] | None = None, telemetry: Telemetry | None = None) -> None:
-        super().__init__(settings, env, telemetry)
+    def __init__(self, settings: BackendSettings, env: dict[str, str] | None = None, telemetry: Telemetry | None = None, backoff_s: float = 1.0) -> None:
+        super().__init__(settings, env, telemetry, backoff_s)
         o, e = settings.options, self.env
 
         def get(key: str, env_name: str, default: Any) -> Any:

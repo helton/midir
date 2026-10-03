@@ -43,6 +43,7 @@ def test_idm_failure_is_401_to_the_client(app_client, upstream):
 
 # ---------------------------------------------------------------- retries
 
+@pytest.mark.inprocess  # reads the recorded waits
 def test_retry_backoff_is_1_2_4_seconds(app_client, upstream, sleeps):
     upstream.add(*[Reply(status=503, body={"message": "busy"})] * 3, "finally")
     r = chat(app_client)

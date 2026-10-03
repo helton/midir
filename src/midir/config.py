@@ -79,6 +79,7 @@ class ServerSettings:
     responses_retention_days: float = 30.0
     responses_max_mb: float = 500.0
     keepalive_s: float = 15.0  # SSE keepalive while a stream waits for its first content (0 = off)
+    retry_backoff_s: float = 1.0  # first backend retry wait; then doubled (1, 2, 4 s). Tests use a tiny value
 
 
 @dataclass
@@ -163,7 +164,8 @@ class Config:
             responses_dir=(Path(rdir) if Path(rdir).is_absolute() else self.root / rdir) if rdir else None,
             responses_retention_days=float(self._get(s, "responses_retention_days", "MIDIR_RESPONSES_RETENTION_DAYS", 30)),
             responses_max_mb=float(self._get(s, "responses_max_mb", "MIDIR_RESPONSES_MAX_MB", 500)),
-            keepalive_s=float(self._get(s, "keepalive_s", "MIDIR_KEEPALIVE_S", 15)))
+            keepalive_s=float(self._get(s, "keepalive_s", "MIDIR_KEEPALIVE_S", 15)),
+            retry_backoff_s=float(self._get(s, "retry_backoff_s", "MIDIR_RETRY_BACKOFF_S", 1)))
 
     def _backends(self, raw: dict) -> dict[str, BackendSettings]:
         """Every [backends.<name>] table; with none, one StackSpot backend configured from the environment alone."""

@@ -27,7 +27,7 @@ class Gateway:
     def __init__(self, config: Config, telemetry: Telemetry | None = None, backends: dict[str, TextBackend] | None = None, store: ResponseStore | None = None) -> None:
         self.config = config
         self.telemetry = telemetry or Telemetry()
-        self.backends = backends if backends is not None else {name: create_backend(s, config.env, self.telemetry) for name, s in config.backends.items()}
+        self.backends = backends if backends is not None else {name: create_backend(s, config.env, self.telemetry, config.server.retry_backoff_s) for name, s in config.backends.items()}
         self.runners: dict[str, Runner] = {name: EmulationEngine(b, config) for name, b in self.backends.items()}
         s = config.server
         self.store = store if store is not None else ResponseStore(s.responses_dir, s.responses_retention_days, s.responses_max_mb)

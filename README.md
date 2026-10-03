@@ -111,9 +111,11 @@ Ready configurations in [examples/clients/](examples/clients/) (with a README wh
 | DeepSeek Harness (`dsh`) | Chat Completions | `deepseek-harness/cordis.patch.yml` |
 | OpenClaw | Chat Completions or Responses | `openclaw/openclaw.json` |
 
-All five were validated end to end on the three models (multi-file edits, tests, commits, and tool arguments with
-quotes, backslashes and tabs). Midir needs no API key; clients may send any value. For agents running on top of it,
-[docs/agent-brief.md](docs/agent-brief.md) explains what the emulation means for them.
+Validated end to end on the three models with Claude Code, GitHub Copilot CLI, Hermes Agent, DeepSeek Harness and
+OpenClaw (multi-file edits, tests, commits, and tool arguments with quotes, backslashes and tabs); GitHub Copilot in
+VS Code uses the same OpenAI APIs and is in daily use with the configuration above. Midir needs no API key; clients
+may send any value. For agents running on top of it, [docs/agent-brief.md](docs/agent-brief.md) explains what the
+emulation means for them.
 
 ## Endpoints
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from conftest import CHAT_TOOLS, RESP_TOOLS, Reply, sse_events, tool_call_text
 from midir.canonical import CanonicalRequest
 from midir.emulation.prompt import ASSISTANT_PREFILL_NUDGE, render_prompt
@@ -173,6 +175,7 @@ def test_truncation_keeps_system_and_recent_turns_and_tells_the_model():
 
 # ---------------------------------------------------------------- what the Responses store keeps
 
+@pytest.mark.inprocess  # reads the store's memory
 def test_stored_text_is_the_same_streaming_or_not(openai_client, upstream, gateway):
     reply = "Reading it.\n\n" + tool_call_text("read_file", {"path": "a.py"})
     upstream.add(reply, reply)

@@ -9,11 +9,11 @@ from midir.telemetry import Telemetry
 BACKEND_TYPES: dict[str, type[TextBackend]] = {StackSpotBackend.type: StackSpotBackend}
 
 
-def create_backend(settings: BackendSettings, env: dict[str, str] | None = None, telemetry: Telemetry | None = None) -> TextBackend:
+def create_backend(settings: BackendSettings, env: dict[str, str] | None = None, telemetry: Telemetry | None = None, backoff_s: float = 1.0) -> TextBackend:
     cls = BACKEND_TYPES.get(settings.type)
     if cls is None:
         raise ConfigError(f"backend {settings.name!r}: unknown type {settings.type!r} (available: {', '.join(sorted(BACKEND_TYPES))})")
-    return cls(settings, env, telemetry)
+    return cls(settings, env, telemetry, backoff_s)
 
 
 __all__ = ["BACKEND_TYPES", "Completion", "TextBackend", "StackSpotBackend", "create_backend"]

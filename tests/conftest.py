@@ -1,12 +1,14 @@
 """Shared fixtures for the regression suite: the real Midir app, a scripted StackSpot stand-in (httpx.MockTransport,
 nothing leaves the machine) and the official OpenAI/Anthropic SDKs pointed at the app.
 
-    uv run poe test            # or: uv run pytest -q
+    uv run poe test                        # in-process (the default)
+    MIDIR_IMPL=go uv run pytest -q         # black-box: the same tests against a running implementation (tests/blackbox.py)
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -21,6 +23,27 @@ from midir.config import Config
 from midir.gateway import Gateway
 
 ROOT = Path(__file__).resolve().parents[1]
+IMPL = os.environ.get("MIDIR_IMPL", "").strip()  # set: black-box mode against that implementation
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "inprocess: looks inside the Python process (skipped in black-box mode)")
+
+
+HTTP_FIXTURES = {"app_client", "openai_client", "anthropic_client"}
+INTERNAL_FIXTURES = {"caplog", "monkeypatch", "stackspot"}  # fixtures that only exist inside the Python process
+
+
+def pytest_collection_modifyitems(config, items):
+    """In black-box mode only tests that talk HTTP and do not look inside the process run: the `inprocess` marker, or no
+    HTTP client fixture, or an internals fixture (captured logs, patched objects, config objects)."""
+    if not IMPL:
+        return
+    skip = pytest.mark.skip(reason=f"in-process test; black-box mode ({IMPL})")
+    for item in items:
+        names = set(getattr(item, "fixturenames", ()))
+        if "inprocess" in item.keywords or not names & HTTP_FIXTURES or names & INTERNAL_FIXTURES:
+            item.add_marker(skip)
 
 MIDIR_TOML = """
 default_model = "gpt-5.1"
@@ -145,8 +168,14 @@ class Upstream:
 # ---------------------------------------------------------------------------------------------------------------------
 
 @pytest.fixture
-def upstream() -> Upstream:
-    return Upstream()
+def upstream():
+    if IMPL:
+        from blackbox import HttpUpstream
+        up = HttpUpstream(Reply)
+        yield up
+        up.close()
+    else:
+        yield Upstream()
 
 
 @pytest.fixture
@@ -165,9 +194,17 @@ def make_cfg(tmp_path):
 
 
 @pytest.fixture
-def gateway(request, make_cfg, upstream, sleeps):
-    """The real Gateway on the mock upstream. Parametrize indirectly with a TOML string to change the configuration."""
-    gw = Gateway(make_cfg(getattr(request, "param", MIDIR_TOML)))
+def gateway(request, make_cfg, upstream, sleeps, tmp_path):
+    """The real Gateway on the mock upstream (in black-box mode: the implementation as a process on the HTTP stand-in).
+    Parametrize indirectly with a TOML string to change the configuration."""
+    toml = getattr(request, "param", MIDIR_TOML)
+    if IMPL:
+        from blackbox import ServerProcess
+        server = ServerProcess(IMPL, toml, upstream, tmp_path / "server")
+        yield server
+        server.stop()
+        return
+    gw = Gateway(make_cfg(toml))
 
     async def fake_sleep(s: float) -> None:
         sleeps.append(s)
@@ -175,16 +212,22 @@ def gateway(request, make_cfg, upstream, sleeps):
     for backend in gw.backends.values():
         backend._http = httpx.AsyncClient(transport=httpx.MockTransport(upstream.handler))
         backend.retry["sleep"] = fake_sleep
-    return gw
+    yield gw
 
 
 @pytest.fixture
 def stackspot(gateway):
+    if IMPL:
+        pytest.skip("in-process only")
     return gateway.backends["stackspot"]
 
 
 @pytest.fixture
 def app_client(gateway):
+    if IMPL:
+        with httpx.Client(base_url=gateway.url, timeout=120) as c:
+            yield c
+        return
     from fastapi.testclient import TestClient
     with TestClient(build_app(gateway), raise_server_exceptions=False) as c:
         yield c
@@ -193,13 +236,15 @@ def app_client(gateway):
 @pytest.fixture
 def openai_client(app_client):
     import openai
-    return openai.OpenAI(base_url="http://testserver/v1", api_key="x", http_client=app_client, max_retries=0)
+    base = f"{app_client.base_url}".rstrip("/") + "/v1" if IMPL else "http://testserver/v1"
+    return openai.OpenAI(base_url=base, api_key="x", http_client=app_client, max_retries=0)
 
 
 @pytest.fixture
 def anthropic_client(app_client):
     import anthropic
-    return anthropic.Anthropic(base_url="http://testserver", api_key="x", http_client=app_client, max_retries=0)
+    base = f"{app_client.base_url}".rstrip("/") if IMPL else "http://testserver"
+    return anthropic.Anthropic(base_url=base, api_key="x", http_client=app_client, max_retries=0)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
