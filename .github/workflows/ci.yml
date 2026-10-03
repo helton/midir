@@ -47,11 +47,19 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
         uses: docker/metadata-action@v5
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index   # multi-arch: ghcr shows the index's description
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=dev
             type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.title=midir
+            org.opencontainers.image.description=Midir: OpenAI- and Anthropic-compatible gateway for LLM backends (StackSpot AI agents today)
+          annotations: |
+            org.opencontainers.image.title=midir
+            org.opencontainers.image.description=Midir: OpenAI- and Anthropic-compatible gateway for LLM backends (StackSpot AI agents today)
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -60,5 +68,6 @@ jobs:
           push: ${{ env.PUBLISH == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ env.PUBLISH == 'true' && steps.meta.outputs.annotations || '' }}   # index annotations only for the pushed multi-arch image
           cache-from: type=gha
           cache-to: type=gha,mode=max

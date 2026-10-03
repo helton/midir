@@ -24,7 +24,7 @@ git clone https://github.com/helton/midir && cd midir
 cp .env.example .env                                   # credentials and agent ids
 cp config/midir.example.toml config/midir.toml         # backends and models
 mkdir -p docker/data/gateway
-docker compose -f docker/compose.yml up -d             # pulls ghcr.io/helton/midir; http://127.0.0.1:18880/v1
+docker compose -f docker/compose.yml up -d             # pulls ghcr.io/helton/midir (public, ~30 MB, amd64 and arm64)
 curl -s http://127.0.0.1:18880/ready                   # {"ok": true, ...} once the credentials work
 ```
 
@@ -138,11 +138,13 @@ format; `previous_response_id` chains that survive restarts (30 days, 500 MB cap
   provides, or leaves pending an action the request ordered gets one follow-up appended to the same response.
 - Structured JSON is prompt + validation + one repair, not streamed incrementally.
 - `max_tokens` and `stop` are applied after generation; `count_tokens` is an estimate (4 chars per token).
+- While a stream waits for the backend's first content (it can take a minute), an SSE keepalive goes out every 15 s
+  (`[server] keepalive_s`) so clients and proxies with idle timeouts do not abort.
 - Above the prompt cap the oldest turns are dropped and the model is told; a backend refusal for input length is
   retried once with a proportionally smaller prompt.
 - Images, audio and files become a text placeholder; built-in provider tools (web search, ...) are omitted.
-- **Refused**: `logprobs`, `n > 1`, `/v1/embeddings`. **Accepted and ignored** (logged): `temperature`, `top_p`,
-  `seed`, `reasoning`, `thinking`, `cache_control`, `metadata`.
+- **Refused**: `logprobs`, `n > 1`, `/v1/embeddings`. **Accepted and ignored** (logged once per client): `temperature`,
+  `top_p`, `seed`, `reasoning`, `reasoning_effort`, `thinking`, `cache_control`, `metadata`.
 
 How the pieces fit, and how to add a backend: [docs/architecture.md](docs/architecture.md).
 
@@ -170,7 +172,8 @@ Binds to `127.0.0.1` and has **no authentication**: local use only; put somethin
 Everything a client sends (open files, terminal output) goes to the backend, as it would to any hosted LLM. Prompts
 are logged only with `--debug`, to stderr. The only data written to disk is the Responses store
 (`docker/data/gateway/responses`, or `data/gateway/responses` from source): conversation content in owner-only files
-(0600, folders 0700), kept 30 days, capped at 500 MB, not encrypted. `responses_dir = ""` keeps it in memory only.
+(0600, folders 0700), kept 30 days, capped at 500 MB, not encrypted. `responses_dir = ""` keeps it in memory only, and
+so does a folder that cannot be created (a container started without its data volume), with a warning in the log.
 
 ## Development
 
@@ -205,7 +208,7 @@ A push to `main` whose version was already released publishes nothing. To releas
 
 ```bash
 uv run poe bump [patch|minor|major|X.Y.Z]   # pyproject.toml, uv.lock and the default image tag in docker/compose.yml
-# rename the "unreleased" section of docs/CHANGELOG.md to "## X.Y.Z (date)", then commit
+# rename the "## Unreleased" section of docs/CHANGELOG.md to "## X.Y.Z (date)", then commit
 git push                                     # snapshot of the release candidate
 git checkout main && git merge --ff-only develop && git push && git checkout develop
 ```
@@ -214,10 +217,6 @@ git checkout main && git merge --ff-only develop && git push && git checkout dev
 `MIDIR_IMAGE=ghcr.io/helton/midir:dev docker compose -f docker/compose.yml up -d`. The version lives only in
 `pyproject.toml` (`midir --version`, `GET /health`, first log line); changes are listed in
 [docs/CHANGELOG.md](docs/CHANGELOG.md).
-
-## License
-
-[MIT](LICENSE).
 
 ## Troubleshooting
 
@@ -231,5 +230,11 @@ git checkout main && git merge --ff-only develop && git push && git checkout dev
 - **Log times in UTC**: containers run in UTC; set `TZ` in `.env` (for example `TZ=America/Sao_Paulo`) and recreate
   the container. Running from source uses the machine's time zone.
 - **Corporate TLS**: set `STACKSPOT_CA_BUNDLE` (and `UV_NATIVE_TLS=1` for uv itself).
-- **Pulling the image at work**: if the package is private, `docker login ghcr.io` with a token that has
-  `read:packages`; to use a mirror, set `MIDIR_IMAGE=<registry>/midir:<tag>` in the shell or `docker/.env`.
+- **Pulling the image**: `ghcr.io/helton/midir` is public, no login needed; for a registry mirror or a fork, set
+  `MIDIR_IMAGE=<registry>/midir:<tag>` in the shell or `docker/.env`.
+- **Name resolution behind a corporate proxy**: the image is Alpine-based (musl). If DNS behaves differently there,
+  build a Debian variant by changing both `FROM` lines of `docker/Dockerfile` to the `bookworm-slim` images.
+
+## License
+
+[MIT](LICENSE).

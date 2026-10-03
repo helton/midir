@@ -5,6 +5,7 @@ nothing leaves the machine) and the official OpenAI/Anthropic SDKs pointed at th
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections import deque
@@ -113,7 +114,7 @@ class Upstream:
     def prompts(self) -> list[str]:
         return [c["prompt"] for c in self.calls]
 
-    def handler(self, request: httpx.Request) -> httpx.Response:
+    async def handler(self, request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/oidc/oauth/token"):
             self.token_calls += 1
             if self.token_status != 200:
@@ -124,7 +125,7 @@ class Upstream:
         self.calls.append({"agent": agent, "prompt": body["user_prompt"], "auth": request.headers.get("authorization"), "body": body})
         r = self.script.popleft() if self.script else self.default
         if r.delay:
-            time.sleep(r.delay)
+            await asyncio.sleep(r.delay)  # the loop keeps running, as with a real slow backend
         if r.status != 200:
             return httpx.Response(r.status, json=r.body, headers=r.headers) if not isinstance(r.body, str) else httpx.Response(r.status, text=r.body, headers=r.headers)
         if r.raw is not None:

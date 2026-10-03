@@ -9,6 +9,7 @@ port = 18880
 max_prompt_chars = 1000000   # oldest history turns are dropped above this (StackSpot rejects inputs above 272k tokens)
 tail_reminder = true         # one-line tool-protocol reminder after the last turn (fewer "announce and stop" replies)
 tool_desc_max = 0            # truncate tool descriptions to N chars (0 = off): ~12% fewer input tokens, alters what clients send
+keepalive_s = 15             # streams waiting for the backend's first content get an SSE keepalive this often (0 = off)
 responses_dir = "data/gateway/responses"   # previous_response_id store (one small file per response, owner-only); "" = memory only
 responses_retention_days = 30   # fixed from creation; purged hourly; a later previous_response_id to a purged response gets a 404
 responses_max_mb = 500          # above this, the oldest responses are removed first

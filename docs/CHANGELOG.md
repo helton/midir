@@ -3,6 +3,21 @@
 All notable changes are listed here. Versions follow [Semantic Versioning](https://semver.org/); before 1.0.0 a minor
 release may change configuration or behavior.
 
+## Unreleased
+
+- **SSE keepalive** while a stream waits for the backend's first content: an SSE comment (`: keepalive`) in Chat
+  Completions and Responses, a `ping` event in Anthropic Messages, every `[server] keepalive_s` (15 s;
+  `MIDIR_KEEPALIVE_S`, 0 turns it off), and nothing once content flows. Backends took up to 97 s to start in the
+  2026-10-03 harness runs; clients and proxies with shorter idle timeouts would abort the stream.
+- **Quieter log**: parameters accepted without effect (Hermes sends `reasoning_effort` on every request: 64 of 74
+  warnings in that run) are reported once per client and set of parameters, at INFO; repeats go to DEBUG.
+- **No crash without the data volume**: when the Responses store folder cannot be created (for example `docker run`
+  without mounting `/data`), Midir logs a warning and keeps `previous_response_id` in memory instead of exiting.
+- **Image 64% smaller**: two-stage build on Alpine; the final image carries only Python and the locked dependencies
+  (no uv, no pip): 222 MB -> 81 MB, 85 MB -> 30 MB to download.
+- **Image description on ghcr.io**: the multi-arch images carry the description as manifest and index annotations
+  (the package page read "No description provided").
+
 ## 0.0.1 (2026-10-03)
 
 First public release, as **Midir**. The gateway was used daily before this, under other names (stackpilot,

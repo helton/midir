@@ -216,3 +216,16 @@ def test_done_report_saying_nothing_is_pending_is_left_alone(app_client, upstrea
         upstream.add(final)
         chat(app_client, tools=CHAT_TOOLS, messages=msgs)
     assert len(upstream.calls) == 3
+
+
+def test_ignored_parameters_reported_once_per_client(app_client, upstream, caplog):
+    """Hermes sends reasoning_effort on every request: one INFO line per client and set of parameters, then DEBUG only."""
+    caplog.set_level("DEBUG", logger="midir")
+    upstream.add("a", "b", "c")
+    for _ in range(2):
+        chat(app_client, reasoning_effort="medium")
+    chat(app_client, reasoning_effort="medium", temperature=0.2)
+    info = [r for r in caplog.records if "without effect" in r.getMessage() and r.levelname == "INFO"]
+    debug = [r for r in caplog.records if "without effect" in r.getMessage() and r.levelname == "DEBUG"]
+    warnings = [r for r in caplog.records if "without effect" in r.getMessage() and r.levelname == "WARNING"]
+    assert len(info) == 2 and len(debug) == 1 and not warnings  # second set of parameters is new: reported once too

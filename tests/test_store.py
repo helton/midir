@@ -106,3 +106,16 @@ def test_ids_that_are_not_ours_never_touch_the_disk(openai_client):
 
 def test_memory_only_mode(make_cfg):
     assert make_cfg(MIDIR_TOML.replace('responses_dir = "{responses_dir}"', 'responses_dir = ""')).server.responses_dir is None
+
+
+def test_unwritable_directory_falls_back_to_memory(tmp_path, caplog):
+    """`docker run` without the data volume: the store cannot create its folder; Midir starts anyway."""
+    from midir.store import ResponseStore
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    try:
+        store = ResponseStore(locked / "data" / "responses")
+    finally:
+        locked.chmod(0o700)
+    assert store.dir is None and "kept in memory only" in caplog.text

@@ -29,12 +29,23 @@ class EmulationEngine:
         self.backend = backend
         self.config = config
         self.learned_max_chars: dict[str, int] = {}  # target -> prompt cap learned from an input-too-long refusal
+        self._ignored_seen: set[tuple[str, tuple[str, ...]]] = set()  # (client, parameters) already reported
+
+    def _report_ignored(self, req: CanonicalRequest, rid: str) -> None:
+        """Parameters accepted without effect (temperature, reasoning_effort, ...): reported once per client and set of
+        parameters, at INFO, since clients send them on every request (Hermes: reasoning_effort); then only at DEBUG."""
+        key = (str(req.meta.get("client", "")), tuple(sorted(req.ignored)))
+        if key in self._ignored_seen:
+            log.debug("%s accepted parameters without effect: %s", rid, ", ".join(req.ignored))
+            return
+        self._ignored_seen.add(key)
+        log.info("%s accepted parameters without effect: %s (client %s; reported once per client)", rid, ", ".join(req.ignored), key[0] or "unknown")
 
     # ---- public runner contract ----
     async def run(self, req: CanonicalRequest, rid: str) -> AsyncIterator[Event]:
         """Event stream. JSON mode is fully buffered (CAVEAT: no incremental streaming) so it can be validated and repaired."""
         if req.ignored:
-            log.warning("%s accepted parameters without effect: %s", rid, ", ".join(req.ignored))
+            self._report_ignored(req, rid)
         if req.json_schema is not None:
             resp = await self._json_mode(req, rid)
             if resp.text:

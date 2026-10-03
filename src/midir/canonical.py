@@ -127,7 +127,7 @@ class CanonicalResponse:
 class Event:
     """One item of a response stream: text, a complete tool call, or the end (with the whole response)."""
 
-    kind: str  # text | tool_call | done
+    kind: str  # text | tool_call | done | keepalive (nothing yet: the transport should send a keepalive)
     text: str = ""
     call: ToolCall | None = None
     response: CanonicalResponse | None = None

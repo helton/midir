@@ -102,6 +102,8 @@ class ChatCompletions:
             elif ev.kind == "tool_call" and ev.call:
                 yield chunk({"tool_calls": [cls._tool_call(ev.call, n_calls)]})
                 n_calls += 1
+            elif ev.kind == "keepalive":
+                yield ": keepalive\n\n"  # SSE comment: ignored by parsers, keeps idle-timeout proxies and clients waiting
             elif ev.kind == "done" and ev.response:
                 yield chunk({}, finish=cls.finish_reason(ev.response), usage=cls.usage(ev.response.usage) if include_usage else None)
         yield "data: [DONE]\n\n"

@@ -120,6 +120,8 @@ class Messages:
                 yield ev("content_block_delta", {"index": index, "delta": {"type": "input_json_delta", "partial_json": json.dumps(cls.tool_input(e.call), ensure_ascii=False)}})
                 yield ev("content_block_stop", {"index": index})
                 index += 1
+            elif e.kind == "keepalive":
+                yield ev("ping", {})  # Anthropic's own keepalive event
             elif e.kind == "done":
                 final = e.response
         if text_open:

@@ -5,7 +5,8 @@ the file. An environment variable with the same meaning always wins over the fil
 machines override without editing it). Format: config/midir.example.toml.
 
     default_model = "gpt-5.1"
-    [server]    port, max_prompt_chars, tail_reminder, tool_desc_max, responses_dir, responses_retention_days, responses_max_mb
+    [server]    port, max_prompt_chars, tail_reminder, tool_desc_max, keepalive_s, responses_dir, responses_retention_days,
+                responses_max_mb
     [telemetry] otlp_endpoint, service_name
     [backends.<name>]          type (default: the name) + the backend's own keys (see midir.backends)
     [backends.<name>.limits]   max_concurrent, requests_per_minute, queue_timeout_s, cooldown_on_429_s
@@ -77,6 +78,7 @@ class ServerSettings:
     responses_dir: Path | None = Path("data/gateway/responses")  # previous_response_id store; None = memory only
     responses_retention_days: float = 30.0
     responses_max_mb: float = 500.0
+    keepalive_s: float = 15.0  # SSE keepalive while a stream waits for its first content (0 = off)
 
 
 @dataclass
@@ -160,7 +162,8 @@ class Config:
             tool_desc_max=int(self._get(s, "tool_desc_max", "MIDIR_TOOL_DESC_MAX", 0)),
             responses_dir=(Path(rdir) if Path(rdir).is_absolute() else self.root / rdir) if rdir else None,
             responses_retention_days=float(self._get(s, "responses_retention_days", "MIDIR_RESPONSES_RETENTION_DAYS", 30)),
-            responses_max_mb=float(self._get(s, "responses_max_mb", "MIDIR_RESPONSES_MAX_MB", 500)))
+            responses_max_mb=float(self._get(s, "responses_max_mb", "MIDIR_RESPONSES_MAX_MB", 500)),
+            keepalive_s=float(self._get(s, "keepalive_s", "MIDIR_KEEPALIVE_S", 15)))
 
     def _backends(self, raw: dict) -> dict[str, BackendSettings]:
         """Every [backends.<name>] table; with none, one StackSpot backend configured from the environment alone."""

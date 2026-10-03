@@ -177,6 +177,8 @@ class Responses:
                 done_item = {**item, "status": "completed"}
                 items.append(done_item)
                 yield ev("response.output_item.done", {"output_index": index, "item": done_item})
+            elif e.kind == "keepalive":
+                yield ": keepalive\n\n"  # SSE comment: ignored by parsers, keeps idle-timeout proxies and clients waiting
             elif e.kind == "done":
                 final = e.response
         if msg_id:

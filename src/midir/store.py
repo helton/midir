@@ -33,9 +33,14 @@ class ResponseStore:
         self.max_bytes = int(max_mb * 1024 * 1024)
         self.memory: "OrderedDict[str, Entry]" = OrderedDict()
         if self.dir:
-            (self.dir / "blobs").mkdir(parents=True, exist_ok=True)
-            for d in (self.dir, self.dir / "blobs"):
-                d.chmod(0o700)  # conversation content: readable by the owner only
+            try:
+                (self.dir / "blobs").mkdir(parents=True, exist_ok=True)
+                for d in (self.dir, self.dir / "blobs"):
+                    d.chmod(0o700)  # conversation content: readable by the owner only
+            except OSError as e:  # e.g. the container started without its data volume: run, but say so
+                log.warning("responses store: cannot use %s (%s); previous_response_id is kept in memory only (lost on restart)", self.dir, e)
+                self.dir = None
+                return
             log.info("responses store: %s (retention %g days from creation, max %g MB)", self.dir, retention_days, max_mb)
             self.purge()
 

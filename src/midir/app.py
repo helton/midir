@@ -14,7 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from midir import __version__ as VERSION
-from midir.canonical import estimate_tokens
+from midir.canonical import Event, estimate_tokens
 from midir.config import DEFAULT_MODEL_NAME
 from midir.emulation.prompt import render_prompt
 from midir.errors import BackendError, ClientError
@@ -45,6 +45,46 @@ def stream_error(flavor: str, message: str, typ: str) -> str:
     return f"data: {json.dumps({'error': {'message': message, 'type': typ, 'code': None, 'param': None}}, ensure_ascii=False)}\n\ndata: [DONE]\n\n"
 
 
+async def with_keepalive(events: AsyncIterator[Event], interval: float) -> AsyncIterator[Event]:
+    """Pass `events` through, adding a keepalive event every `interval` seconds while no content (text or tool call)
+    has arrived yet: backends can take a minute or more to start, and clients or proxies with shorter idle timeouts
+    would abort the stream. Nothing is added once content flows. interval <= 0 disables it."""
+    it = events.__aiter__()
+    if interval <= 0:
+        async for e in it:
+            yield e
+        return
+    pending: asyncio.Future | None = None
+    content = False
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(it.__anext__())
+            if not content:
+                done, _ = await asyncio.wait({pending}, timeout=interval)  # never cancels the pending step
+                if not done:
+                    yield Event("keepalive")
+                    continue
+            try:
+                e = await pending
+            except StopAsyncIteration:
+                return
+            finally:
+                pending = None
+            content = content or e.kind in ("text", "tool_call")
+            yield e
+    finally:
+        if pending is not None and not pending.done():  # the client went away while the backend was still silent
+            pending.cancel()
+            try:
+                await pending
+            except BaseException:
+                pass
+        aclose = getattr(it, "aclose", None)
+        if aclose:
+            await aclose()
+
+
 async def guarded(gen: AsyncIterator[str], rid: str, flavor: str) -> AsyncIterator[str]:
     try:
         async for chunk in gen:
@@ -64,6 +104,7 @@ async def guarded(gen: AsyncIterator[str], rid: str, flavor: str) -> AsyncIterat
 
 def build_app(gateway: Gateway) -> FastAPI:
     store, telemetry = gateway.store, gateway.telemetry
+    keepalive_s = gateway.config.server.keepalive_s
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -166,7 +207,7 @@ def build_app(gateway: Gateway) -> FastAPI:
         if not stream:
             return ChatCompletions.response(await telemetry.observe_complete(runner.complete(req, cid), req, cid), cid, created, model_name)
         include_usage = bool((body.get("stream_options") or {}).get("include_usage", True))
-        events = telemetry.observe(runner.run(req, cid), req, cid)
+        events = with_keepalive(telemetry.observe(runner.run(req, cid), req, cid), keepalive_s)
         return StreamingResponse(guarded(ChatCompletions.stream(events, cid, created, model_name, include_usage), cid, "openai"), media_type="text/event-stream", headers=SSE_HEADERS)
 
     # ---- OpenAI Responses ----
@@ -177,7 +218,7 @@ def build_app(gateway: Gateway) -> FastAPI:
         req, runner, model_name, stream = prepare(request, body, Responses, "responses", rid, store=store)
         if not stream:
             return Responses.complete_response(body, rid, created, model_name, req, await telemetry.observe_complete(runner.complete(req, rid), req, rid), store)
-        events = telemetry.observe(runner.run(req, rid), req, rid)
+        events = with_keepalive(telemetry.observe(runner.run(req, rid), req, rid), keepalive_s)
         return StreamingResponse(guarded(Responses.stream(events, body, rid, created, model_name, req, store), rid, "responses"), media_type="text/event-stream", headers=SSE_HEADERS)
 
     @app.get("/v1/responses/{rid}")
@@ -196,7 +237,7 @@ def build_app(gateway: Gateway) -> FastAPI:
         req, runner, model_name, stream = prepare(request, body, Messages, "messages", mid)
         if not stream:
             return Messages.response(await telemetry.observe_complete(runner.complete(req, mid), req, mid), mid, model_name)
-        events = telemetry.observe(runner.run(req, mid), req, mid)
+        events = with_keepalive(telemetry.observe(runner.run(req, mid), req, mid), keepalive_s)
         return StreamingResponse(guarded(Messages.stream(events, mid, model_name), mid, "anthropic"), media_type="text/event-stream", headers=SSE_HEADERS)
 
     @app.post("/v1/messages/count_tokens")
