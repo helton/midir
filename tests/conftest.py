@@ -28,6 +28,7 @@ IMPL = os.environ.get("MIDIR_IMPL", "").strip()  # set: black-box mode against t
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "inprocess: looks inside the Python process (skipped in black-box mode)")
+    config.addinivalue_line("markers", "blackbox: runs only in black-box mode, with its own processes")
 
 
 HTTP_FIXTURES = {"app_client", "openai_client", "anthropic_client"}
@@ -42,6 +43,8 @@ def pytest_collection_modifyitems(config, items):
     skip = pytest.mark.skip(reason=f"in-process test; black-box mode ({IMPL})")
     for item in items:
         names = set(getattr(item, "fixturenames", ()))
+        if "blackbox" in item.keywords:
+            continue
         if "inprocess" in item.keywords or not names & HTTP_FIXTURES or names & INTERNAL_FIXTURES:
             item.add_marker(skip)
 
@@ -236,15 +239,17 @@ def app_client(gateway):
 @pytest.fixture
 def openai_client(app_client):
     import openai
-    base = f"{app_client.base_url}".rstrip("/") + "/v1" if IMPL else "http://testserver/v1"
-    return openai.OpenAI(base_url=base, api_key="x", http_client=app_client, max_retries=0)
+    if IMPL:
+        return openai.OpenAI(base_url=f"{app_client.base_url}".rstrip("/") + "/v1", api_key="x", max_retries=0, timeout=120)
+    return openai.OpenAI(base_url="http://testserver/v1", api_key="x", http_client=app_client, max_retries=0)
 
 
 @pytest.fixture
 def anthropic_client(app_client):
     import anthropic
-    base = f"{app_client.base_url}".rstrip("/") if IMPL else "http://testserver"
-    return anthropic.Anthropic(base_url=base, api_key="x", http_client=app_client, max_retries=0)
+    if IMPL:
+        return anthropic.Anthropic(base_url=f"{app_client.base_url}".rstrip("/"), api_key="x", max_retries=0, timeout=120)
+    return anthropic.Anthropic(base_url="http://testserver", api_key="x", http_client=app_client, max_retries=0)
 
 
 # ---------------------------------------------------------------------------------------------------------------------

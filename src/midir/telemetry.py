@@ -120,7 +120,9 @@ class Telemetry:
         log.info("telemetry on: OTLP/HTTP -> %s (service %s)", endpoint, service_name)
 
     def shutdown(self) -> None:
-        if self.enabled:
+        """Flush and stop the exporters; safe to call twice (the app's shutdown, then atexit)."""
+        if self.enabled and not getattr(self, "_closed", False):
+            self._closed = True
             self._tp.shutdown()
             self._mp.shutdown()
 

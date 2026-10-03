@@ -34,8 +34,11 @@ IMPLS = {
 
 
 def impl_command(name: str) -> list[str]:
+    """MIDIR_IMPL_CMD replaces the command of the implementation under test only, never the Python reference."""
     custom = os.environ.get("MIDIR_IMPL_CMD")
-    return shlex.split(custom) if custom else IMPLS[name]
+    if custom and name == os.environ.get("MIDIR_IMPL"):
+        return shlex.split(custom)
+    return IMPLS[name]
 
 
 def free_port() -> int:
@@ -100,18 +103,23 @@ class HttpUpstream:
                 parts = [f"data: {json.dumps(e) if not isinstance(e, str) else e}\r\n\r\n".encode() for e in events]
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Connection", "close")
+                self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
-                self.close_connection = True
+
+                def chunk(data: bytes) -> None:
+                    self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+                    self.wfile.flush()
+
                 if r.break_after is not None:
                     for p in parts[: r.break_after]:
-                        self.wfile.write(p)
-                        self.wfile.flush()
-                    self.connection.shutdown(socket.SHUT_RDWR)  # dropped mid-stream
+                        chunk(p)
+                    self.close_connection = True
+                    self.connection.shutdown(socket.SHUT_RDWR)  # dropped mid-stream: no terminating chunk
                     return
                 for p in parts:
-                    self.wfile.write(p)
-                    self.wfile.flush()
+                    chunk(p)
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True

@@ -120,8 +120,11 @@ def build_app(gateway: Gateway) -> FastAPI:
         if task:
             task.cancel()
         await gateway.aclose()
+        await asyncio.to_thread(telemetry.shutdown)  # flush pending spans and metrics on a graceful stop (SIGTERM)
 
-    app = FastAPI(title="midir", version=VERSION, lifespan=lifespan)
+    # FastAPI's own telemetry is off: it would export a span per health check and dependency, under its own resource,
+    # alongside Midir's request spans (midir.telemetry), which carry what matters
+    app = FastAPI(title="midir", version=VERSION, lifespan=lifespan, telemetry={"tracing": False, "metrics": False, "auto_configure": False})
 
     def is_anthropic(request: Request) -> bool:
         return request.url.path.startswith("/v1/messages")

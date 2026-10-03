@@ -11,6 +11,7 @@ from midir.app import with_keepalive
 from midir.canonical import Event
 
 FAST_KEEPALIVE = MIDIR_TOML.replace('responses_dir = "{responses_dir}"', 'responses_dir = "{responses_dir}"\nkeepalive_s = 0.05')
+ONE_SECOND = MIDIR_TOML.replace('responses_dir = "{responses_dir}"', 'responses_dir = "{responses_dir}"\nkeepalive_s = 1')
 NO_KEEPALIVE = MIDIR_TOML.replace('responses_dir = "{responses_dir}"', 'responses_dir = "{responses_dir}"\nkeepalive_s = 0')
 SLOW = 0.4  # backend silence, in seconds: about 8 keepalive intervals
 USER = [{"role": "user", "content": "hi"}]
@@ -67,7 +68,7 @@ def test_json_mode_waits_with_keepalives(app_client, upstream):
     assert text.count(": keepalive") >= 2 and '{\\"a\\": 1}' in text
 
 
-@keepalive_config
+@pytest.mark.parametrize("gateway", [ONE_SECOND], indirect=True)  # a real process needs some ms for token + call
 def test_fast_backend_gets_no_keepalive(app_client, upstream):
     upstream.add("quick")
     text = app_client.post("/v1/chat/completions", json={"model": "gpt-5.1", "messages": USER, "stream": True}).text
