@@ -24,25 +24,25 @@ git clone https://github.com/helton/midir && cd midir
 cp .env.example .env                                   # credentials and agent ids
 cp config/midir.example.toml config/midir.toml         # backends and models
 mkdir -p docker/data/gateway
-docker compose -f docker/compose.yml up -d             # pulls ghcr.io/helton/midir (public, ~30 MB, amd64 and arm64)
+docker compose -f docker/compose.yml up -d             # pulls ghcr.io/helton/midir (public, ~3 MB, amd64 and arm64)
 curl -s http://127.0.0.1:18880/ready                   # {"ok": true, ...} once the credentials work
 ```
 
 Then point a client at `http://127.0.0.1:18880/v1` (Anthropic clients: `http://127.0.0.1:18880`) with any API key; see
 [Clients](#clients).
 
-**From source** (Python 3.11+ and [uv](https://docs.astral.sh/uv/)):
+**From source** (Rust 1.81+; Midir is a single static binary):
 
 ```bash
-uv sync                    # creates .venv with the locked dependencies
-uv run midir               # reads .env and config/midir.toml from the current directory
+cargo build --release      # target/release/midir
+./target/release/midir     # reads .env and config/midir.toml from the current directory; --help for the options
 ```
 
 **Docker, building the image locally** (with or without the observability stack):
 
 ```bash
-uv run poe deploy-standalone   # Midir only
-uv run poe deploy-full         # Midir + mitmproxy + Grafana LGTM
+cargo xtask deploy standalone  # Midir only
+cargo xtask deploy full        # Midir + mitmproxy + Grafana LGTM
 ```
 
 ## Ports
@@ -179,23 +179,31 @@ so does a folder that cannot be created (a container started without its data vo
 
 ## Development
 
+Everything is Rust: you need Rust 1.81+ (and Docker for the images). The tests are black-box: each starts the
+binary Cargo built as a process, in front of a scripted StackSpot (nothing leaves the machine), and checks what clients
+see over HTTP. Repository tasks are a workspace member, `xtask`, run through a Cargo alias.
+
 ```bash
-uv sync                    # runtime + dev group (poethepoet + the test group: pytest and the OpenAI/Anthropic SDKs)
-uv run poe test            # offline regression suite, ~10 s
-uv run poe smoke           # live acceptance against a running Midir (25 checks, real backend requests)
-uv run poe check-leaks     # scan what git would publish for secrets, agent ids, home paths, e-mails
-uv run poe --help          # all tasks
+cargo run --release                         # build and run from source (reads .env and config/midir.toml)
+cargo test --release                        # unit tests + the offline regression suite (~1 min)
+cargo clippy --all-targets -- -D warnings   # lints, as CI runs them (also: cargo fmt --check)
+cargo xtask smoke                           # live acceptance against a running Midir (25 checks, real backend requests)
+cargo xtask check-leaks                     # scan what git would publish for secrets, agent ids, home paths, e-mails
+cargo xtask                                 # all tasks
 ```
+
+The one file in another language is `docker/mitm/sse_stream.py`: a mitmproxy addon for the observability stack
+(mitmproxy only loads Python addons); `cargo test --release --test mitm -- --ignored` checks it.
 
 | Path | Contents |
 |---|---|
-| `src/midir/` | the package: `protocols/`, `emulation/`, `backends/`, `gateway.py`, `app.py`, `config.py`, `store.py`, `telemetry.py`, `cli.py` ([architecture](docs/architecture.md)) |
-| `tests/` | regression suite: scripted backend, official OpenAI and Anthropic SDKs against the real app |
+| `src/` | the gateway: `protocols/`, `emulation/`, `backends/`, `gateway.rs`, `app.rs`, `config.rs`, `store.rs`, `telemetry.rs`, `main.rs` ([architecture](docs/architecture.md)) |
+| `tests/` | black-box regression suite: the binary as a process, a scripted backend (`tests/common/`) |
 | `config/` | `midir.example.toml` (your `midir.toml` is not versioned) |
 | `docker/` | `Dockerfile`, compose files, Grafana provisioning, `data/` (runtime, not versioned) |
 | `examples/clients/` | client configurations |
 | `docs/` | architecture, backend notes, agent brief, changelog |
-| `scripts/` | version bump, live smoke test, leak check |
+| `xtask/` | repository tasks (`cargo xtask`): version, bump, check-leaks, smoke, deploy |
 | `.github/workflows/` | CI with snapshots (`develop`) and releases (`main`) to ghcr.io |
 
 **Branches and images**: work happens on `develop`; `main` only receives releases. Tags `vX.Y.Z` are created by the
@@ -209,19 +217,20 @@ release workflow, never by hand.
 A push to `main` whose version was already released publishes nothing. To release, on `develop`:
 
 ```bash
-uv run poe bump [patch|minor|major|X.Y.Z]   # pyproject.toml, uv.lock and the default image tag in docker/compose.yml
+cargo xtask bump [patch|minor|major|X.Y.Z]  # Cargo.toml, Cargo.lock and the default image tag in docker/compose.yml
 # rename the "## Unreleased" section of docs/CHANGELOG.md to "## X.Y.Z (date)", then commit
 git push                                     # snapshot of the release candidate
 git checkout main && git merge --ff-only develop && git push && git checkout develop
 ```
 
 Every build says what it is (`midir --version`, the startup banner, `GET /health`): a release reports the bare version
-(`0.0.1`); anything else carries the commit as semver build metadata, `0.0.1+dev.a817822` for a `develop` snapshot,
-`0.0.1+local.a817822` for an image built here (`.dirty` with uncommitted changes) and `0.0.1+src.a817822` from source.
+(`0.1.0`); anything else carries the commit as semver build metadata, `0.1.0+dev.a817822` for a `develop` snapshot,
+`0.1.0+local.a817822` for an image built here (`.dirty` with uncommitted changes) and `0.1.0+src.a817822` for a
+binary built from a git checkout.
 
 `docker/compose.yml` runs the release it was bumped to; a snapshot runs with
 `MIDIR_IMAGE=ghcr.io/helton/midir:dev docker compose -f docker/compose.yml up -d`. The version lives only in
-`pyproject.toml` (`midir --version`, `GET /health`, first log line); changes are listed in
+`Cargo.toml` (`midir --version`, `GET /health`, first log line); changes are listed in
 [docs/CHANGELOG.md](docs/CHANGELOG.md).
 
 ## Troubleshooting
@@ -235,11 +244,14 @@ Every build says what it is (`midir --version`, the startup banner, `GET /health
   examples); images become placeholders on purpose.
 - **Log times in UTC**: containers run in UTC; set `TZ` in `.env` (for example `TZ=America/Sao_Paulo`) and recreate
   the container. Running from source uses the machine's time zone.
-- **Corporate TLS**: set `STACKSPOT_CA_BUNDLE` (and `UV_NATIVE_TLS=1` for uv itself).
+- **Corporate TLS**: set `STACKSPOT_CA_BUNDLE` to a PEM bundle with the corporate CA (it replaces the built-in roots);
+  Cargo itself honors `CARGO_HTTP_CAINFO`.
+- **Corporate proxy**: Midir honors `HTTPS_PROXY`/`https_proxy` and `NO_PROXY`/`no_proxy`; when both spellings are
+  set, the uppercase one wins.
 - **Pulling the image**: `ghcr.io/helton/midir` is public, no login needed; for a registry mirror or a fork, set
   `MIDIR_IMAGE=<registry>/midir:<tag>` in the shell or `docker/.env`.
-- **Name resolution behind a corporate proxy**: the image is Alpine-based (musl). If DNS behaves differently there,
-  build a Debian variant by changing both `FROM` lines of `docker/Dockerfile` to the `bookworm-slim` images.
+- **Name resolution behind a corporate proxy**: the image's binary is static (musl's resolver). If names resolve
+  differently than on the host, run a binary built for the host from source (`cargo build --release`).
 
 ## License
 

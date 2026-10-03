@@ -3,18 +3,31 @@
 All notable changes are listed here. Versions follow [Semantic Versioning](https://semver.org/); before 1.0.0 a minor
 release may change configuration or behavior.
 
-## Unreleased
+## 0.1.0 (2026-10-03)
 
+- **Rewritten in Rust**: Midir is now one static binary (tokio, axum, reqwest with rustls) instead of a Python
+  package, with the same behavior. Every observable detail was kept: endpoints, configuration (`config/midir.toml`,
+  `.env`, every `MIDIR_*`/`STACKSPOT_*`/`OTEL_*` variable), prompts sent to the backend byte for byte, SSE event
+  sequences, error bodies, the Responses store on disk (chains created by 0.0.1 keep working), telemetry and log
+  events. The regression suite is now black-box and in Rust too (`cargo test`: the binary as a process against a
+  scripted StackSpot); before the switch, the same scenarios ran against both implementations, plus a differential
+  test on 237 real client requests: same prompts to the backend, same answers to the client.
+  Measured against a local mock: startup 308 ms -> 61 ms, idle memory 48 MB -> 7 MB, about 7x the requests per
+  second; image 81 MB -> 7 MB (30 MB -> 3 MB to download), `FROM scratch`, health check with `midir --healthcheck`.
+  From source: `cargo build --release` (Rust 1.81+). Repository tasks moved to `cargo xtask` (version, bump,
+  check-leaks, smoke, deploy); the codebase no longer needs Python.
 - **Streaming through the observability stack fixed**: mitmproxy buffered whole responses, so on port 18880 tokens
   and keepalives reached clients only when generation was over, and StackSpot's stream reached Midir the same way.
   An addon (`docker/mitm/sse_stream.py`) streams `text/event-stream` responses through in both directions and keeps a
-  copy for mitmweb; `uv run poe test-mitm` checks it.
-- **Telemetry fixed**: Midir's own request spans and metrics were not flushed when the process stopped, and FastAPI's
-  built-in telemetry (new in FastAPI 0.142) exported a span for every health check and internal step under
-  `unknown_service:python`. FastAPI's automatic telemetry is now off, and Midir flushes its exporters on shutdown.
+  copy for mitmweb; `cargo test --release --test mitm -- --ignored` checks it. The overlay sets both spellings of the proxy variables
+  (`HTTPS_PROXY`/`https_proxy`, `NO_PROXY`/`no_proxy`).
+- **Telemetry fixed**: request spans and metrics are flushed when the process stops (SIGTERM), and only Midir's own
+  span per request is exported (0.0.1 also exported a span for every health check and internal step under
+  `unknown_service:python`).
 - **Every build says what it is**: only a release reports the bare version; a `develop` snapshot is
-  `0.0.1+dev.<commit>`, a local image `0.0.1+local.<commit>`, a source checkout `0.0.1+src.<commit>` (`.dirty` with
-  uncommitted changes), shown by `midir --version`, the startup banner, `/health`, `/ready` and telemetry.
+  `0.1.0+dev.<commit>`, a local image `0.1.0+local.<commit>`, a binary built from a git checkout
+  `0.1.0+src.<commit>` (`.dirty` with uncommitted changes), shown by `midir --version`, the startup banner,
+  `/health`, `/ready` and telemetry.
 - **SSE keepalive** while a stream waits for the backend's first content: an SSE comment (`: keepalive`) in Chat
   Completions and Responses, a `ping` event in Anthropic Messages, every `[server] keepalive_s` (15 s;
   `MIDIR_KEEPALIVE_S`, 0 turns it off), and nothing once content flows. Backends took up to 97 s to start in the
@@ -23,8 +36,6 @@ release may change configuration or behavior.
   warnings in that run) are reported once per client and set of parameters, at INFO; repeats go to DEBUG.
 - **No crash without the data volume**: when the Responses store folder cannot be created (for example `docker run`
   without mounting `/data`), Midir logs a warning and keeps `previous_response_id` in memory instead of exiting.
-- **Image 64% smaller**: two-stage build on Alpine; the final image carries only Python and the locked dependencies
-  (no uv, no pip): 222 MB -> 81 MB, 85 MB -> 30 MB to download.
 - **Image description on ghcr.io**: the multi-arch images carry the description as manifest and index annotations
   (the package page read "No description provided").
 

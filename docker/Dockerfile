@@ -1,27 +1,31 @@
 # Midir container image (published to ghcr.io by .github/workflows; build context: repository root).
-# Two stages: uv installs the locked dependencies and Midir into a virtual environment, and the final image carries
-# only Python and that environment (no uv, no pip, no build files). Alpine keeps it small: about 80 MB, 30 MB to
-# download. Runtime files come from the working directory /app: .env values arrive as environment variables (compose
-# env_file) and config/midir.toml as a compose config.
+# Two stages: a static musl build of the binary (rust:alpine targets <arch>-unknown-linux-musl natively, so each
+# platform is built on its own architecture), and a `scratch` image with only the binary, CA certificates, time zone
+# data and an owner-writable /app: about 7 MB, 3 MB to download. No shell and no libc: the HEALTHCHECK runs
+# `midir --healthcheck`. Runtime files come from the working directory /app: .env values arrive as environment
+# variables (compose env_file) and config/midir.toml as a compose config.
 
-FROM ghcr.io/astral-sh/uv:python3.12-alpine AS build
-ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
-WORKDIR /app
-COPY pyproject.toml uv.lock README.md LICENSE ./
-RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev --no-install-project
+FROM rust:1.81-alpine AS build
+RUN apk add --no-cache musl-dev ca-certificates tzdata
+WORKDIR /src
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
-RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev --no-editable
+# the workspace's other member (repository tasks): only its manifest is read, nothing of it is built
+COPY xtask ./xtask
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked --package midir && cp target/release/midir /midir \
+ && mkdir -p /rootfs/app/config /rootfs/app/data /rootfs/tmp
 
-FROM python:3.12-alpine
-# pip and ensurepip are not needed at runtime: removing them does not shrink the image (they live in the base layer),
-# but nothing can be installed into a running container
-RUN rm -rf /usr/local/lib/python3.12/site-packages/pip* /usr/local/lib/python3.12/ensurepip /usr/local/bin/pip* \
- && mkdir -p /app/config
-ENV PYTHONUNBUFFERED=1 PATH="/app/.venv/bin:$PATH"
-WORKDIR /app
-COPY --from=build /app/.venv /app/.venv
+FROM scratch
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /usr/share/zoneinfo /usr/share/zoneinfo
+COPY --from=build --chown=1000:1000 /rootfs/ /
+COPY --from=build /midir /usr/local/bin/midir
 COPY LICENSE /app/LICENSE
-# which build this is (midir --version, banner, /health): release (main), dev (develop), local (poe deploy-*).
+ENV PATH=/usr/local/bin SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+WORKDIR /app
+# which build this is (midir --version, banner, /health): release (main), dev (develop), local (cargo xtask deploy).
 # Last on purpose: commit and date change on every build, and nothing after them needs rebuilding.
 ARG MIDIR_BUILD_CHANNEL=local
 ARG MIDIR_BUILD_COMMIT=
@@ -30,8 +34,8 @@ ENV MIDIR_BUILD_CHANNEL=$MIDIR_BUILD_CHANNEL MIDIR_BUILD_COMMIT=$MIDIR_BUILD_COM
 # no root at runtime; compose overrides the ids with yours (user: "${UID}:${GID}")
 USER 1000:1000
 EXPOSE 18880
-HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=5 \
-  CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:18880/health', timeout=2).status == 200 else 1)"]
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=5 \
+  CMD ["midir", "--healthcheck", "--port", "18880"]
 CMD ["midir", "--host", "0.0.0.0", "--port", "18880"]
 LABEL org.opencontainers.image.title="midir" \
       org.opencontainers.image.description="Midir: OpenAI- and Anthropic-compatible gateway for LLM backends (StackSpot AI agents today)" \

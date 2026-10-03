@@ -1,0 +1,112 @@
+# The container image, called by ci.yml (develop snapshots, pull requests) and release.yml (releases). Each platform
+# is built on a runner of its own architecture (amd64 and arm64, no emulation: the Rust build takes minutes, not an
+# hour under QEMU) and pushed by digest; then one multi-arch image is assembled on ghcr.io with the given tags and the
+# description as an index annotation (what the package page shows). Without `push`, only amd64 is built.
+name: image
+
+on:
+  workflow_call:
+    inputs:
+      channel:
+        description: MIDIR_BUILD_CHANNEL baked into the image (dev or release)
+        type: string
+        required: true
+      tags:
+        description: docker/metadata-action `tags` (one rule per line)
+        type: string
+        required: true
+      push:
+        description: publish to ghcr.io (false for pull requests)
+        type: boolean
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  DESCRIPTION: "Midir: OpenAI- and Anthropic-compatible gateway for LLM backends (StackSpot AI agents today)"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include: ${{ fromJSON(inputs.push && '[{"platform":"linux/amd64","runner":"ubuntu-latest"},{"platform":"linux/arm64","runner":"ubuntu-24.04-arm"}]' || '[{"platform":"linux/amd64","runner":"ubuntu-latest"}]') }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - if: inputs.push
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          labels: |
+            org.opencontainers.image.title=midir
+            org.opencontainers.image.description=${{ env.DESCRIPTION }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            MIDIR_BUILD_CHANNEL=${{ inputs.channel }}
+            MIDIR_BUILD_COMMIT=${{ github.sha }}
+            MIDIR_BUILD_DATE=${{ github.event.head_commit.timestamp }}
+          outputs: ${{ inputs.push && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) || 'type=cacheonly' }}
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+      - if: inputs.push
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: mkdir -p "$RUNNER_TEMP/digests" && touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - if: inputs.push
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    if: inputs.push
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+        with:
+          images: ${{ env.IMAGE }}
+          tags: ${{ inputs.tags }}
+          annotations: |
+            org.opencontainers.image.title=midir
+            org.opencontainers.image.description=${{ env.DESCRIPTION }}
+      - name: Assemble the multi-arch image and tag it
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          args=()
+          while IFS= read -r tag; do args+=(-t "$tag"); done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          while IFS= read -r note; do args+=(--annotation "$note"); done < <(jq -r '.annotations[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          docker buildx imagetools create "${args[@]}" $(printf "$IMAGE@sha256:%s " *)
+      - run: docker buildx imagetools inspect "$IMAGE:${{ steps.meta.outputs.version }}"

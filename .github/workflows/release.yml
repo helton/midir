@@ -1,4 +1,4 @@
-# A push to main is a release: the version in pyproject.toml is published as ghcr.io/<owner>/<repo>:X.Y.Z, :X.Y and
+# A push to main is a release: the version in Cargo.toml is published as ghcr.io/<owner>/<repo>:X.Y.Z, :X.Y and
 # :latest (amd64 and arm64), then tagged vX.Y.Z with a GitHub release whose notes are that version's section of
 # docs/CHANGELOG.md. A push to main whose version was already released publishes nothing (bump it on develop first).
 name: release
@@ -24,10 +24,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@v6
       - id: v
         run: |
-          version="$(uv version --short)"
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"   # [package] comes first
           echo "version=$version" >> "$GITHUB_OUTPUT"
           if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
             echo "release=false" >> "$GITHUB_OUTPUT"
@@ -41,62 +40,21 @@ jobs:
   test:
     needs: check
     if: needs.check.outputs.release == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-        with:
-          enable-cache: true
-      - run: uv sync --frozen --no-default-groups --group test
-      - run: uv run --no-sync pytest -q
-      - run: uv run --no-sync python scripts/check_leaks.py
+    uses: ./.github/workflows/test.yml
 
   image:
     needs: [check, test]
-    runs-on: ubuntu-latest
+    uses: ./.github/workflows/image.yml
     permissions:
       contents: read
       packages: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - id: meta
-        uses: docker/metadata-action@v5
-        env:
-          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index   # multi-arch: ghcr shows the index's description
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=semver,pattern={{version}},value=v${{ needs.check.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=v${{ needs.check.outputs.version }}
-            type=raw,value=latest
-          labels: |
-            org.opencontainers.image.title=midir
-            org.opencontainers.image.description=Midir: OpenAI- and Anthropic-compatible gateway for LLM backends (StackSpot AI agents today)
-          annotations: |
-            org.opencontainers.image.title=midir
-            org.opencontainers.image.description=Midir: OpenAI- and Anthropic-compatible gateway for LLM backends (StackSpot AI agents today)
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            MIDIR_BUILD_CHANNEL=release
-            MIDIR_BUILD_COMMIT=${{ github.sha }}
-            MIDIR_BUILD_DATE=${{ github.event.head_commit.timestamp }}
-          annotations: ${{ steps.meta.outputs.annotations }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+    with:
+      channel: release
+      push: true
+      tags: |
+        type=semver,pattern={{version}},value=v${{ needs.check.outputs.version }}
+        type=semver,pattern={{major}}.{{minor}},value=v${{ needs.check.outputs.version }}
+        type=raw,value=latest
 
   github-release:
     needs: [check, image]

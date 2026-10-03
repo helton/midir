@@ -1,0 +1,26 @@
+# The checks every change must pass, called by ci.yml and release.yml: formatting, lints, the unit tests and the
+# black-box regression suite (tests/: the release binary as a process against a scripted StackSpot), and the leak check.
+name: test
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.81   # the minimum in Cargo.toml (rust-version) and the image's toolchain
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --release --locked -- -D warnings
+      - run: cargo test --workspace --release --locked
+      - run: cargo xtask check-leaks

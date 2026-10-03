@@ -1,3 +1,6 @@
+# build output
+/target/
+
 # secrets and personal configuration (examples are versioned: .env.example, config/midir.example.toml)
 .env
 .env.*
@@ -9,17 +12,8 @@ config/midir.toml
 docker/data/
 /data/
 
-# internal material: research, benchmarks, captures, history (has its own .gitignore with `*`)
+# internal material: research, benchmarks, captures, ports, history (has its own .gitignore with `*`)
 .internal/
-
-# Python and tooling
-.venv/
-__pycache__/
-*.py[cod]
-.pytest_cache/
-dist/
-build/
-*.egg-info/
 
 # editors and OS
 .vscode/

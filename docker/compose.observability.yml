@@ -17,9 +17,11 @@ services:
     ports: !override
       - "127.0.0.1:18881:18880"
     environment:
-      # lowercase on purpose: Python (httpx) prefers https_proxy/no_proxy over the uppercase names, and Docker setups
-      # with a proxy configured (e.g. at work) inject lowercase values that would otherwise win over these
+      # both spellings on purpose: Docker setups with a proxy configured (e.g. at work) inject one or both of them, and
+      # Midir reads the uppercase name first, then the lowercase one; these must win over the injected values
+      HTTPS_PROXY: http://mitm:8080
       https_proxy: http://mitm:8080
+      NO_PROXY: lgtm,mitm,localhost,127.0.0.1
       no_proxy: lgtm,mitm,localhost,127.0.0.1
       STACKSPOT_CA_BUNDLE: /certs/mitm/mitmproxy-ca-cert.pem
       OTEL_EXPORTER_OTLP_ENDPOINT: http://lgtm:4318

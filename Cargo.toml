@@ -1,0 +1,50 @@
+[package]
+name = "midir"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+description = "Midir: OpenAI- and Anthropic-compatible gateway for LLM backends (StackSpot AI agents today)"
+license = "MIT"
+repository = "https://github.com/helton/midir"
+publish = false
+build = "build.rs"
+
+[[bin]]
+name = "midir"
+path = "src/main.rs"
+
+[workspace]
+members = ["xtask"]
+
+[dependencies]
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+indexmap = "2"
+regex = "1"
+fancy-regex = "0.13"
+toml = { version = "0.8", default-features = false, features = ["parse", "preserve_order"] }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+async-stream = "0.3"
+bytes = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+getrandom = "0.2"
+libc = "0.2"
+# idna_adapter >= 1.2.1 pulls icu 2.x, which needs rustc 1.82; pinned for the 1.81 toolchain.
+idna_adapter = "=1.2.0"
+
+[dev-dependencies]
+# the black-box suite (tests/): the binary as a process, a StackSpot stand-in on axum, plain HTTP as the clients see it
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "stream"] }
+tempfile = "~3.14"  # newer releases pull getrandom 0.4, which needs a newer cargo than 1.81
+opentelemetry-proto = { version = "0.27", default-features = false, features = ["gen-tonic-messages", "trace", "metrics"] }
+prost = "0.13"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

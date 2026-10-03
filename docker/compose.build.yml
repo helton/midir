@@ -1,4 +1,4 @@
-# Build the gateway image from this checkout instead of pulling it (used by `uv run poe deploy-*`):
+# Build the gateway image from this checkout instead of pulling it (used by `cargo xtask deploy`):
 #   docker compose -f docker/compose.yml -f docker/compose.build.yml up -d --build
 services:
   midir:
@@ -6,7 +6,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-      args:  # `uv run poe deploy-*` fills the commit (with -dirty for uncommitted changes)
+      args:  # `cargo xtask deploy` fills the commit (with -dirty for uncommitted changes)
         MIDIR_BUILD_CHANNEL: local
         MIDIR_BUILD_COMMIT: ${MIDIR_BUILD_COMMIT:-}
         MIDIR_BUILD_DATE: ${MIDIR_BUILD_DATE:-}

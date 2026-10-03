@@ -1,8 +1,8 @@
 # Build context is the repository root: send only what the image needs (BuildKit reads this file next to the Dockerfile).
 *
-!pyproject.toml
-!uv.lock
-!README.md
-!LICENSE
+!Cargo.toml
+!Cargo.lock
+!build.rs
 !src/
-**/__pycache__
+!xtask/
+!LICENSE
