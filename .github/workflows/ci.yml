@@ -68,6 +68,10 @@ jobs:
           push: ${{ env.PUBLISH == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            MIDIR_BUILD_CHANNEL=dev
+            MIDIR_BUILD_COMMIT=${{ github.sha }}
+            MIDIR_BUILD_DATE=${{ github.event.head_commit.timestamp }}
           annotations: ${{ env.PUBLISH == 'true' && steps.meta.outputs.annotations || '' }}   # index annotations only for the pushed multi-arch image
           cache-from: type=gha
           cache-to: type=gha,mode=max

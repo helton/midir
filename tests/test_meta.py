@@ -58,8 +58,11 @@ def test_initiator():
 
 
 def test_startup_banner():
+    from midir.build import BuildInfo
     from midir.cli import banner
-    text = banner("9.9.9")
+    text = banner(BuildInfo("9.9.9", "release"))
     lines = [ln for ln in text.splitlines() if ln.strip()]
     assert "\t" not in text and len(lines) == 3 and lines[0].endswith("v9.9.9") and "M  I  D  I  R" in lines[1]
     assert len({ln.index("│") for ln in lines}) == 1  # one straight vertical rule
+    dev = banner(BuildInfo("9.9.9", "dev", "abc1234")).splitlines()
+    assert dev[1].endswith("v9.9.9+dev.abc1234 · development build")

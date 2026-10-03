@@ -6,3 +6,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      args:  # `uv run poe deploy-*` fills the commit (with -dirty for uncommitted changes)
+        MIDIR_BUILD_CHANNEL: local
+        MIDIR_BUILD_COMMIT: ${MIDIR_BUILD_COMMIT:-}
+        MIDIR_BUILD_DATE: ${MIDIR_BUILD_DATE:-}

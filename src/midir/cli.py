@@ -30,16 +30,19 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from midir import __version__ as VERSION
+from midir.build import BUILD, BuildInfo
+
+VERSION = BUILD.full_version  # 0.0.1 for a release; 0.0.1+dev.<commit> and the like otherwise (midir.build)
 
 log = logging.getLogger("midir")
 
-def banner(version: str) -> str:
-    """The startup banner: the name, a vertical rule, and the version, what Midir is and what it translates.
-    Spaces only; the only ambiguous-width character (the arrow) ends its line, so nothing after it can shift."""
+def banner(build: BuildInfo) -> str:
+    """The startup banner: the name, a vertical rule, and the version (with the kind of build when it is not a release),
+    what Midir is and what it translates. Spaces only; the only ambiguous-width character (the arrow) ends its line."""
     name = "M  I  D  I  R"
     left = [" " * len(name), name, " " * len(name)]
-    side = [f"v{version}", "an LLM gateway for agent platforms", "OpenAI · Anthropic ⇄ text-only agents"]
+    version = f"v{build.full_version}" + (f" · {build.label}" if build.label else "")
+    side = [version, "an LLM gateway for agent platforms", "OpenAI · Anthropic ⇄ text-only agents"]
     return "\n" + "\n".join(f"  {n}  │  {t}" for n, t in zip(left, side)) + "\n\n"
 
 
@@ -47,7 +50,7 @@ def _print_banner() -> None:
     if os.environ.get("MIDIR_NO_BANNER", "").lower() in ("1", "true", "yes", "on"):
         return
     try:
-        sys.stderr.write(banner(VERSION))
+        sys.stderr.write(banner(BUILD))
     except UnicodeEncodeError:  # a console without Unicode: a plain line instead
         sys.stderr.write(f"\n  MIDIR v{VERSION} - an LLM gateway for agent platforms\n\n")
     sys.stderr.flush()

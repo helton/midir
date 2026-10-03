@@ -11,7 +11,9 @@ import re
 import time
 from typing import Any, AsyncIterator, Callable
 
-from midir import __version__ as VERSION
+from midir.build import BUILD
+
+VERSION = BUILD.full_version
 from midir.canonical import CanonicalRequest, CanonicalResponse, Event
 from midir.errors import BackendError
 

@@ -5,6 +5,9 @@ release may change configuration or behavior.
 
 ## Unreleased
 
+- **Every build says what it is**: only a release reports the bare version; a `develop` snapshot is
+  `0.0.1+dev.<commit>`, a local image `0.0.1+local.<commit>`, a source checkout `0.0.1+src.<commit>` (`.dirty` with
+  uncommitted changes), shown by `midir --version`, the startup banner, `/health`, `/ready` and telemetry.
 - **SSE keepalive** while a stream waits for the backend's first content: an SSE comment (`: keepalive`) in Chat
   Completions and Responses, a `ping` event in Anthropic Messages, every `[server] keepalive_s` (15 s;
   `MIDIR_KEEPALIVE_S`, 0 turns it off), and nothing once content flows. Backends took up to 97 s to start in the

@@ -74,8 +74,8 @@ cmd = "uv version --short"
 # folders are created first so they belong to you and not to root. To run the published image instead, see README.
 [tool.poe.tasks.deploy-standalone]
 help = "Build and run only the gateway (docker/compose.yml + compose.build.yml)"
-shell = "mkdir -p docker/data/gateway && docker compose -f docker/compose.yml -f docker/compose.observability.yml down --remove-orphans && docker compose -f docker/compose.yml -f docker/compose.build.yml up --build -d --remove-orphans"
+shell = "export MIDIR_BUILD_COMMIT=\"$(git rev-parse --short=7 HEAD)$(git diff --quiet HEAD -- || echo -dirty)\" MIDIR_BUILD_DATE=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" && mkdir -p docker/data/gateway && docker compose -f docker/compose.yml -f docker/compose.observability.yml down --remove-orphans && docker compose -f docker/compose.yml -f docker/compose.build.yml up --build -d --remove-orphans"
 
 [tool.poe.tasks.deploy-full]
 help = "Build and run the gateway with mitmproxy and Grafana LGTM (+ compose.observability.yml)"
-shell = "mkdir -p docker/data/gateway docker/data/mitm docker/data/lgtm && docker compose -f docker/compose.yml -f docker/compose.observability.yml down --remove-orphans && docker compose -f docker/compose.yml -f docker/compose.build.yml -f docker/compose.observability.yml up --build -d"
+shell = "export MIDIR_BUILD_COMMIT=\"$(git rev-parse --short=7 HEAD)$(git diff --quiet HEAD -- || echo -dirty)\" MIDIR_BUILD_DATE=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" && mkdir -p docker/data/gateway docker/data/mitm docker/data/lgtm && docker compose -f docker/compose.yml -f docker/compose.observability.yml down --remove-orphans && docker compose -f docker/compose.yml -f docker/compose.build.yml -f docker/compose.observability.yml up --build -d"

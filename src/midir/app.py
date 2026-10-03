@@ -13,7 +13,9 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from midir import __version__ as VERSION
+from midir.build import BUILD
+
+VERSION = BUILD.full_version
 from midir.canonical import Event, estimate_tokens
 from midir.config import DEFAULT_MODEL_NAME
 from midir.emulation.prompt import render_prompt
@@ -171,7 +173,7 @@ def build_app(gateway: Gateway) -> FastAPI:
     @app.get("/health")
     async def health():
         cfg = gateway.config
-        return {"ok": True, "version": VERSION, "config": cfg.source, "default": cfg.default.name, "models": gateway.describe_models(),
+        return {"ok": True, "version": VERSION, "build": BUILD.as_dict(), "config": cfg.source, "default": cfg.default.name, "models": gateway.describe_models(),
                 "backends": {n: {"type": b.type, "queue": b.limiter.state()} for n, b in gateway.backends.items()}, "protocols": ["chat-completions", "responses", "messages"]}
 
     @app.get("/ready")
@@ -180,7 +182,7 @@ def build_app(gateway: Gateway) -> FastAPI:
         the identity server at most once per 20 minutes)."""
         status = await gateway.ready()
         failed = {n: why for n, why in status.items() if why}
-        body = {"ok": not failed, "version": VERSION, "backends": {n: {"ok": why is None, **({"error": why} if why else {}), "queue": gateway.backends[n].limiter.state()} for n, why in status.items()}}
+        body = {"ok": not failed, "version": VERSION, "build": BUILD.as_dict(), "backends": {n: {"ok": why is None, **({"error": why} if why else {}), "queue": gateway.backends[n].limiter.state()} for n, why in status.items()}}
         if failed:
             return JSONResponse(status_code=503, content={**body, "error": "; ".join(failed.values())})
         return body

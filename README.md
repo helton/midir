@@ -213,6 +213,10 @@ git push                                     # snapshot of the release candidate
 git checkout main && git merge --ff-only develop && git push && git checkout develop
 ```
 
+Every build says what it is (`midir --version`, the startup banner, `GET /health`): a release reports the bare version
+(`0.0.1`); anything else carries the commit as semver build metadata, `0.0.1+dev.a817822` for a `develop` snapshot,
+`0.0.1+local.a817822` for an image built here (`.dirty` with uncommitted changes) and `0.0.1+src.a817822` from source.
+
 `docker/compose.yml` runs the release it was bumped to; a snapshot runs with
 `MIDIR_IMAGE=ghcr.io/helton/midir:dev docker compose -f docker/compose.yml up -d`. The version lives only in
 `pyproject.toml` (`midir --version`, `GET /health`, first log line); changes are listed in

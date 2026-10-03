@@ -21,6 +21,12 @@ ENV PYTHONUNBUFFERED=1 PATH="/app/.venv/bin:$PATH"
 WORKDIR /app
 COPY --from=build /app/.venv /app/.venv
 COPY LICENSE /app/LICENSE
+# which build this is (midir --version, banner, /health): release (main), dev (develop), local (poe deploy-*).
+# Last on purpose: commit and date change on every build, and nothing after them needs rebuilding.
+ARG MIDIR_BUILD_CHANNEL=local
+ARG MIDIR_BUILD_COMMIT=
+ARG MIDIR_BUILD_DATE=
+ENV MIDIR_BUILD_CHANNEL=$MIDIR_BUILD_CHANNEL MIDIR_BUILD_COMMIT=$MIDIR_BUILD_COMMIT MIDIR_BUILD_DATE=$MIDIR_BUILD_DATE
 # no root at runtime; compose overrides the ids with yours (user: "${UID}:${GID}")
 USER 1000:1000
 EXPOSE 18880
@@ -30,4 +36,5 @@ CMD ["midir", "--host", "0.0.0.0", "--port", "18880"]
 LABEL org.opencontainers.image.title="midir" \
       org.opencontainers.image.description="Midir: OpenAI- and Anthropic-compatible gateway for LLM backends (StackSpot AI agents today)" \
       org.opencontainers.image.licenses="MIT" \
-      org.opencontainers.image.source="https://github.com/helton/midir"
+      org.opencontainers.image.source="https://github.com/helton/midir" \
+      org.opencontainers.image.revision="$MIDIR_BUILD_COMMIT"

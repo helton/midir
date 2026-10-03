@@ -90,6 +90,10 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            MIDIR_BUILD_CHANNEL=release
+            MIDIR_BUILD_COMMIT=${{ github.sha }}
+            MIDIR_BUILD_DATE=${{ github.event.head_commit.timestamp }}
           annotations: ${{ steps.meta.outputs.annotations }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
