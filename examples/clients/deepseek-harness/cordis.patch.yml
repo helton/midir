@@ -1,0 +1,22 @@
+# DeepSeek Harness (dsh) -> midir. Copy to $DSH_HOME/cordis.patch.yml (home-level patch, applies to every
+# profile) and export GATEWAY_API_KEY=gateway (any value). Pick the model with DSH_MODEL=gpt-5.1|gpt-4.1|flex.
+- id: llm-pi-ai
+  config:
+    providers:
+      gateway:
+        displayName: midir
+        apiKeyEnv: GATEWAY_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:18880/v1
+        defaultContextWindow: 272000
+        models:
+          - {id: gpt-5.1, contextWindow: 272000}
+          - {id: gpt-4.1, contextWindow: 272000}
+          - {id: flex, contextWindow: 272000}
+- id: agent-default-model
+  config:
+    provider: gateway
+    model: !!js process.env.DSH_MODEL || 'gpt-5.1'
+# dsh uploads session logs to DeepSeek by default; with a private backend you most likely want that off.
+- id: session-log-deepseek
+  disabled: true

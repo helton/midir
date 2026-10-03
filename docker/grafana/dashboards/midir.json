@@ -1,0 +1,1159 @@
+{
+ "uid": "midir",
+ "title": "midir",
+ "tags": [
+  "midir",
+  "gen_ai"
+ ],
+ "timezone": "browser",
+ "schemaVersion": 39,
+ "version": 3,
+ "refresh": "10s",
+ "time": {
+  "from": "now-6h",
+  "to": "now"
+ },
+ "editable": true,
+ "graphTooltip": 1,
+ "templating": {
+  "list": [
+   {
+    "name": "client",
+    "label": "client",
+    "type": "query",
+    "datasource": {
+     "type": "prometheus",
+     "uid": "prometheus"
+    },
+    "query": {
+     "query": "label_values(midir_requests_total, client_name)",
+     "refId": "v1"
+    },
+    "refresh": 2,
+    "includeAll": true,
+    "multi": true,
+    "allValue": ".*",
+    "current": {
+     "text": "All",
+     "value": "$__all"
+    },
+    "sort": 1
+   },
+   {
+    "name": "model",
+    "label": "agent",
+    "type": "query",
+    "datasource": {
+     "type": "prometheus",
+     "uid": "prometheus"
+    },
+    "query": {
+     "query": "label_values(midir_requests_total, gen_ai_response_model)",
+     "refId": "v2"
+    },
+    "refresh": 2,
+    "includeAll": true,
+    "multi": true,
+    "allValue": ".*",
+    "current": {
+     "text": "All",
+     "value": "$__all"
+    },
+    "sort": 1
+   },
+   {
+    "name": "session",
+    "label": "session",
+    "type": "query",
+    "datasource": {
+     "type": "prometheus",
+     "uid": "prometheus"
+    },
+    "query": {
+     "query": "label_values(midir_requests_total{client_name=~\"$client\"}, session_id)",
+     "refId": "v3"
+    },
+    "refresh": 2,
+    "includeAll": true,
+    "multi": false,
+    "allValue": ".*",
+    "current": {
+     "text": "All",
+     "value": "$__all"
+    },
+    "sort": 4
+   }
+  ]
+ },
+ "panels": [
+  {
+   "id": 100,
+   "type": "row",
+   "title": "Usage",
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 24,
+    "h": 1
+   },
+   "collapsed": false
+  },
+  {
+   "id": 1,
+   "title": "Input tokens (range)",
+   "type": "stat",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 1,
+    "w": 4,
+    "h": 4
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(increase(gen_ai_client_token_usage_total{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\", gen_ai_token_type=\"input\"}[$__range]))",
+     "legendFormat": "",
+     "refId": "A",
+     "format": "time_series",
+     "instant": true,
+     "range": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "blue"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "colorMode": "value",
+    "graphMode": "none"
+   }
+  },
+  {
+   "id": 2,
+   "title": "Output tokens (range)",
+   "type": "stat",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 4,
+    "y": 1,
+    "w": 4,
+    "h": 4
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(increase(gen_ai_client_token_usage_total{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\", gen_ai_token_type=\"output\"}[$__range]))",
+     "legendFormat": "",
+     "refId": "A",
+     "format": "time_series",
+     "instant": true,
+     "range": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "green"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "colorMode": "value",
+    "graphMode": "none"
+   }
+  },
+  {
+   "id": 3,
+   "title": "LLM calls (range)",
+   "type": "stat",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 8,
+    "y": 1,
+    "w": 4,
+    "h": 4
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(increase(midir_requests_total{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\"}[$__range]))",
+     "legendFormat": "",
+     "refId": "A",
+     "format": "time_series",
+     "instant": true,
+     "range": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "colorMode": "value",
+    "graphMode": "none"
+   }
+  },
+  {
+   "id": 4,
+   "title": "Agent iterations per user turn",
+   "type": "stat",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 1,
+    "w": 4,
+    "h": 4
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(increase(midir_requests_total{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\", midir_initiator=\"agent\"}[$__range])) / clamp_min(sum(increase(midir_requests_total{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\", midir_initiator=\"user\"}[$__range])), 1)",
+     "legendFormat": "",
+     "refId": "A",
+     "format": "time_series",
+     "instant": true,
+     "range": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "decimals": 1
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "colorMode": "value",
+    "graphMode": "none"
+   }
+  },
+  {
+   "id": 5,
+   "title": "Follow-ups (range)",
+   "type": "stat",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 16,
+    "y": 1,
+    "w": 4,
+    "h": 4
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(increase(midir_followups_total{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\"}[$__range])) or vector(0)",
+     "legendFormat": "",
+     "refId": "A",
+     "format": "time_series",
+     "instant": true,
+     "range": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "orange"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "colorMode": "value",
+    "graphMode": "none"
+   }
+  },
+  {
+   "id": 6,
+   "title": "Upstream retries / 429 (range)",
+   "type": "stat",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 20,
+    "y": 1,
+    "w": 4,
+    "h": 4
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(increase(midir_upstream_retries_total[$__range])) or vector(0)",
+     "legendFormat": "",
+     "refId": "A",
+     "format": "time_series",
+     "instant": true,
+     "range": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "red"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "colorMode": "value",
+    "graphMode": "none"
+   }
+  },
+  {
+   "id": 7,
+   "title": "Tokens per minute by agent",
+   "type": "timeseries",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 5,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (gen_ai_response_model, gen_ai_token_type) (rate(gen_ai_client_token_usage_total{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\"}[$__rate_interval]) * 60)",
+     "legendFormat": "{{gen_ai_response_model}} {{gen_ai_token_type}}",
+     "refId": "A",
+     "format": "time_series",
+     "instant": false,
+     "range": true
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "fillOpacity": 15,
+      "stacking": {
+       "mode": "normal"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "id": 8,
+   "title": "LLM calls per minute by client",
+   "type": "timeseries",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 5,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (client_name, midir_initiator) (rate(midir_requests_total{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\"}[$__rate_interval]) * 60)",
+     "legendFormat": "{{client_name}} ({{midir_initiator}})",
+     "refId": "A",
+     "format": "time_series",
+     "instant": false,
+     "range": true
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "fillOpacity": 15,
+      "stacking": {
+       "mode": "normal"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "id": 9,
+   "title": "Sessions (range): tokens, calls and iterations",
+   "type": "table",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 13,
+    "w": 24,
+    "h": 10
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (session_id, client_name) (increase(gen_ai_client_token_usage_total{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\", gen_ai_token_type=\"input\"}[$__range]))",
+     "legendFormat": "",
+     "refId": "A",
+     "format": "table",
+     "instant": true,
+     "range": false
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (session_id, client_name) (increase(gen_ai_client_token_usage_total{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\", gen_ai_token_type=\"output\"}[$__range]))",
+     "legendFormat": "",
+     "refId": "B",
+     "format": "table",
+     "instant": true,
+     "range": false
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (session_id, client_name) (increase(midir_requests_total{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\"}[$__range]))",
+     "legendFormat": "",
+     "refId": "C",
+     "format": "table",
+     "instant": true,
+     "range": false
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (session_id, client_name) (increase(midir_requests_total{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\", midir_initiator=\"user\"}[$__range]))",
+     "legendFormat": "",
+     "refId": "D",
+     "format": "table",
+     "instant": true,
+     "range": false
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (session_id, client_name) (increase(midir_tool_calls_total{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\"}[$__range]))",
+     "legendFormat": "",
+     "refId": "E",
+     "format": "table",
+     "instant": true,
+     "range": false
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (session_id, client_name) (increase(midir_followups_total{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\"}[$__range]))",
+     "legendFormat": "",
+     "refId": "F",
+     "format": "table",
+     "instant": true,
+     "range": false
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (session_id, client_name) (rate(midir_request_duration_milliseconds_sum{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\"}[$__range]) / rate(midir_request_duration_milliseconds_count{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\"}[$__range]))",
+     "legendFormat": "",
+     "refId": "G",
+     "format": "table",
+     "instant": true,
+     "range": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "decimals": 0,
+     "custom": {
+      "align": "auto",
+      "cellOptions": {
+       "type": "auto"
+      }
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "avg duration (ms)"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "ms"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byRegex",
+       "options": ".*tokens"
+      },
+      "properties": [
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "gauge",
+         "mode": "gradient"
+        }
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "continuous-BlPu"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "showHeader": true,
+    "footer": {
+     "show": true,
+     "reducer": [
+      "sum"
+     ],
+     "fields": [
+      "input tokens",
+      "output tokens",
+      "LLM calls"
+     ]
+    }
+   },
+   "transformations": [
+    {
+     "id": "merge",
+     "options": {}
+    },
+    {
+     "id": "organize",
+     "options": {
+      "excludeByName": {
+       "Time": true
+      },
+      "renameByName": {
+       "session_id": "session",
+       "client_name": "client",
+       "Value #A": "input tokens",
+       "Value #B": "output tokens",
+       "Value #C": "LLM calls",
+       "Value #D": "user turns",
+       "Value #E": "tool calls",
+       "Value #F": "follow-ups",
+       "Value #G": "avg duration (ms)"
+      }
+     }
+    },
+    {
+     "id": "sortBy",
+     "options": {
+      "sort": [
+       {
+        "field": "input tokens",
+        "desc": true
+       }
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "id": 101,
+   "type": "row",
+   "title": "Latency",
+   "gridPos": {
+    "x": 0,
+    "y": 23,
+    "w": 24,
+    "h": 1
+   },
+   "collapsed": false
+  },
+  {
+   "id": 10,
+   "title": "Time to first byte by agent (p50 solid, p95 dashed)",
+   "type": "timeseries",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 24,
+    "w": 12,
+    "h": 9
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le, gen_ai_response_model) (rate(midir_request_ttfb_milliseconds_bucket{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\"}[$__rate_interval])))",
+     "legendFormat": "p50 {{gen_ai_response_model}}",
+     "refId": "A",
+     "format": "time_series",
+     "instant": false,
+     "range": true
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "histogram_quantile(0.95, sum by (le, gen_ai_response_model) (rate(midir_request_ttfb_milliseconds_bucket{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\"}[$__rate_interval])))",
+     "legendFormat": "p95 {{gen_ai_response_model}}",
+     "refId": "B",
+     "format": "time_series",
+     "instant": false,
+     "range": true
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ms",
+     "custom": {
+      "fillOpacity": 0
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byFrameRefID",
+       "options": "B"
+      },
+      "properties": [
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          10,
+          10
+         ]
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {}
+  },
+  {
+   "id": 11,
+   "title": "Total duration by agent (p50 solid, p95 dashed)",
+   "type": "timeseries",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 24,
+    "w": 12,
+    "h": 9
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le, gen_ai_response_model) (rate(midir_request_duration_milliseconds_bucket{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\"}[$__rate_interval])))",
+     "legendFormat": "p50 {{gen_ai_response_model}}",
+     "refId": "A",
+     "format": "time_series",
+     "instant": false,
+     "range": true
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "histogram_quantile(0.95, sum by (le, gen_ai_response_model) (rate(midir_request_duration_milliseconds_bucket{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\"}[$__rate_interval])))",
+     "legendFormat": "p95 {{gen_ai_response_model}}",
+     "refId": "B",
+     "format": "time_series",
+     "instant": false,
+     "range": true
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ms",
+     "custom": {
+      "fillOpacity": 0
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byFrameRefID",
+       "options": "B"
+      },
+      "properties": [
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          10,
+          10
+         ]
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {}
+  },
+  {
+   "id": 12,
+   "title": "Average duration by client and protocol",
+   "type": "bargauge",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 33,
+    "w": 12,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (client_name, midir_protocol) (rate(midir_request_duration_milliseconds_sum{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\"}[$__range])) / sum by (client_name, midir_protocol) (rate(midir_request_duration_milliseconds_count{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\"}[$__range]))",
+     "legendFormat": "{{client_name}} / {{midir_protocol}}",
+     "refId": "A",
+     "format": "time_series",
+     "instant": true,
+     "range": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ms",
+     "color": {
+      "mode": "continuous-GrYlRd"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "orientation": "horizontal",
+    "displayMode": "gradient",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   }
+  },
+  {
+   "id": 13,
+   "title": "Tokens by agent (range)",
+   "type": "piechart",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 33,
+    "w": 12,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (gen_ai_response_model) (increase(gen_ai_client_token_usage_total{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\"}[$__range]))",
+     "legendFormat": "{{gen_ai_response_model}}",
+     "refId": "A",
+     "format": "time_series",
+     "instant": true,
+     "range": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "legend": {
+     "displayMode": "table",
+     "placement": "right",
+     "values": [
+      "value",
+      "percent"
+     ]
+    },
+    "pieType": "donut"
+   }
+  },
+  {
+   "id": 102,
+   "type": "row",
+   "title": "Quality and traces",
+   "gridPos": {
+    "x": 0,
+    "y": 40,
+    "w": 24,
+    "h": 1
+   },
+   "collapsed": false
+  },
+  {
+   "id": 14,
+   "title": "Tool calls, follow-ups, retries and errors per minute",
+   "type": "timeseries",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 41,
+    "w": 12,
+    "h": 9
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(rate(midir_tool_calls_total{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\"}[$__rate_interval])*60)",
+     "legendFormat": "tool calls",
+     "refId": "A",
+     "format": "time_series",
+     "instant": false,
+     "range": true
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(rate(midir_followups_total{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\"}[$__rate_interval])*60) or vector(0)",
+     "legendFormat": "follow-ups",
+     "refId": "B",
+     "format": "time_series",
+     "instant": false,
+     "range": true
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(rate(midir_upstream_retries_total[$__rate_interval])*60) or vector(0)",
+     "legendFormat": "upstream retries",
+     "refId": "C",
+     "format": "time_series",
+     "instant": false,
+     "range": true
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(rate(midir_errors_total{client_name=~\"$client\", gen_ai_response_model=~\"$model\", session_id=~\"$session\"}[$__rate_interval])*60) or vector(0)",
+     "legendFormat": "errors",
+     "refId": "D",
+     "format": "time_series",
+     "instant": false,
+     "range": true
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "fillOpacity": 10
+     }
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "id": 15,
+   "title": "Recent LLM calls (click a trace for tokens, session, tool calls)",
+   "type": "table",
+   "datasource": {
+    "type": "tempo",
+    "uid": "tempo"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 41,
+    "w": 12,
+    "h": 9
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "tempo",
+      "uid": "tempo"
+     },
+     "refId": "A",
+     "queryType": "traceql",
+     "query": "{span.gen_ai.system=\"stackspot\" && span.client.name=~\"$client\" && span.gen_ai.response.model=~\"$model\" && span.session.id=~\"$session\"}",
+     "limit": 50,
+     "tableType": "spans",
+     "spss": 1
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "showHeader": true
+   }
+  },
+  {
+   "id": 103,
+   "type": "row",
+   "title": "Upstream queue",
+   "gridPos": {
+    "x": 0,
+    "y": 50,
+    "w": 24,
+    "h": 1
+   },
+   "collapsed": false
+  },
+  {
+   "id": 16,
+   "title": "Queue wait (p50 solid, p95 dashed)",
+   "type": "timeseries",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 51,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "refId": "A",
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(midir_queue_wait_milliseconds_bucket[$__rate_interval])))",
+     "legendFormat": "p50"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "refId": "B",
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(midir_queue_wait_milliseconds_bucket[$__rate_interval])))",
+     "legendFormat": "p95"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ms",
+     "custom": {
+      "fillOpacity": 0
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byFrameRefID",
+       "options": "B"
+      },
+      "properties": [
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          10,
+          10
+         ]
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {}
+  },
+  {
+   "id": 17,
+   "title": "Waiting for a slot / upstream calls per minute",
+   "type": "timeseries",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 51,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "refId": "A",
+     "expr": "sum(midir_queue_waiting) or vector(0)",
+     "legendFormat": "waiting"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "refId": "B",
+     "expr": "sum(rate(midir_queue_wait_milliseconds_count[$__rate_interval]) * 60)",
+     "legendFormat": "upstream calls/min (limit 90)"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "fillOpacity": 10
+     }
+    },
+    "overrides": []
+   },
+   "options": {}
+  }
+ ]
+}

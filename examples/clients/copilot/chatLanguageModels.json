@@ -1,0 +1,43 @@
+[
+  {
+    "name": "StackSpot",
+    "vendor": "customendpoint",
+    "apiKey": "${input:gateway.key}",
+    "apiType": "responses",
+    "models": [
+      {
+        "id": "gpt-5.1",
+        "name": "GPT-5.1 via StackSpot",
+        "url": "http://localhost:18880/v1",
+        "toolCalling": true,
+        "vision": false,
+        "thinking": false,
+        "streaming": true,
+        "maxInputTokens": 250000,
+        "maxOutputTokens": 16000
+      },
+      {
+        "id": "gpt-4.1",
+        "name": "GPT-4.1 via StackSpot",
+        "url": "http://localhost:18880/v1",
+        "toolCalling": true,
+        "vision": false,
+        "thinking": false,
+        "streaming": true,
+        "maxInputTokens": 250000,
+        "maxOutputTokens": 16000
+      },
+      {
+        "id": "flex",
+        "name": "Flex via StackSpot",
+        "url": "http://localhost:18880/v1",
+        "toolCalling": true,
+        "vision": false,
+        "thinking": false,
+        "streaming": true,
+        "maxInputTokens": 250000,
+        "maxOutputTokens": 16000
+      }
+    ]
+  }
+]

@@ -1,0 +1,8 @@
+# Build the gateway image from this checkout instead of pulling it (used by `uv run poe deploy-*`):
+#   docker compose -f docker/compose.yml -f docker/compose.build.yml up -d --build
+services:
+  midir:
+    image: midir:local
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile

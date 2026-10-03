@@ -1,0 +1,28 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:18880",
+    "ANTHROPIC_AUTH_TOKEN": "gateway",
+    "ANTHROPIC_API_KEY": "",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "stackspot-gpt-5.1",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "GPT-5.1 via StackSpot",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION": "Most capable: long autonomous and multi-file tasks",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "stackspot-flex",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "Flex via StackSpot",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION": "Everyday work: GPT-4.1 with StackSpot's prompt, finishes tasks, ~2x faster",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "stackspot-gpt-4.1",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": "GPT-4.1 via StackSpot",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION": "Fastest: quick answers; also Claude Code's background calls",
+    "ANTHROPIC_SMALL_FAST_MODEL": "stackspot-gpt-4.1",
+    "CLAUDE_CODE_USE_BEDROCK": "0",
+    "CLAUDE_CODE_USE_VERTEX": "0",
+    "NO_PROXY": "localhost,127.0.0.1,::1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "DISABLE_TELEMETRY": "1",
+    "DISABLE_AUTOUPDATER": "1"
+  },
+  "model": "opus",
+  "statusLine": {
+    "type": "command",
+    "command": "input=$(cat); model=$(echo \"$input\" | grep -o '\"display_name\":\"[^\"]*\"' | head -1 | cut -d'\"' -f4); dir=$(echo \"$input\" | grep -o '\"current_dir\":\"[^\"]*\"' | head -1 | cut -d'\"' -f4); printf 'StackSpot ▸ %s ▸ 127.0.0.1:18880 ▸ %s' \"${model:-GPT-5.1}\" \"${dir##*/}\""
+  }
+}

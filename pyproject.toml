@@ -1,0 +1,81 @@
+[project]
+name = "midir"
+version = "0.0.1"
+description = "Midir: OpenAI- and Anthropic-compatible gateway for LLM backends; text-only agent platforms (StackSpot AI today) get streaming, tool calling and structured output"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+classifiers = ["Private :: Do Not Upload"]  # distributed as a container image (ghcr.io), not on PyPI
+# Ranges: lower bound = the version tested; upper bound = the next release that may break compatibility.
+# 0.x packages may break on a minor release, so only patches are allowed; 1.x+ packages follow semver (< next major).
+# The exact versions in use are pinned in uv.lock; `uv lock --upgrade` moves them within these ranges.
+dependencies = [
+    "fastapi>=0.142.2,<0.143",
+    "uvicorn>=0.54.0,<0.55",
+    "httpx>=0.28.1,<0.29",
+    "python-dotenv>=1.2.4,<2",
+    "tenacity>=9.1.4,<10",
+    "opentelemetry-sdk>=1.45.0,<2",                      # keep sdk and exporter on the same version
+    "opentelemetry-exporter-otlp-proto-http>=1.45.0,<2",
+]
+
+[project.scripts]
+midir = "midir.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/midir"]
+
+[dependency-groups]
+test = [                                                 # tests/ and scripts/smoke.py (official SDKs as clients)
+    "pytest>=9.1.1,<10",
+    "openai>=3.22.1,<4",
+    "anthropic>=1.11.0,<2",
+]
+dev = [                                                  # local development: task runner + everything to test
+    "poethepoet>=0.48.0,<0.49",
+    { include-group = "test" },
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.poe.tasks.serve]
+help = "Run Midir locally (reads .env and config/midir.toml from the repository root)"
+cmd = "midir"
+
+[tool.poe.tasks.test]
+help = "Run the regression suite (offline: scripted StackSpot, official SDKs; ~10 s)"
+cmd = "pytest -q"
+
+[tool.poe.tasks.smoke]
+help = "Live acceptance against a running gateway with the official SDKs (25 checks; uses real StackSpot requests)"
+cmd = "python scripts/smoke.py --base ${base}"
+args = [{ name = "base", default = "http://127.0.0.1:18880", help = "gateway URL" }]
+
+[tool.poe.tasks.check-leaks]
+help = "Scan the files that git would publish for secrets, agent ids, home paths and e-mails"
+cmd = "python scripts/check_leaks.py"
+
+[tool.poe.tasks.bump]
+help = "Bump the version in pyproject.toml, uv.lock and docker/compose.yml (patch | minor | major | X.Y.Z)"
+cmd = "python scripts/bump_version.py ${part}"
+args = [{ name = "part", positional = true, default = "patch", help = "patch, minor, major or an explicit X.Y.Z" }]
+
+[tool.poe.tasks.version]
+help = "Show the current version"
+cmd = "uv version --short"
+
+# Deploy from source: recreate the stack, building the image locally. Bind-mounted data in docker/data survives; the
+# folders are created first so they belong to you and not to root. To run the published image instead, see README.
+[tool.poe.tasks.deploy-standalone]
+help = "Build and run only the gateway (docker/compose.yml + compose.build.yml)"
+shell = "mkdir -p docker/data/gateway && docker compose -f docker/compose.yml -f docker/compose.observability.yml down --remove-orphans && docker compose -f docker/compose.yml -f docker/compose.build.yml up --build -d --remove-orphans"
+
+[tool.poe.tasks.deploy-full]
+help = "Build and run the gateway with mitmproxy and Grafana LGTM (+ compose.observability.yml)"
+shell = "mkdir -p docker/data/gateway docker/data/mitm docker/data/lgtm && docker compose -f docker/compose.yml -f docker/compose.observability.yml down --remove-orphans && docker compose -f docker/compose.yml -f docker/compose.build.yml -f docker/compose.observability.yml up --build -d"

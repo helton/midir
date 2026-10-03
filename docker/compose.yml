@@ -1,0 +1,36 @@
+# Midir alone, from the published image. Run from the repository root:
+#
+#   docker compose -f docker/compose.yml up -d                                   -> http://127.0.0.1:18880/v1
+#   docker compose -f docker/compose.yml -f docker/compose.build.yml up -d --build   (build from source instead)
+#   docker compose -f docker/compose.yml -f docker/compose.observability.yml up -d   (+ mitmproxy and Grafana LGTM)
+#
+# Before the first start: copy .env.example to .env (credentials and agent ids) and config/midir.example.toml to
+# config/midir.toml (models), both at the repository root. midir.toml is injected as a compose config: after editing
+# it run `docker compose -f docker/compose.yml up -d --force-recreate midir`.
+#
+# Host ports live in the block 18880-18889. Local data, one folder per service, under docker/data: gateway (Midir
+# itself), mitm (proxy), lgtm (Grafana LGTM). Another image (a fork, a mirror): MIDIR_IMAGE=<image:tag>.
+
+name: midir
+
+services:
+  midir:
+    container_name: midir
+    image: ${MIDIR_IMAGE:-ghcr.io/helton/midir:0.0.1}
+    user: "${UID:-1000}:${GID:-1000}"   # run as your user: files in docker/data/gateway stay yours (no root-owned files)
+    env_file: ../.env
+    environment:
+      MIDIR_PORT: "18880"
+      MIDIR_RESPONSES_DIR: /data/responses   # previous_response_id store; survives restarts
+    ports:
+      - "127.0.0.1:18880:18880"
+    volumes:
+      - ./data/gateway:/data   # the gateway's own data only (create it first: mkdir -p docker/data/gateway)
+    configs:
+      - source: midir
+        target: /app/config/midir.toml
+    restart: unless-stopped
+
+configs:
+  midir:
+    file: ../config/midir.toml

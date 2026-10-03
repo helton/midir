@@ -1,0 +1,23 @@
+# Hermes Agent (Nous Research) -> midir. Copy to $HERMES_HOME/config.yaml (default ~/.hermes/config.yaml) or
+# merge the `model` and `providers` blocks into yours. Select a model per run with `-m gpt-4.1` / `-m flex`.
+model:
+  provider: gateway
+  default: gpt-5.1
+  context_length: 272000
+providers:
+  gateway:
+    name: midir
+    api: http://127.0.0.1:18880/v1
+    api_key: gateway            # any value: the gateway has no authentication
+    transport: chat_completions
+    default_model: gpt-5.1
+    context_length: 272000
+    discover_models: false
+    models:
+      gpt-5.1: {context_length: 272000}
+      gpt-4.1: {context_length: 272000}
+      flex: {context_length: 272000}
+# Optional: fewer requests against the account's shared 100/min quota (each of these is one extra LLM call).
+# auxiliary:
+#   title_generation: {enabled: false}
+#   background_review: {enabled: false}

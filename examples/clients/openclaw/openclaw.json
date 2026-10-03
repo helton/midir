@@ -1,0 +1,83 @@
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "stackspot/gpt-5.1"
+      },
+      "subagents": {
+        "maxConcurrent": 2
+      }
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "stackspot": {
+        "baseUrl": "http://127.0.0.1:18880/v1",
+        "apiKey": "gateway",
+        "api": "openai-completions",
+        "timeoutSeconds": 300,
+        "models": [
+          {
+            "id": "gpt-5.1",
+            "name": "GPT-5.1 (StackSpot)",
+            "reasoning": false,
+            "input": [
+              "text"
+            ],
+            "contextWindow": 272000,
+            "contextTokens": 250000,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            }
+          },
+          {
+            "id": "flex",
+            "name": "Flex (StackSpot)",
+            "reasoning": false,
+            "input": [
+              "text"
+            ],
+            "contextWindow": 272000,
+            "contextTokens": 250000,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            }
+          },
+          {
+            "id": "gpt-4.1",
+            "name": "GPT-4.1 (StackSpot)",
+            "reasoning": false,
+            "input": [
+              "text"
+            ],
+            "contextWindow": 272000,
+            "contextTokens": 250000,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            }
+          }
+        ]
+      }
+    }
+  },
+  "memory": {
+    "search": {
+      "provider": "none"
+    }
+  },
+  "tools": {
+    "toolSearch": {
+      "mode": "tools"
+    }
+  }
+}
