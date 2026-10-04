@@ -1,10 +1,12 @@
 //! Detectors for replies that need an automatic follow-up: announce and stop, redundant confirmation, false
-//! incapacity; and how two calls are compared when deduplicating the invalid-JSON repair. CAVEAT: heuristics, pt/en/es.
+//! incapacity; how two calls are compared when deduplicating the invalid-JSON repair; and which calls a follow-up must
+//! not make again. CAVEAT: heuristics, pt/en/es.
 //!
 //! A follow-up must never push the model into something the user did not ask for: a confirmation is only answered
 //! for the user when their most recent instruction orders the action (and does not forbid it), and irreversible
 //! actions (push, merge, deploy, install) only when the latest message itself orders them.
 
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -208,6 +210,14 @@ static NEEDS_ACCESS_RE: LazyLock<Regex> = LazyLock::new(|| {
         r"(?i)(login|senha|password|autentica|authenticat|credencia|credential|privad|private|\bconta\b|account|paywall|assinatura|subscription)",
     )
 });
+/// A denial that reports what a tool returned (an HTTP status, a block, a timeout) is no false incapacity.
+static ACCESS_FAILURE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    re(concat!(
+        r"(?i)(\b[45]\d\d\b|forbidden|proibid|bloque|blocked|negad[oa]|denied|recusad|refused|time-?out|timed out|tempo (limite|esgotado)|",
+        r"unauthori[sz]ed|n[ãa]o autorizad|not found|n[ãa]o encontrad|indispon[íi]ve|unavailable|rate.?limit|captcha|",
+        r"\bfalh(ou|aram|ando)\b|\bfailed\b|\b(deu|retorn\w*|devolve\w*|returned|returning|gave)( um| o| an?)? (erro|error))"
+    ))
+});
 
 const TARGET_KEYS: [&str; 13] =
     ["path", "file_path", "filePath", "filepath", "file", "filename", "target", "command", "cmd", "url", "uri", "query", "pattern"];
@@ -265,22 +275,23 @@ pub fn call_key(c: &ToolCall) -> (String, String) {
 }
 
 /// The tools that provide an ability the reply says the model lacks ("I don't have access to the internet" while a
-/// fetch tool is listed); empty when the reply denies nothing, or something no tool provides (a bank account).
+/// fetch tool is listed); empty when the reply denies nothing, or something no tool provides (a bank account), or
+/// reports what a tool returned: a failure it cites (a 403, a timeout), or anything after trying that ability in this
+/// turn. Asking for the call again then only repeats the failure, one client round after another.
 pub fn false_incapacity<'a>(req: &'a CanonicalRequest, resp: &CanonicalResponse, text_: &str, calls: &[ToolCall]) -> Vec<&'a ToolSpec> {
     if !calls.is_empty() || !req.tools_on() || resp.finish != Finish::Stop {
         return vec![];
     }
     let t = text_.trim();
-    if t.is_empty() || char_len(t) > 800 || !INCAPACITY_RE.is_match(t) {
+    if t.is_empty() || char_len(t) > 800 || !INCAPACITY_RE.is_match(t) || ACCESS_FAILURE_RE.is_match(t) {
         return vec![];
     }
     let denials: Vec<&str> = sent_split(t).into_iter().filter(|s| INCAPACITY_RE.is_match(s)).collect();
     if denials.iter().any(|d| NEEDS_ACCESS_RE.is_match(d)) {
         return vec![];
     }
-    let denied: Vec<&Regex> =
-        ABILITIES.iter().filter(|(_, words, _)| denials.iter().any(|d| words.is_match(d))).map(|(_, _, tools)| tools).collect();
-    if denied.is_empty() {
+    let denied: Vec<&(&str, Regex, Regex)> = ABILITIES.iter().filter(|(_, words, _)| denials.iter().any(|d| words.is_match(d))).collect();
+    if denied.is_empty() || tried(req, &denied) {
         return vec![];
     }
     let terminal = &ABILITIES[2].2;
@@ -288,9 +299,40 @@ pub fn false_incapacity<'a>(req: &'a CanonicalRequest, resp: &CanonicalResponse,
         .iter()
         .filter(|tool| {
             let about = format!("{} {}", tool.name, tool.description);
-            terminal.is_match(&about) || denied.iter().any(|r| r.is_match(&about))
+            terminal.is_match(&about) || denied.iter().any(|(_, _, r)| r.is_match(&about))
         })
         .collect()
+}
+
+/// Where the current turn starts: the turn of the user's newest instruction (0 when there is none).
+fn turn_start(req: &CanonicalRequest) -> usize {
+    instructions(req).next().map_or(0, |(i, _)| i)
+}
+
+/// Whether a call in the current turn already used one of these abilities: a tool of that kind, or arguments about
+/// it (a terminal's `curl https://...`).
+fn tried(req: &CanonicalRequest, abilities: &[&(&str, Regex, Regex)]) -> bool {
+    req.turns[turn_start(req)..].iter().flat_map(|t| &t.tool_calls).any(|c| {
+        let about = req.tools.iter().find(|t| t.name == c.name).map_or_else(|| c.name.clone(), |t| format!("{} {}", t.name, t.description));
+        let args = c.arguments.to_string();
+        abilities.iter().any(|(_, words, tools)| tools.is_match(&about) || words.is_match(&args))
+    })
+}
+
+/// Whether the current turn already made this call (same tool, same target) and its last two runs returned the same
+/// result: a follow-up that makes it again only repeats that result, and the client loops on it.
+pub fn repeats_itself(req: &CanonicalRequest, call: &ToolCall) -> bool {
+    let turns = &req.turns[turn_start(req)..];
+    let results: HashMap<&str, &str> =
+        turns.iter().flat_map(|t| &t.tool_results).map(|r| (r.call_id.as_str(), r.content.as_str())).collect();
+    let key = call_key(call);
+    let outcomes: Vec<&str> = turns
+        .iter()
+        .flat_map(|t| &t.tool_calls)
+        .filter(|c| call_key(c) == key)
+        .filter_map(|c| results.get(c.id.as_str()).copied())
+        .collect();
+    matches!(outcomes.as_slice(), [.., a, b] if a == b)
 }
 
 pub fn promise_only(req: &CanonicalRequest, resp: &CanonicalResponse, text_: &str, calls: &[ToolCall]) -> bool {
@@ -668,5 +710,68 @@ mod tests {
         r.tools = vec![ToolSpec::new("bash", "Run a command", None, false)].into();
         assert_eq!(false_incapacity(&r, &resp, "I can't browse the web.", &[]).len(), 1); // a terminal reaches the web
         assert!(false_incapacity(&r, &resp, "Não consigo acessar o site do banco porque ele exige login.", &[]).is_empty());
+    }
+
+    fn ran(r: &mut CanonicalRequest, id: &str, name: &str, arguments: Value, result: &str) {
+        let call = ToolCall { id: id.into(), name: name.into(), arguments };
+        r.add("assistant", "", vec![call], vec![]);
+        r.add("user", "", vec![], vec![ToolResult { call_id: id.into(), content: result.into(), name: String::new(), is_error: false }]);
+    }
+
+    #[test]
+    fn a_denial_after_a_failed_call_is_not_a_false_incapacity() {
+        // VS Code Copilot on gpt-5.1 (2026-10-04): fetch_webpage got a 403, the reply said so, and each ability
+        // follow-up fetched again: one client round after another until the user stopped it
+        let resp = CanonicalResponse::default();
+        let tools = vec![
+            ToolSpec::new("fetch_webpage", "Fetches the main content from a web page", None, false),
+            ToolSpec::new("run_in_terminal", "Run a command in a terminal", None, false),
+        ];
+        let mut r = CanonicalRequest { tools: tools.into(), ..Default::default() };
+        r.add_text("user", "<userRequest>qual a versão mais atual do fastapi no registry do pypi?</userRequest>");
+        let denial = "Não consigo acessar a página do PyPI daqui, então não tenho como afirmar qual é a versão mais recente.";
+        assert_eq!(false_incapacity(&r, &resp, denial, &[]).len(), 2); // never tried: it does not know its tools
+        let url = serde_json::json!({"urls": ["https://pypi.org/pypi/fastapi/json"]});
+        ran(&mut r, "c1", "fetch_webpage", url.clone(), "Error: 403 Forbidden");
+        assert!(false_incapacity(&r, &resp, denial, &[]).is_empty()); // tried in this turn
+        for cites in [
+            "Não consigo consultar diretamente o PyPI agora (a chamada à ferramenta de web deu erro 403), então não tenho como te afirmar.",
+            "Não consigo acessar o JSON do PyPI daqui (a ferramenta de web está retornando 403 para https://pypi.org/pypi/fastapi/json).",
+            "I can't access that page: the request timed out.",
+        ] {
+            assert!(false_incapacity(&req(&["veja o pypi"]), &resp, cites, &[]).is_empty(), "{cites}");
+        }
+        // trying through a terminal counts too; a call from an earlier turn does not
+        let mut t = CanonicalRequest { tools: vec![ToolSpec::new("bash", "Run a command", None, false)].into(), ..Default::default() };
+        t.add_text("user", "qual a versão do fastapi?");
+        ran(&mut t, "c1", "bash", serde_json::json!({"command": "curl -s https://pypi.org/pypi/fastapi/json"}), "");
+        assert!(false_incapacity(&t, &resp, denial, &[]).is_empty());
+        t.add_text("assistant", "Não consegui.");
+        t.add_text("user", "e a versão do django?");
+        assert_eq!(false_incapacity(&t, &resp, "Não consigo acessar a página do PyPI.", &[]).len(), 1);
+    }
+
+    #[test]
+    fn a_call_that_returned_the_same_twice_is_not_made_again() {
+        let call = |id: &str| ToolCall {
+            id: id.into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({"command": "uv run pytest -q"}),
+        };
+        let args = serde_json::json!({"command": "uv run pytest -q"});
+        let mut r = req(&["rode os testes"]);
+        ran(&mut r, "c1", "run_command", args.clone(), "ERROR: database unreachable");
+        assert!(!repeats_itself(&r, &call("c9")));
+        ran(&mut r, "c2", "run_command", args.clone(), "1 failed");
+        assert!(!repeats_itself(&r, &call("c9"))); // something changed between the runs
+        ran(&mut r, "c3", "run_command", args.clone(), "1 failed");
+        assert!(repeats_itself(&r, &call("c9")));
+        let other =
+            ToolCall { id: "c9".into(), name: "run_command".into(), arguments: serde_json::json!({"command": "uv run pytest -q -x"}) };
+        assert!(!repeats_itself(&r, &other));
+        // a new instruction starts a new turn
+        r.add_text("assistant", "Os testes falham.");
+        r.add_text("user", "rode de novo");
+        assert!(!repeats_itself(&r, &call("c9")));
     }
 }

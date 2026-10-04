@@ -342,6 +342,44 @@ fn a_correct_refusal_gets_no_ability_follow_up() {
 }
 
 #[test]
+fn a_denial_after_a_failed_fetch_gets_no_ability_follow_up() {
+    // VS Code Copilot on gpt-5.1 (2026-10-04): fetch_webpage got a 403 and the reply said it could not reach the page;
+    // the ability follow-up appended another fetch, the client ran it, and so on until the user stopped it
+    let rig = Rig::new();
+    let fetch = json!({"type": "function", "function": {"name": "fetch_webpage", "description": "Fetches the main content from a web page", "parameters": {"type": "object", "properties": {"urls": {"type": "array", "items": {"type": "string"}}}}}});
+    let messages = json!([
+        {"role": "user", "content": "<userRequest>qual a versão mais atual do fastapi no registry do pypi?</userRequest>"},
+        {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "fetch_webpage", "arguments": "{\"urls\": [\"https://pypi.org/pypi/fastapi/json\"]}"}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "Failed to fetch https://pypi.org/pypi/fastapi/json: 403 Forbidden"}
+    ]);
+    rig.upstream
+        .add("Não consigo acessar a página do PyPI daqui, então não tenho como afirmar qual é a versão mais recente.")
+        .add(tool_call_text("fetch_webpage", json!({"urls": ["https://pypi.org/pypi/fastapi/json"]})));
+    let r = chat(&rig, json!({"tools": [fetch, run_tool()], "messages": messages}));
+    assert_eq!(r["choices"][0]["finish_reason"], "stop");
+    assert!(r["choices"][0]["message"]["tool_calls"].is_null(), "{r}");
+    assert_eq!(rig.upstream.calls().len(), 1);
+}
+
+#[test]
+fn a_follow_up_never_repeats_a_call_that_returned_the_same_twice() {
+    let rig = Rig::new();
+    let call = |id: &str| json!({"id": id, "type": "function", "function": {"name": "run_command", "arguments": "{\"command\": \"uv run pytest -q\"}"}});
+    let messages = json!([
+        {"role": "user", "content": "rode os testes"},
+        {"role": "assistant", "content": null, "tool_calls": [call("call_1")]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "ERROR: database unreachable"},
+        {"role": "assistant", "content": null, "tool_calls": [call("call_2")]},
+        {"role": "tool", "tool_call_id": "call_2", "content": "ERROR: database unreachable"}
+    ]);
+    rig.upstream.add("Vou rodar os testes novamente.").add(tool_call_text("run_command", json!({"command": "uv run pytest -q"})));
+    let r = chat(&rig, json!({"tools": chat_tools(), "messages": messages}));
+    assert_eq!(r["choices"][0]["finish_reason"], "stop");
+    assert!(r["choices"][0]["message"]["tool_calls"].is_null(), "{r}");
+    assert_eq!(rig.upstream.calls().len(), 2); // the follow-up ran once; its call was dropped and it was not asked again
+}
+
+#[test]
 fn a_second_announcement_gets_a_second_follow_up() {
     let rig = Rig::new();
     rig.upstream

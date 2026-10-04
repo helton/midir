@@ -303,11 +303,14 @@ impl EmulationEngine {
                 req.meta().followups += 1;
                 let prompt = follow.prompt;
                 let mut next = Reply::default();
+                let mut repeated = 0;
                 let mut s = this.stream_once(Arc::new(follow.req), format!("{rid}/{}", follow.suffix));
                 while let Some(ev) = s.next().await {
                     match ev? {
                         Event::ToolCall(c) => {
-                            if gate.pass() {
+                            if followups::repeats_itself(&req, &c) {
+                                repeated += 1;
+                            } else if gate.pass() {
                                 next.calls.push(c.clone());
                                 yield Event::ToolCall(c);
                             }
@@ -319,6 +322,14 @@ impl EmulationEngine {
                 }
                 drop(s);
                 reply.resp.usage = add_usage(&reply.resp.usage, Some(next.resp.usage));
+                if repeated > 0 {
+                    // CAVEAT: the same call already returned the same result twice in this turn; asking for it again
+                    // is a loop the client cannot leave
+                    tracing::warn!("{rid}/{} dropped {repeated} call(s) that returned the same result twice in this turn", follow.suffix);
+                    if next.calls.is_empty() {
+                        break;
+                    }
+                }
                 reply.calls.extend(next.calls.iter().cloned());
                 history.push((current.text.clone(), prompt));
                 current = next;

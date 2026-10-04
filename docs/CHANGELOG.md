@@ -40,6 +40,11 @@ release may change configuration or behavior.
   offer of the ordered action ("Se quiser o commit, só avisar") count as asking; an action a tool call already did
   (a `git commit` since the order) is not asked for again; and a final report that leaves out the commit the user
   ordered ("Tudo pronto! ... 14 passed", no commit made, no failure reported) gets a follow-up asking for it.
+- **Follow-ups never loop**: a reply that says it cannot reach something after a call in the same turn already tried
+  (VS Code Copilot's `fetch_webpage` answering 403 on PyPI), or that cites the failure (a 403, a timeout), reports what
+  the tool returned. The ability follow-up treated it as a false incapacity and appended the same fetch to every reply,
+  so the client ran it again, round after round, until the user stopped it. And a follow-up never makes again a call
+  whose last two runs in the turn returned the same result.
 - **Tool calls**: JSON with raw newlines or tabs inside strings, or with trailing commas, is read as the model meant
   it instead of costing a repair round trip; JSON mode with tools returns the model's tool calls (they were dropped);
   a forced `tool_choice` is retried when streaming too; text held back for a stop sequence comes out before a tool

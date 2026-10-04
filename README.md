@@ -144,7 +144,9 @@ event format; real token usage; errors in each protocol's format; `previous_resp
   broken. A reply that only announces an action, denies an ability a tool provides, or leaves pending an action the
   user ordered gets a hidden follow-up (two at most) whose calls are appended to the same response. A follow-up only
   confirms a commit or a test run the user explicitly ordered (and did not forbid, condition or keep for themselves);
-  push, merge, deploy and install are never confirmed for the user.
+  push, merge, deploy and install are never confirmed for the user. A reply that reports a failed call (a 403 after
+  trying the fetch tool) is left as it is, and no follow-up makes again a call whose last two runs returned the same
+  result.
 - Structured JSON is prompt + validation + one repair, not streamed incrementally.
 - `max_tokens` and `stop` are applied after generation; `count_tokens` is an estimate (4 chars per token).
 - Whenever a stream is idle (the backend can take a minute to start, a follow-up runs after the text), an SSE
