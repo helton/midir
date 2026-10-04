@@ -60,7 +60,7 @@ impl BuildInfo {
         }
     }
 
-    pub fn as_dict(&self) -> Value {
+    pub fn as_json(&self) -> Value {
         json!({"version": self.full_version(), "channel": self.channel, "commit": if self.commit.is_empty() { Value::Null } else { json!(self.commit) },
                "dirty": self.dirty, "date": if self.date.is_empty() { Value::Null } else { json!(self.date) }})
     }

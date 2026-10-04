@@ -11,15 +11,12 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::LimitSettings;
 use crate::errors::BackendError;
-use crate::py::json as pyjson;
-use crate::py::text;
 use crate::telemetry::Telemetry;
-
-const LOG: &str = "midir.limiter";
+use crate::text::round1;
 
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-/// `time.monotonic()` (seconds since the process started).
+/// Seconds on a monotonic clock (only differences matter).
 pub fn monotonic() -> f64 {
     EPOCH.elapsed().as_secs_f64() + 1000.0
 }
@@ -102,7 +99,7 @@ impl UpstreamLimiter {
         }
         let eff = self.effective(&mut st);
         json!({"max_concurrent": self.max_concurrent, "requests_per_minute": self.rpm, "effective_rpm": eff, "in_flight": self.in_flight.load(Ordering::SeqCst),
-               "waiting": self.waiting.load(Ordering::SeqCst), "starts_last_60s": st.starts.len(), "paused_s": pyjson::float(text::round1((st.paused_until - now).max(0.0)))})
+               "waiting": self.waiting.load(Ordering::SeqCst), "starts_last_60s": st.starts.len(), "paused_s": round1((st.paused_until - now).max(0.0))})
     }
 
     /// Seconds a client should wait before trying again (Retry-After on our 429s).
@@ -112,7 +109,7 @@ impl UpstreamLimiter {
         while st.starts.front().map_or(false, |s| now - s >= 60.0) {
             st.starts.pop_front();
         }
-        let paused = text::round1((st.paused_until - now).max(0.0));
+        let paused = round1((st.paused_until - now).max(0.0));
         let rpm = self.effective(&mut st);
         let window =
             if rpm > 0 && st.starts.len() as i64 >= rpm { st.starts[st.starts.len() - rpm as usize] + 60.0 - monotonic() } else { 0.0 };
@@ -127,8 +124,7 @@ impl UpstreamLimiter {
             let b = (self.effective(&mut st) / 2).max(10);
             st.budget = Some(b);
             st.budget_at = now;
-            crate::warn!(
-                LOG,
+            tracing::warn!(
                 "{} 429: pausing {:.0}s and lowering the local budget to {b} requests/minute (recovers 1/min)",
                 self.backend,
                 self.cooldown

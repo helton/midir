@@ -78,7 +78,7 @@ fn chat_null_description_and_empty_arguments() {
         json!({"model": "m", "messages": [{"role": "user", "content": "x"}, {"role": "assistant", "tool_calls": [{"id": "c", "function": {"name": "f", "arguments": ""}}]}, {"role": "tool", "tool_call_id": "c", "content": "r"}],
                "tools": [{"type": "function", "function": {"name": "f", "description": null, "parameters": null}}]}),
     );
-    assert!(p.contains("\"name\": \"f\", \"arguments\": {}") || p.contains("\"arguments\": {}"), "{p}");
+    assert!(p.contains("{\"name\": \"f\", \"arguments\": {}}"), "{p}");
 }
 
 #[test]

@@ -6,21 +6,29 @@ release may change configuration or behavior.
 ## 0.1.0 (2026-10-03)
 
 - **Rewritten in Rust**: Midir is now one static binary (tokio, axum, reqwest with rustls) instead of a Python
-  package, with the same behavior. Every observable detail was kept: endpoints, configuration (`config/midir.toml`,
-  `.env`, every `MIDIR_*`/`STACKSPOT_*`/`OTEL_*` variable), prompts sent to the backend byte for byte, SSE event
-  sequences, error bodies, the Responses store on disk (chains created by 0.0.1 keep working), telemetry and log
-  events. The regression suite is now black-box and in Rust too (`cargo test`: the binary as a process against a
-  scripted StackSpot); before the switch, the same scenarios ran against both implementations, plus a differential
-  test on 237 real client requests: same prompts to the backend, same answers to the client.
-  Measured against a local mock: startup 308 ms -> 61 ms, idle memory 48 MB -> 7 MB, about 7x the requests per
-  second; image 81 MB -> 7 MB (30 MB -> 3 MB to download), `FROM scratch`, health check with `midir --healthcheck`.
-  From source: `cargo build --release` (Rust 1.81+). Repository tasks moved to `cargo xtask` (version, bump,
-  check-leaks, smoke, deploy); the codebase no longer needs Python.
+  package. What clients and models see is unchanged: endpoints, configuration (`config/midir.toml`, `.env`, every
+  `MIDIR_*`/`STACKSPOT_*`/`OTEL_*` variable), the prompts sent to the backend (byte for byte on 237 captured client
+  requests), SSE event sequences, the Responses store on disk (chains created by 0.0.1 keep working), telemetry and
+  the log's messages (lines now read `HH:MM:SS LEVEL module: message`). Measured against a local mock: startup 308 ms
+  -> 61 ms, idle memory 48 MB -> 7 MB, about 7x the requests per second; image 81 MB -> 7 MB (30 MB -> 3 MB to
+  download), `FROM scratch`, health check with `midir --healthcheck`. From source: `cargo build --release` (Rust
+  1.81+).
+- **Clearer errors for malformed requests**: each protocol decodes the body into typed requests, so a field of the
+  wrong type is a 400 that names it (`invalid request: messages[2].content: a string or a list of content parts`);
+  unknown endpoints and methods answer 404/405 in the protocol's error format; a trailing slash is ignored
+  (`/v1/chat/completions/`); an internal error is a JSON error, not a bare 500. JSON output (responses, SSE events,
+  JSON mode) is compact.
+- **Configuration**: numbers and booleans may also be strings (`port = "${PORT}"`); an invalid value names the key
+  and the variable. `match` patterns use the `regex` crate's syntax (no lookaround or backreferences).
+- **Tests and tooling in Rust**: the regression suite is black-box (`cargo test`: the binary as a process against a
+  scripted StackSpot), with opt-in checks for the observability proxy and for a replay of real client requests.
+  Repository tasks moved to `cargo xtask` (version, bump, check-leaks, smoke, deploy); CI runs fmt, clippy and the
+  suite. The codebase no longer needs Python.
 - **Streaming through the observability stack fixed**: mitmproxy buffered whole responses, so on port 18880 tokens
   and keepalives reached clients only when generation was over, and StackSpot's stream reached Midir the same way.
   An addon (`docker/mitm/sse_stream.py`) streams `text/event-stream` responses through in both directions and keeps a
-  copy for mitmweb; `cargo test --release --test mitm -- --ignored` checks it. The overlay sets both spellings of the proxy variables
-  (`HTTPS_PROXY`/`https_proxy`, `NO_PROXY`/`no_proxy`).
+  copy for mitmweb; `cargo test --release --test mitm -- --ignored` checks it. The overlay sets both spellings of the
+  proxy variables (`HTTPS_PROXY`/`https_proxy`, `NO_PROXY`/`no_proxy`).
 - **Telemetry fixed**: request spans and metrics are flushed when the process stops (SIGTERM), and only Midir's own
   span per request is exported (0.0.1 also exported a span for every health check and internal step under
   `unknown_service:python`).

@@ -138,7 +138,7 @@ fn invalid_configuration_is_a_clear_error() {
         (format!("{bad_model}name = \"z\"\ntarget = \"X\"\nbackend = \"nope\"\n"), "'backend' must be one of"),
         (MIDIR_TOML.replace("default_model = \"gpt-5.1\"", "default_model = \"nope\""), "not one of the configured models"),
         ("this is = = not toml".to_string(), "cannot read"),
-        (MIDIR_TOML.replace("type = \"stackspot\"", "type = \"nope\""), "unknown type 'nope'"),
+        (MIDIR_TOML.replace("type = \"stackspot\"", "type = \"nope\""), "unknown type \"nope\""),
     ];
     for (toml, message) in cases {
         let o = run(&["--port", "1"], Some(&toml), &[]);

@@ -2,14 +2,14 @@
 
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use serde_json::{json, Map, Value};
+use serde::Deserialize;
+use serde_json::{json, Value};
 
-use super::common::{arguments_str, ignored_params, parse_arguments, text_of, tool_params, Adapted};
-use crate::canonical::{new_call_id, CanonicalRequest, CanonicalResponse, Event, ToolCall, ToolChoice, ToolResult, ToolSpec, Usage};
+use super::common::{arguments_text, decode, ignored_params, parse_arguments, positive, stops, text_of, tool_params, Content, Stop};
+use crate::canonical::{
+    new_call_id, CanonicalRequest, CanonicalResponse, Event, Finish, ToolCall, ToolChoice, ToolResult, ToolSpec, Usage,
+};
 use crate::errors::{ClientError, Error};
-use crate::py::json as pyjson;
-use crate::py::obj::{self, PyResult};
-use crate::py::text::{self, truthy};
 
 const IGNORED: [&str; 15] = [
     "temperature",
@@ -29,150 +29,203 @@ const IGNORED: [&str; 15] = [
     "verbosity",
 ];
 
-fn str_or(v: Option<&Value>, default: &str) -> String {
-    match v {
-        None | Some(Value::Null) => default.to_string(),
-        Some(x) => text::str_of(x),
-    }
+#[derive(Deserialize)]
+struct Request {
+    messages: Option<Vec<Message>>,
+    #[serde(default)]
+    tools: Vec<Tool>,
+    #[serde(default)]
+    functions: Vec<Function>,
+    tool_choice: Option<Choice>,
+    function_call: Option<Choice>,
+    response_format: Option<ResponseFormat>,
+    stop: Option<Stop>,
+    max_tokens: Option<i64>,
+    max_completion_tokens: Option<i64>,
+    n: Option<u64>,
+    #[serde(default)]
+    logprobs: Option<bool>,
+    top_logprobs: Option<u64>,
 }
 
-pub fn to_canonical(body: &Value) -> PyResult<Result<Adapted, ClientError>> {
-    if text::truthy_opt(body.get("logprobs")) || text::truthy_opt(body.get("top_logprobs")) {
-        return Ok(Err(ClientError::new("logprobs are not available from StackSpot", "unsupported_parameter")));
+#[derive(Deserialize)]
+#[serde(expecting = "a message object")]
+struct Message {
+    role: Option<String>,
+    content: Option<Content>,
+    #[serde(default)]
+    tool_calls: Vec<MessageToolCall>,
+    function_call: Option<Function>,
+    name: Option<String>,
+    tool_call_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(expecting = "a tool call object")]
+struct MessageToolCall {
+    id: Option<String>,
+    function: Option<Function>,
+}
+
+/// A function: its definition (tools, functions) or a call (name + arguments).
+#[derive(Deserialize, Default)]
+#[serde(expecting = "a function object")]
+struct Function {
+    name: Option<String>,
+    description: Option<String>,
+    parameters: Option<Value>,
+    arguments: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(expecting = "a tool object")]
+struct Tool {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    function: Option<Function>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged, expecting = "\"auto\", \"none\", \"required\" or an object naming a function")]
+enum Choice {
+    Mode(String),
+    Named { function: Option<Function>, name: Option<String> },
+}
+
+#[derive(Deserialize)]
+#[serde(expecting = "a response_format object")]
+struct ResponseFormat {
+    #[serde(rename = "type")]
+    kind: String,
+    json_schema: Option<JsonSchemaFormat>,
+}
+
+#[derive(Deserialize)]
+struct JsonSchemaFormat {
+    schema: Option<Value>,
+}
+
+/// The request as a canonical request (`max_tokens` included).
+pub fn to_canonical(body: &Value) -> Result<CanonicalRequest, ClientError> {
+    let r: Request = decode(body)?;
+    if r.logprobs == Some(true) || r.top_logprobs.is_some_and(|n| n > 0) {
+        return Err(ClientError::new("logprobs are not available from this backend", "unsupported_parameter"));
     }
-    if let Some(n) = body.get("n") {
-        if !n.is_null() && !text::eq(n, &json!(1)) {
-            return Ok(Err(ClientError::new("n > 1 is not supported (one generation per request)", "unsupported_parameter")));
-        }
+    if r.n.is_some_and(|n| n != 1) {
+        return Err(ClientError::new("n > 1 is not supported (one generation per request)", "unsupported_parameter"));
     }
-    let messages = match body.get("messages") {
-        Some(Value::Array(a)) if !a.is_empty() => a,
-        _ => return Ok(Err(ClientError::new("'messages' is required and must be a non-empty list", "missing_messages"))),
-    };
+    let messages = r
+        .messages
+        .filter(|m| !m.is_empty())
+        .ok_or_else(|| ClientError::new("'messages' is required and must be a non-empty list", "missing_messages"))?;
     let mut req = CanonicalRequest { ignored: ignored_params(body, &IGNORED), ..Default::default() };
     for m in messages {
-        let role = obj::get(m, "role")?.cloned().unwrap_or(json!("user"));
-        let role_s = role.as_str().unwrap_or("");
-        if role.is_string() && (role_s == "system" || role_s == "developer") {
-            req.system.push(text_of(obj::get(m, "content")?, "system")?);
-        } else if role.is_string() && role_s == "assistant" {
-            let mut calls = vec![];
-            for tc in obj::iter_or_empty(obj::get(m, "tool_calls")?)? {
-                let id = obj::get(&tc, "id")?;
-                let f = obj::get_truthy(&tc, "function")?.cloned().unwrap_or(json!({}));
-                let name = str_or(obj::get(&f, "name")?, "");
-                let id = if text::truthy_opt(id) { text::str_of(id.unwrap_or(&Value::Null)) } else { new_call_id() };
-                calls.push(ToolCall { id, name, arguments: parse_arguments(obj::get(&f, "arguments")?) });
+        let role = m.role.unwrap_or_else(|| "user".into());
+        match role.as_str() {
+            "system" | "developer" => req.system.push(text_of(&m.content, "system")),
+            "assistant" => {
+                let mut calls: Vec<ToolCall> = m
+                    .tool_calls
+                    .into_iter()
+                    .map(|tc| {
+                        let f = tc.function.unwrap_or_default();
+                        ToolCall {
+                            id: tc.id.filter(|i| !i.is_empty()).unwrap_or_else(new_call_id),
+                            name: f.name.unwrap_or_default(),
+                            arguments: parse_arguments(f.arguments),
+                        }
+                    })
+                    .collect();
+                if let Some(fc) = m.function_call {
+                    calls.push(ToolCall { id: new_call_id(), name: fc.name.unwrap_or_default(), arguments: parse_arguments(fc.arguments) });
+                }
+                req.add("assistant", &text_of(&m.content, "assistant"), calls, vec![]);
             }
-            if let Some(fc) = obj::get_truthy(m, "function_call")? {
-                let name = str_or(obj::get(fc, "name")?, "");
-                calls.push(ToolCall { id: new_call_id(), name, arguments: parse_arguments(obj::get(fc, "arguments")?) });
+            "tool" | "function" => {
+                let name = m.name.unwrap_or_default();
+                let call_id = m.tool_call_id.filter(|i| !i.is_empty()).unwrap_or_else(|| name.clone());
+                let content = text_of(&m.content, "tool");
+                req.add("user", "", vec![], vec![ToolResult { call_id, content, name, is_error: false }]);
             }
-            let t = text_of(obj::get(m, "content")?, "assistant")?;
-            req.add("assistant", &t, calls, vec![]);
-        } else if role.is_string() && (role_s == "tool" || role_s == "function") {
-            let name = str_or(obj::get(m, "name")?, "");
-            let call_id = match obj::get(m, "tool_call_id")? {
-                Some(v) if truthy(v) => text::str_of(v),
-                _ => obj::get(m, "name")?.map(text::str_of).unwrap_or_default(),
-            };
-            let content = text_of(obj::get(m, "content")?, "tool")?;
-            req.add("user", "", vec![], vec![ToolResult { call_id, content, name, is_error: false }]);
-        } else {
-            let t = text_of(obj::get(m, "content")?, &text::str_of(&role))?;
-            req.add("user", &t, vec![], vec![]);
+            other => req.add_text("user", &text_of(&m.content, other)),
         }
     }
-    for t in obj::iter_or_empty(body.get("tools"))? {
-        let typ = obj::get(&t, "type")?.cloned().unwrap_or(json!("function"));
-        if !obj::is_str(Some(&typ), "function") {
-            req.ignored.push(format!("tool:{}", text::str_of(obj::get(&t, "type")?.unwrap_or(&Value::Null))));
-            continue;
+    for t in r.tools {
+        match t.kind.as_deref().unwrap_or("function") {
+            "function" => {
+                let f = t.function.unwrap_or_default();
+                req.tools.push(ToolSpec::new(
+                    f.name.unwrap_or_default(),
+                    f.description.unwrap_or_default(),
+                    tool_params(f.parameters),
+                    false,
+                ));
+            }
+            other => req.ignored.push(format!("tool:{other}")),
         }
-        let f = obj::get_truthy(&t, "function")?.cloned().unwrap_or(json!({}));
-        let name = obj::get(&f, "name")?.cloned().unwrap_or(json!(""));
-        req.tools.push(ToolSpec::new(Some(&name), obj::get(&f, "description")?, tool_params(obj::get(&f, "parameters")?), false));
     }
-    for f in obj::iter_or_empty(body.get("functions"))? {
-        let name = obj::get(&f, "name")?.cloned().unwrap_or(json!(""));
-        let desc = obj::get(&f, "description")?.cloned().unwrap_or(json!(""));
-        req.tools.push(ToolSpec::new(Some(&name), Some(&desc), tool_params(obj::get(&f, "parameters")?), false));
+    for f in r.functions {
+        req.tools.push(ToolSpec::new(f.name.unwrap_or_default(), f.description.unwrap_or_default(), tool_params(f.parameters), false));
     }
-    let choice = match body.get("tool_choice") {
-        Some(c) => c.clone(),
-        None => body.get("function_call").cloned().unwrap_or(json!("auto")),
+    req.tool_choice = match r.tool_choice.or(r.function_call) {
+        Some(Choice::Mode(m)) => match m.as_str() {
+            "none" => ToolChoice::None,
+            "required" => ToolChoice::Required,
+            _ => ToolChoice::Auto,
+        },
+        Some(Choice::Named { function, name }) => match function.and_then(|f| f.name).or(name).filter(|n| !n.is_empty()) {
+            Some(n) => ToolChoice::Named(n),
+            None => ToolChoice::Auto,
+        },
+        None => ToolChoice::Auto,
     };
-    match &choice {
-        Value::Object(_) => {
-            let f = obj::get_truthy(&choice, "function")?.cloned().unwrap_or(json!({}));
-            let name = match obj::get(&f, "name")? {
-                Some(n) if truthy(n) => Some(n.clone()),
-                _ => choice.get("name").cloned(),
-            };
-            req.tool_choice = match name {
-                Some(n) if truthy(&n) => ToolChoice::Named(n),
-                _ => ToolChoice::Auto,
-            };
-        }
-        Value::String(s) if s == "none" => req.tool_choice = ToolChoice::None,
-        Value::String(s) if s == "required" => req.tool_choice = ToolChoice::Required,
-        Value::String(s) if s == "auto" => req.tool_choice = ToolChoice::Auto,
-        _ => {}
-    }
-    if let Some(fmt @ Value::Object(_)) = body.get("response_format") {
-        if obj::is_str(fmt.get("type"), "json_object") {
-            req.json_schema = Some(json!({"type": "object"}));
-        } else if obj::is_str(fmt.get("type"), "json_schema") {
-            let js = obj::get_truthy(fmt, "json_schema")?.cloned().unwrap_or(json!({}));
-            req.json_schema = Some(match obj::get(&js, "schema")? {
-                Some(s) if truthy(s) => s.clone(),
-                _ => json!({"type": "object"}),
-            });
+    if let Some(fmt) = r.response_format {
+        match fmt.kind.as_str() {
+            "json_object" => req.json_schema = Some(json!({"type": "object"})),
+            "json_schema" => {
+                let schema = fmt.json_schema.and_then(|j| j.schema).filter(|s| s.as_object().is_some_and(|m| !m.is_empty()));
+                req.json_schema = Some(schema.unwrap_or_else(|| json!({"type": "object"})));
+            }
+            _ => {}
         }
     }
-    req.stop = match body.get("stop") {
-        Some(Value::String(s)) => vec![s.clone()],
-        other => obj::iter_or_empty(other)?.into_iter().filter_map(|s| s.as_str().map(String::from)).collect(),
-    };
-    let max_tokens = match body.get("max_completion_tokens") {
-        Some(v) if truthy(v) => Some(v.clone()),
-        _ => body.get("max_tokens").cloned(),
-    };
-    Ok(Ok(Adapted { req, max_tokens }))
+    req.stop = stops(r.stop);
+    req.max_tokens = positive("max_tokens", r.max_completion_tokens.or(r.max_tokens))?;
+    Ok(req)
+}
+
+/// Whether a streamed response should end with a usage chunk (`stream_options.include_usage`, default on).
+pub fn include_usage(body: &Value) -> bool {
+    body.get("stream_options").and_then(|o| o.get("include_usage")).and_then(Value::as_bool).unwrap_or(true)
 }
 
 pub fn finish_reason(r: &CanonicalResponse) -> &'static str {
-    match r.finish.as_str() {
-        "tool_calls" => "tool_calls",
-        "length" => "length",
-        _ => "stop",
+    match r.finish {
+        Finish::ToolCalls => "tool_calls",
+        Finish::Length => "length",
+        Finish::Stop | Finish::StopSequence => "stop",
     }
 }
 
 /// Same shape streaming (last chunk) and not.
 pub fn usage(u: &Usage) -> Value {
-    let mut m = match u.to_json() {
-        Value::Object(m) => m,
-        _ => Map::new(),
-    };
-    m.insert("prompt_tokens_details".into(), json!({"cached_tokens": 0}));
-    m.insert("completion_tokens_details".into(), json!({"reasoning_tokens": 0}));
-    Value::Object(m)
+    json!({"prompt_tokens": u.prompt_tokens, "completion_tokens": u.completion_tokens, "total_tokens": u.total_tokens,
+           "prompt_tokens_details": {"cached_tokens": 0}, "completion_tokens_details": {"reasoning_tokens": 0}})
 }
 
 fn tool_call(c: &ToolCall, index: Option<usize>) -> Value {
-    let mut d = json!({"id": c.id, "type": "function", "function": {"name": c.name, "arguments": arguments_str(&c.arguments)}});
-    if let (Some(i), Value::Object(m)) = (index, &mut d) {
-        m.insert("index".into(), json!(i));
+    let mut d = json!({"id": c.id, "type": "function", "function": {"name": c.name, "arguments": arguments_text(&c.arguments)}});
+    if let Some(i) = index {
+        d["index"] = json!(i);
     }
     d
 }
 
-pub fn response(r: &CanonicalResponse, cid: &str, created: i64, model: &Value) -> Value {
+pub fn response(r: &CanonicalResponse, cid: &str, created: i64, model: &str) -> Value {
     let content = if !r.text.is_empty() || r.tool_calls.is_empty() { json!(r.text) } else { Value::Null };
     let mut message = json!({"role": "assistant", "content": content, "refusal": null});
     if !r.tool_calls.is_empty() {
-        message["tool_calls"] = Value::Array(r.tool_calls.iter().map(|c| tool_call(c, None)).collect());
+        message["tool_calls"] = r.tool_calls.iter().map(|c| tool_call(c, None)).collect();
     }
     json!({"id": cid, "object": "chat.completion", "created": created, "model": model,
            "choices": [{"index": 0, "message": message, "finish_reason": finish_reason(r), "logprobs": null}],
@@ -183,7 +236,7 @@ pub fn stream(
     events: BoxStream<'static, Result<Event, Error>>,
     cid: String,
     created: i64,
-    model: Value,
+    model: String,
     include_usage: bool,
 ) -> BoxStream<'static, Result<String, Error>> {
     let chunk = move |delta: Value, finish: Option<&str>, usage: Option<Value>| -> String {
@@ -192,7 +245,7 @@ pub fn stream(
         if let Some(u) = usage {
             d["usage"] = u;
         }
-        format!("data: {}\n\n", pyjson::dumps(&d, pyjson::DEFAULT))
+        format!("data: {d}\n\n")
     };
     Box::pin(async_stream::try_stream! {
         yield chunk(json!({"role": "assistant", "content": ""}), None, None);
@@ -206,10 +259,7 @@ pub fn stream(
                     n_calls += 1;
                 }
                 Event::Keepalive => yield ": keepalive\n\n".to_string(),
-                Event::Done(r) => {
-                    let u = if include_usage { Some(usage(&r.usage)) } else { None };
-                    yield chunk(json!({}), Some(finish_reason(&r)), u);
-                }
+                Event::Done(r) => yield chunk(json!({}), Some(finish_reason(&r)), include_usage.then(|| usage(&r.usage))),
             }
         }
         yield "data: [DONE]\n\n".to_string();

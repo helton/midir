@@ -22,7 +22,7 @@ fn chat_keepalive_before_content_only() {
     let rig = fast();
     rig.upstream.add(Reply::text("Hello there, this is the answer.").delay(SLOW));
     let r = rig.http.post("/v1/chat/completions", &json!({"model": "gpt-5.1", "messages": user("hi"), "stream": true}));
-    let (before, after) = split_at(&r.text, "\"content\": \"Hello");
+    let (before, after) = split_at(&r.text, "\"content\":\"Hello");
     assert!(before.matches(": keepalive").count() >= 2, "{before}");
     assert!(!after.contains(": keepalive"));
     assert!(r.text.trim_end().ends_with("data: [DONE]"));
@@ -70,7 +70,7 @@ fn json_mode_waits_with_keepalives() {
         &json!({"model": "gpt-5.1", "messages": user("hi"), "stream": true, "response_format": {"type": "json_object"}}),
     );
     assert!(r.text.matches(": keepalive").count() >= 2);
-    assert!(r.text.contains(r#"{\"a\": 1}"#), "{}", r.text);
+    assert!(r.text.contains(r#"{\"a\":1}"#), "{}", r.text);
 }
 
 #[test]

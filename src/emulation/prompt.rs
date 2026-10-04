@@ -4,10 +4,7 @@
 use serde_json::{json, Map, Value};
 
 use crate::canonical::{CanonicalRequest, ToolChoice, ToolSpec, Turn};
-use crate::py::json as pyjson;
-use crate::py::text;
-
-const LOG: &str = "midir.emulation.prompt";
+use crate::text::{char_len, ellipsize, readable_json};
 
 pub const TOOL_PROTOCOL: &str = r#"# Tools
 You can call tools. To call one, write exactly this block:
@@ -31,44 +28,44 @@ pub const ASSISTANT_PREFILL_NUDGE: &str = "(continue your previous message exact
 const KEEP_RECENT_TURNS: usize = 4;
 const TAIL_REMINDER_TEXT: &str = "<reminder>Check your last paragraph before ending: if it announces, plans or promises an action, emit its <tool_call> block(s) now, in this reply; several independent calls go in one reply. Never claim you lack an ability a listed tool provides.</reminder>";
 
-/// Copy of a JSON Schema with every nested "description" cut at `limit` chars.
+/// Copy of a JSON Schema with every nested "description" cut at `limit` characters.
 fn truncate_descriptions(schema: &Value, limit: usize) -> Value {
     match schema {
-        Value::Object(m) => {
-            let mut out = Map::new();
-            for (k, v) in m {
-                match v {
-                    Value::String(s) if k == "description" && text::len(s) > limit => {
-                        out.insert(k.clone(), json!(format!("{}…", text::rstrip(text::head(s, limit)))));
-                    }
-                    _ => {
-                        out.insert(k.clone(), truncate_descriptions(v, limit));
-                    }
-                }
-            }
-            Value::Object(out)
-        }
+        Value::Object(m) => Value::Object(
+            m.iter()
+                .map(|(k, v)| match v {
+                    Value::String(s) if k == "description" => (k.clone(), json!(ellipsize(s, limit))),
+                    _ => (k.clone(), truncate_descriptions(v, limit)),
+                })
+                .collect(),
+        ),
         Value::Array(a) => Value::Array(a.iter().map(|v| truncate_descriptions(v, limit)).collect()),
         other => other.clone(),
     }
 }
 
-/// One tool per line as compact JSON without empty keys.
+fn non_empty(v: Option<&Value>) -> bool {
+    match v {
+        Some(Value::Object(m)) => !m.is_empty(),
+        Some(Value::Array(a)) => !a.is_empty(),
+        _ => false,
+    }
+}
+
+/// One tool per line as compact JSON without empty keys. `desc_max` > 0 cuts descriptions (also nested ones).
 fn tool_line(t: &ToolSpec, desc_max: i64) -> String {
+    let limit = usize::try_from(desc_max).ok().filter(|n| *n > 0);
     let mut d = Map::new();
     d.insert("name".into(), json!(t.name));
-    let mut description = t.description.clone();
-    if desc_max != 0 && (text::len(&description) as i64) > desc_max {
-        description = format!("{}…", text::rstrip(text::head(&description, desc_max.max(0) as usize)));
-    }
+    let description = limit.map_or_else(|| t.description.clone(), |n| ellipsize(&t.description, n));
     if !description.is_empty() {
         d.insert("description".into(), json!(description));
     }
     let params = &t.parameters;
-    if text::truthy_opt(params.get("properties")) || text::truthy_opt(params.get("required")) {
-        d.insert("parameters".into(), if desc_max != 0 { truncate_descriptions(params, desc_max.max(0) as usize) } else { params.clone() });
+    if non_empty(params.get("properties")) || non_empty(params.get("required")) {
+        d.insert("parameters".into(), limit.map_or_else(|| params.clone(), |n| truncate_descriptions(params, n)));
     }
-    pyjson::dumps(&Value::Object(d), pyjson::COMPACT)
+    Value::Object(d).to_string()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -86,15 +83,12 @@ fn render_turn(req: &CanonicalRequest, t: &Turn) -> String {
         parts.push(t.text.clone());
     }
     for c in &t.tool_calls {
+        // arguments that are not JSON (a client's broken history) are shown as they came
         let args = match &c.arguments {
             Value::String(s) => s.clone(),
-            other => pyjson::dumps(other, pyjson::DEFAULT),
+            other => readable_json(other),
         };
-        parts.push(format!(
-            "<tool_call id=\"{}\">\n{{\"name\": {}, \"arguments\": {args}}}\n</tool_call>",
-            c.id,
-            pyjson::dumps_str(&c.name, true)
-        ));
+        parts.push(format!("<tool_call id=\"{}\">\n{{\"name\": {}, \"arguments\": {args}}}\n</tool_call>", c.id, readable_json(&c.name)));
     }
     for r in &t.tool_results {
         let err = if r.is_error { " is_error=\"true\"" } else { "" };
@@ -111,26 +105,24 @@ fn render_turn(req: &CanonicalRequest, t: &Turn) -> String {
 /// reminder. Above `max_chars` the oldest history turns are dropped (never the system parts, the last turn or the last
 /// KEEP_RECENT_TURNS history turns).
 pub fn render_prompt(req: &CanonicalRequest, max_chars: i64, tail_reminder: bool, tool_desc_max: i64) -> (String, PromptInfo) {
-    let mut system_parts: Vec<String> = req.system.iter().filter(|s| !text::is_blank(s)).cloned().collect();
-    let tools_on = !req.tools.is_empty() && req.tool_choice != ToolChoice::None;
+    let mut system_parts: Vec<String> = req.system.iter().filter(|s| !s.trim().is_empty()).cloned().collect();
+    let tools_on = req.tools_on();
     if tools_on {
         let mut block = TOOL_PROTOCOL.to_string();
         block.push_str(&req.tools.iter().map(|t| tool_line(t, tool_desc_max)).collect::<Vec<_>>().join("\n"));
         match &req.tool_choice {
             ToolChoice::Required => block.push_str(TOOL_CHOICE_REQUIRED),
-            ToolChoice::Named(n) => {
-                block.push_str(&format!("\nIn this response you MUST call the tool `{}` (and only that tool).", text::str_of(n)))
-            }
+            ToolChoice::Named(n) => block.push_str(&format!("\nIn this response you MUST call the tool `{n}` (and only that tool).")),
             _ => {}
         }
         system_parts.push(block);
     }
     if let Some(schema) = &req.json_schema {
-        let loose = text::eq(schema, &json!({})) || text::eq(schema, &json!({"type": "object"}));
+        let loose = schema == &json!({}) || schema == &json!({"type": "object"});
         let schema_line = if loose {
             "The value must be a JSON object.".to_string()
         } else {
-            format!("The value must validate against this JSON Schema:\n{}", pyjson::dumps(schema, pyjson::DEFAULT))
+            format!("The value must validate against this JSON Schema:\n{}", readable_json(schema))
         };
         system_parts.push(format!(
             "# Output format\nRespond with a single JSON value and nothing else: no code fences, no prose before or after.\n{schema_line}"
@@ -174,7 +166,7 @@ pub fn render_prompt(req: &CanonicalRequest, max_chars: i64, tail_reminder: bool
 
     let mut start = 0usize;
     let mut prompt = build(&history, 0);
-    let mut prompt_len = text::len(&prompt);
+    let mut prompt_len = char_len(&prompt);
     let original = prompt_len;
     let mut dropped = 0usize;
     while (prompt_len as i64) > max_chars && history.len() - start > KEEP_RECENT_TURNS {
@@ -182,16 +174,15 @@ pub fn render_prompt(req: &CanonicalRequest, max_chars: i64, tail_reminder: bool
         start += n;
         dropped += n;
         prompt = build(&history[start..], dropped);
-        prompt_len = text::len(&prompt);
+        prompt_len = char_len(&prompt);
     }
-    let system_chars: usize = system_parts.iter().map(|s| text::len(s)).sum();
+    let system_chars: usize = system_parts.iter().map(|s| char_len(s)).sum();
     if dropped > 0 {
-        crate::warn!(LOG, "prompt of {original} chars exceeded {max_chars}; dropped {dropped} old turns -> {prompt_len} chars");
+        tracing::warn!("prompt of {original} chars exceeded {max_chars}; dropped {dropped} old turns -> {prompt_len} chars");
     }
     let history_turns = history.len() - start;
     if (prompt_len as i64) > max_chars {
-        crate::error!(
-            LOG,
+        tracing::error!(
             "prompt of {prompt_len} chars still above {max_chars} with system ({system_chars} chars) + last {} turns; sending anyway",
             history_turns.min(KEEP_RECENT_TURNS) + 1
         );

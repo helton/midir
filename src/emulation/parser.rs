@@ -7,23 +7,18 @@ use regex::Regex;
 use serde_json::{json, Map, Value};
 
 use crate::canonical::{new_call_id, ToolCall, ToolSpec};
-use crate::py::json as pyjson;
-use crate::py::text;
+use crate::text::prefix;
 
-const LOG: &str = "midir.emulation.parser";
 pub const OPEN_TAG: &str = "<tool_call";
 pub const CLOSE_TAG: &str = "</tool_call>";
-static OPEN_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?s)^<tool_call(?:[\s\x1c-\x1f]+id[\s\x1c-\x1f]*=[\s\x1c-\x1f]*"?([\w.-]*)"?)?[\s\x1c-\x1f]*>"#).unwrap()
-});
-static FENCE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?s)^[\s\x1c-\x1f]*```(?:json)?[\s\x1c-\x1f]*|[\s\x1c-\x1f]*```[\s\x1c-\x1f]*$").unwrap());
+static OPEN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?s)^<tool_call(?:\s+id\s*=\s*"?([\w.-]*)"?)?\s*>"#).unwrap());
+static FENCE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)^\s*```(?:json)?\s*|\s*```\s*$").unwrap());
 static LOOKS_LIKE_CALL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#""(name|arguments|parameters|input|tool|function)"\s*:"#).unwrap());
 static SALVAGE_NAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""name"\s*:\s*"([^"]+)""#).unwrap());
 static SALVAGE_ARGS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""(?:arguments|parameters|input)"\s*:\s*"#).unwrap());
 
-/// `FENCE_RE.sub("", s)`.
+/// The text without a surrounding Markdown code fence (```json ... ```).
 pub fn strip_fences(s: &str) -> String {
     FENCE_RE.replace_all(s, "").into_owned()
 }
@@ -57,8 +52,8 @@ impl ToolCallParser {
             if !self.in_call {
                 if let Some(i) = self.buf.find(OPEN_TAG) {
                     let before = &self.buf[..i];
-                    if !text::is_blank(before) {
-                        let t = if before.ends_with("\n\n") { before.to_string() } else { text::rstrip(before).to_string() };
+                    if !before.trim().is_empty() {
+                        let t = if before.ends_with("\n\n") { before.to_string() } else { before.trim_end().to_string() };
                         out.push(Parsed::Text(t));
                     }
                     self.buf = self.buf[i..].to_string();
@@ -69,7 +64,7 @@ impl ToolCallParser {
                     Some(k) if OPEN_TAG.starts_with(&self.buf[k..]) => k,
                     _ => self.buf.len(),
                 };
-                if hold_from > 0 && text::is_blank(&self.buf[..hold_from]) {
+                if hold_from > 0 && self.buf[..hold_from].trim().is_empty() {
                     return out; // whitespace alone waits for real text: it never becomes a text block of its own
                 }
                 if hold_from > 0 {
@@ -92,7 +87,7 @@ impl ToolCallParser {
 
     pub fn finish(&mut self) -> Vec<Parsed> {
         let mut out = vec![];
-        if self.in_call && !text::is_blank(&self.buf) {
+        if self.in_call && !self.buf.trim().is_empty() {
             let block = format!("{}{CLOSE_TAG}", self.buf);
             let calls = self.parse_block(&block); // CAVEAT: block without </tool_call>; parsed anyway
             if calls.is_empty() {
@@ -100,7 +95,7 @@ impl ToolCallParser {
             } else {
                 out.extend(calls.into_iter().map(Parsed::Call));
             }
-        } else if !self.buf.is_empty() && (!text::is_blank(&self.buf) || !self.saw_call) {
+        } else if !self.buf.is_empty() && (!self.buf.trim().is_empty() || !self.saw_call) {
             out.push(Parsed::Text(self.buf.clone()));
         }
         self.buf.clear();
@@ -114,26 +109,26 @@ impl ToolCallParser {
         let start = OPEN_RE.find(block).map_or(OPEN_TAG.len(), |m| m.end());
         let end = block.len().saturating_sub(CLOSE_TAG.len());
         let inner_raw = if start <= end { &block[start..end] } else { "" };
-        let inner = strip_fences(text::strip(inner_raw));
-        let objs: Vec<Value> = match pyjson::loads(&inner) {
+        let inner = strip_fences(inner_raw.trim());
+        let objs: Vec<Value> = match serde_json::from_str(&inner) {
             Ok(Value::Array(a)) => a,
             Ok(v) => vec![v],
             Err(e) => {
                 let (mut objs, rest) = decode_sequence(&inner);
-                if !text::is_blank(&rest) {
+                if !rest.trim().is_empty() {
                     if let Some(salvaged) = salvage(&rest) {
                         objs.push(salvaged);
                     } else if !objs.is_empty() && !LOOKS_LIKE_CALL_RE.is_match(&rest) {
                         // trailing junk after a decoded call: nothing was lost, nothing to repair
                     } else {
-                        self.rejected.push(text::head(text::strip(&rest), 4000).to_string());
+                        self.rejected.push(prefix(rest.trim(), 4000).to_string());
                     }
                     self.errors.push(format!(
-                        "invalid JSON in tool_call ({e}); kept {} call(s); raw block: {}",
+                        "invalid JSON in tool_call ({e}); kept {} call(s); raw block: {:?}",
                         objs.len(),
-                        text::repr_str(text::head(&inner, 300))
+                        prefix(&inner, 300)
                     ));
-                    crate::debug!(LOG, "tool_call raw block: {}", text::repr_str(text::head(&inner, 4000)));
+                    tracing::debug!("tool_call raw block: {:?}", prefix(&inner, 4000));
                 } else if objs.len() > 1 {
                     self.errors.push(format!("tool_call block held {} JSON objects; split into {} calls", objs.len(), objs.len()));
                 }
@@ -152,24 +147,23 @@ impl ToolCallParser {
             self.errors.push("tool_call without 'name'".into());
             return None;
         };
-        let name = text::str_of(&map["name"]);
+        let name = match &map["name"] {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
         let mut args = map.get("arguments").or_else(|| map.get("parameters")).or_else(|| map.get("input")).cloned().unwrap_or(json!({}));
         if let Value::String(s) = &args {
-            match pyjson::loads(s) {
+            match serde_json::from_str(s) {
                 Ok(v) => args = v,
                 Err(_) => {
-                    self.errors.push(format!(
-                        "tool_call {} dropped: arguments are not valid JSON: {}",
-                        text::repr_str(&name),
-                        text::repr_str(text::head(s, 300))
-                    ));
-                    self.rejected.push(text::head(&pyjson::dumps(&obj, pyjson::DEFAULT), 4000).to_string());
+                    self.errors.push(format!("tool_call {name:?} dropped: arguments are not valid JSON: {:?}", prefix(s, 300)));
+                    self.rejected.push(prefix(&obj.to_string(), 4000).to_string());
                     return None;
                 }
             }
         }
         if !args.is_null() && !args.is_object() {
-            self.errors.push(format!("tool_call {} dropped: arguments are not a JSON object", text::repr_str(&name)));
+            self.errors.push(format!("tool_call {name:?} dropped: arguments are not a JSON object"));
             return None;
         }
         Some(ToolCall { id: new_call_id(), name, arguments: if args.is_null() { json!({}) } else { args } })
@@ -213,19 +207,18 @@ impl ToolCallParser {
         if candidates.len() == 1 || (candidates.is_empty() && self.tools.len() == 1) {
             let tool = candidates.first().copied().unwrap_or(&self.tools[0]);
             let name = tool.name.clone();
-            self.errors.push(format!("tool_call without 'name': inferred {} from the arguments", text::repr_str(&name)));
+            self.errors.push(format!("tool_call without 'name': inferred {name:?} from the arguments"));
             return json!({"name": name, "arguments": Value::Object(obj)});
         }
         Value::Object(obj)
     }
 }
 
-/// `set(x or ...)` of a schema's properties (dict keys) or required list.
+/// The names in a schema's `properties` (object keys) or `required` (list of strings).
 fn key_set(v: Option<&Value>) -> HashSet<String> {
     match v {
         Some(Value::Object(m)) => m.keys().cloned().collect(),
-        Some(Value::Array(a)) => a.iter().map(text::str_of).collect(),
-        Some(Value::String(s)) => s.chars().map(|c| c.to_string()).collect(),
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).map(String::from).collect(),
         _ => HashSet::new(),
     }
 }
@@ -243,17 +236,24 @@ pub fn decode_sequence(s: &str) -> (Vec<Value>, String) {
         if i >= b.len() {
             return (objs, String::new());
         }
-        match pyjson::raw_decode(s, i) {
-            Ok((v, end)) => {
+        match decode_prefix(&s[i..]) {
+            Some((v, used)) => {
                 match v {
                     Value::Array(a) => objs.extend(a),
                     other => objs.push(other),
                 }
-                i = end;
+                i += used;
             }
-            Err(_) => return (objs, s[i..].to_string()),
+            None => return (objs, s[i..].to_string()),
         }
     }
+}
+
+/// The JSON value at the start of `s` and the bytes it used (anything may follow it).
+fn decode_prefix(s: &str) -> Option<(Value, usize)> {
+    let mut it = serde_json::Deserializer::from_str(s).into_iter::<Value>();
+    let v = it.next()?.ok()?;
+    Some((v, it.byte_offset()))
 }
 
 /// Last resort for one broken object: the "name" string and the "arguments" value decoded on their own.
@@ -262,8 +262,8 @@ fn salvage(s: &str) -> Option<Value> {
     let Some(args) = SALVAGE_ARGS_RE.find(s) else {
         return Some(json!({"name": name, "arguments": {}}));
     };
-    match pyjson::raw_decode(s, args.end()) {
-        Ok((v @ Value::Object(_), _)) => Some(json!({"name": name, "arguments": v})),
+    match decode_prefix(&s[args.end()..]) {
+        Some((v @ Value::Object(_), _)) => Some(json!({"name": name, "arguments": v})),
         _ => None,
     }
 }

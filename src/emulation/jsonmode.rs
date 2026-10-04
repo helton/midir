@@ -1,80 +1,92 @@
-//! Structured output for text backends: parse the model's text as JSON (tolerating code
-//! fences) and validate it against the schema.
+//! Structured output for text backends: parse the model's text as JSON (tolerating code fences) and validate it against
+//! the schema.
 
 use serde_json::Value;
 
 use super::parser::strip_fences;
-use crate::py::json as pyjson;
-use crate::py::text;
 
-fn matches_type(value: &Value, t: &Value) -> bool {
-    let Value::String(t) = t else { return true }; // py.get(t, object): any value is an object
-    match t.as_str() {
-        "object" => value.is_object(),
-        "array" => value.is_array(),
-        "string" => value.is_string(),
-        "integer" => text::is_int(value),
-        "number" => value.is_number() || value.is_boolean(),
-        "boolean" => value.is_boolean(),
-        "null" => value.is_null(),
-        _ => true,
+/// The JSON Schema type name of a value.
+fn type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(n) if n.is_i64() || n.is_u64() => "integer",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
-/// `value in container` for the `enum` check (Python semantics).
-fn contains(container: &Value, value: &Value) -> bool {
-    match container {
-        Value::Array(a) => a.iter().any(|x| text::eq(x, value)),
-        Value::Object(m) => value.as_str().map_or(false, |k| m.contains_key(k)),
-        Value::String(s) => value.as_str().map_or(false, |v| s.contains(v)),
+fn is_integer(v: &Value) -> bool {
+    match v {
+        Value::Number(n) => n.is_i64() || n.is_u64() || n.as_f64().is_some_and(|f| f.fract() == 0.0),
         _ => false,
+    }
+}
+
+fn matches_type(value: &Value, t: &str) -> bool {
+    match t {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "integer" => is_integer(value),
+        "number" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        _ => true, // an unknown type name constrains nothing
+    }
+}
+
+/// JSON Schema equality: numbers by value (1 == 1.0), objects regardless of key order.
+fn json_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => match (x.as_i64(), y.as_i64()) {
+            (Some(i), Some(j)) => i == j,
+            _ => x.as_f64() == y.as_f64(),
+        },
+        (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| json_eq(p, q)),
+        (Value::Object(x), Value::Object(y)) => x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| json_eq(v, w))),
+        _ => a == b,
     }
 }
 
 /// Basic validation (type, required, properties, items, enum, additionalProperties).
 /// CAVEAT: allOf/oneOf/anyOf, pattern and format are not checked.
 pub fn validate_json_schema(value: &Value, schema: &Value, path: &str) -> Vec<String> {
-    let mut errs = vec![];
-    let typ = schema.get("type").cloned().unwrap_or(Value::Null);
-    let types: Vec<Value> = match &typ {
-        Value::Array(a) => a.clone(),
-        t if text::truthy(t) => vec![t.clone()],
+    let types: Vec<&str> = match schema.get("type") {
+        Some(Value::String(t)) => vec![t.as_str()],
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
         _ => vec![],
     };
-    if !types.is_empty()
-        && !types.iter().any(|t| matches_type(value, t) && !(text::eq(t, &Value::String("integer".into())) && value.is_boolean()))
-    {
-        return vec![format!("{path}: expected {}, got {}", text::str_of(&typ), text::type_name(value))];
+    if !types.is_empty() && !types.iter().any(|t| matches_type(value, t)) {
+        return vec![format!("{path}: expected {}, got {}", types.join(" or "), type_name(value))];
     }
-    if let Some(e) = schema.get("enum") {
-        if !contains(e, value) {
+    let mut errs = vec![];
+    if let Some(Value::Array(options)) = schema.get("enum") {
+        if !options.iter().any(|o| json_eq(o, value)) {
             errs.push(format!("{path}: value not in enum"));
         }
     }
     if let Value::Object(obj) = value {
-        if let Some(req) = schema.get("required") {
-            if let Ok(items) = crate::py::obj::iter(req) {
-                for k in items {
-                    let key = text::str_of(&k);
-                    if !(k.is_string() && obj.contains_key(&key)) {
-                        errs.push(format!("{path}.{key}: required property missing"));
-                    }
+        if let Some(Value::Array(required)) = schema.get("required") {
+            for key in required.iter().filter_map(Value::as_str) {
+                if !obj.contains_key(key) {
+                    errs.push(format!("{path}.{key}: required property missing"));
                 }
             }
         }
-        if let Some(Value::Object(props)) = schema.get("properties") {
-            for (k, sub) in props {
-                if let (Some(v), true) = (obj.get(k), sub.is_object()) {
-                    errs.extend(validate_json_schema(v, sub, &format!("{path}.{k}")));
-                }
+        let props = schema.get("properties").and_then(Value::as_object);
+        for (k, sub) in props.into_iter().flatten() {
+            if let (Some(v), true) = (obj.get(k), sub.is_object()) {
+                errs.extend(validate_json_schema(v, sub, &format!("{path}.{k}")));
             }
         }
         if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
-            let props = schema.get("properties").and_then(Value::as_object);
-            let mut extra: Vec<String> = obj.keys().filter(|k| props.map_or(true, |p| !p.contains_key(*k))).cloned().collect();
-            extra.sort();
+            let mut extra: Vec<&str> = obj.keys().map(String::as_str).filter(|k| props.map_or(true, |p| !p.contains_key(*k))).collect();
+            extra.sort_unstable();
             if !extra.is_empty() {
-                errs.push(format!("{path}: additional properties not allowed {}", text::repr_list(&extra)));
+                errs.push(format!("{path}: additional properties not allowed ({})", extra.join(", ")));
             }
         }
     }
@@ -87,15 +99,34 @@ pub fn validate_json_schema(value: &Value, schema: &Value, path: &str) -> Vec<St
 }
 
 /// Parse the model output as JSON (tolerating code fences) and validate it. Returns (normalized JSON, errors).
-pub fn check_json(text_: &str, schema: &Value) -> (Option<String>, Vec<String>) {
-    let value = match pyjson::loads(&strip_fences(text::strip(text_))) {
+pub fn check_json(text: &str, schema: &Value) -> (Option<String>, Vec<String>) {
+    let value: Value = match serde_json::from_str(&strip_fences(text.trim())) {
         Ok(v) => v,
         Err(e) => return (None, vec![format!("not JSON: {e}")]),
     };
-    let errs = if text::truthy(schema) { validate_json_schema(&value, schema, "$") } else { vec![] };
+    let errs = validate_json_schema(&value, schema, "$");
     if errs.is_empty() {
-        (Some(pyjson::dumps(&value, pyjson::DEFAULT)), errs)
+        (Some(value.to_string()), errs)
     } else {
         (None, errs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn validation() {
+        let schema = json!({"type": "object", "required": ["a"], "properties": {"a": {"type": "integer", "enum": [1, 2]}}, "additionalProperties": false});
+        assert!(validate_json_schema(&json!({"a": 1.0}), &schema, "$").is_empty());
+        assert_eq!(validate_json_schema(&json!({"a": "x"}), &schema, "$"), vec!["$.a: expected integer, got string"]);
+        assert_eq!(
+            validate_json_schema(&json!({"b": 1}), &schema, "$"),
+            vec!["$.a: required property missing", "$: additional properties not allowed (b)"]
+        );
+        assert_eq!(check_json("```json\n{\"a\": 2}\n```", &schema).0.as_deref(), Some("{\"a\":2}"));
+        assert!(check_json("nope", &schema).1[0].starts_with("not JSON: "));
     }
 }

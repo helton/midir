@@ -1,43 +1,36 @@
 //! Errors that cross module boundaries. Each protocol renders them in its own error format (app.rs).
 
+use std::fmt;
+
 use serde_json::{json, Value};
 
-use crate::py::json as pyjson;
-use crate::py::text;
+use crate::text::prefix;
 
-/// An error answered by a backend, with its raw status, headers and body.
+/// An error answered by a backend, with its raw status and body.
 #[derive(Debug, Clone)]
 pub struct BackendError {
     pub status: u16,
     pub body: Value,
-    #[allow(dead_code)] // the backend's raw headers, kept for diagnostics
-    pub headers: Vec<(String, String)>,
-    pub where_: String,
+    /// what was being called ("idm", "agent", "queue")
+    pub stage: String,
     pub backend: String,
-    /// QueueTimeout: a 429 of our own queue, never retried.
+    /// A 429 of our own queue: never retried.
     pub queue_timeout: bool,
 }
 
 impl BackendError {
-    pub fn new(status: u16, body: Value, headers: Vec<(String, String)>, where_: &str, backend: &str) -> Self {
-        BackendError { status, body, headers, where_: where_.into(), backend: backend.into(), queue_timeout: false }
+    pub fn new(status: u16, body: Value, stage: &str, backend: &str) -> Self {
+        BackendError { status, body, stage: stage.into(), backend: backend.into(), queue_timeout: false }
     }
 
-    /// `QueueTimeout(timeout, needed, backend)`.
+    /// Our queue could not start the call before `limits.queue_timeout_s`.
     pub fn queue_timeout(timeout: f64, needed: Option<f64>, backend: &str) -> Self {
         let why = match needed {
             Some(n) => format!("the next slot is {n:.0}s away"),
             None => format!("no slot within {timeout:.0}s"),
         };
         let msg = format!("queue: {why}, above limits.queue_timeout_s={timeout:.0} (requests_per_minute / max_concurrent)");
-        BackendError {
-            status: 429,
-            body: json!({"message": msg}),
-            headers: vec![],
-            where_: "queue".into(),
-            backend: backend.into(),
-            queue_timeout: true,
-        }
+        BackendError { status: 429, body: json!({"message": msg}), stage: "queue".into(), backend: backend.into(), queue_timeout: true }
     }
 
     pub fn retryable(&self) -> bool {
@@ -56,17 +49,20 @@ impl BackendError {
     fn body_text(&self) -> String {
         match &self.body {
             Value::String(s) => s.clone(),
-            other => pyjson::dumps(other, pyjson::DEFAULT),
+            other => other.to_string(),
         }
     }
 
+    /// The message clients get (the backend's body, up to 2000 characters).
     pub fn message(&self) -> String {
-        format!("{} {} HTTP {}: {}", self.backend, self.where_, self.status, text::head(&self.body_text(), 2000))
+        format!("{} {} HTTP {}: {}", self.backend, self.stage, self.status, prefix(&self.body_text(), 2000))
     }
+}
 
-    /// `str(e)`.
-    pub fn describe(&self) -> String {
-        format!("{} {} HTTP {}: {}", self.backend, self.where_, self.status, text::head(&text::str_of(&self.body), 300))
+/// Short form for logs (the backend's body, up to 300 characters).
+impl fmt::Display for BackendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {} HTTP {}: {}", self.backend, self.stage, self.status, prefix(&self.body_text(), 300))
     }
 }
 
@@ -88,22 +84,40 @@ impl ClientError {
     }
 }
 
-/// A network error talking to a backend (connection, timeout, protocol).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetErrorKind {
+    /// could not connect (DNS, refused, TLS)
+    Connect,
+    /// no answer in time (connect or read)
+    Timeout,
+    /// the connection broke before the response was complete
+    Protocol,
+    /// reading the body failed for another reason
+    Read,
+}
+
+impl NetErrorKind {
+    /// The telemetry `error.type` label.
+    pub fn label(self) -> &'static str {
+        match self {
+            NetErrorKind::Connect => "network_connect",
+            NetErrorKind::Timeout => "network_timeout",
+            NetErrorKind::Protocol => "network_protocol",
+            NetErrorKind::Read => "network_read",
+        }
+    }
+}
+
+/// A network error talking to a backend.
 #[derive(Debug, Clone)]
 pub struct NetError {
-    /// httpx-style exception name: ConnectError, ReadTimeout, RemoteProtocolError, ReadError, ...
-    pub kind: String,
+    pub kind: NetErrorKind,
     pub detail: String,
-    pub timeout: bool,
+    /// worth another attempt (only before the response started)
     pub retryable: bool,
 }
 
 impl NetError {
-    /// `repr(e)`.
-    pub fn repr(&self) -> String {
-        format!("{}({})", self.kind, text::repr_str(&self.detail))
-    }
-
     pub fn from_reqwest(e: &reqwest::Error, reading_body: bool) -> Self {
         let mut detail = e.to_string();
         let mut src: Option<&dyn std::error::Error> = std::error::Error::source(e);
@@ -112,23 +126,33 @@ impl NetError {
             src = s.source();
         }
         let low = detail.to_lowercase();
-        let (kind, timeout, retryable) = if e.is_timeout() {
-            (if reading_body { "ReadTimeout" } else { "ConnectTimeout" }, true, true)
+        let broken = ["closed before message completed", "connection reset", "incomplete", "unexpected eof", "connection closed"]
+            .iter()
+            .any(|m| low.contains(m));
+        let (kind, retryable) = if e.is_timeout() {
+            (NetErrorKind::Timeout, true)
         } else if e.is_connect() {
-            ("ConnectError", false, true)
-        } else if low.contains("closed before message completed")
-            || low.contains("connection reset")
-            || low.contains("incomplete")
-            || low.contains("unexpected eof")
-            || low.contains("connection closed")
-        {
-            ("RemoteProtocolError", false, !reading_body)
+            (NetErrorKind::Connect, true)
+        } else if broken {
+            (NetErrorKind::Protocol, !reading_body)
         } else if reading_body {
-            ("ReadError", false, false)
+            (NetErrorKind::Read, false)
         } else {
-            ("ConnectError", false, true)
+            (NetErrorKind::Connect, true)
         };
-        NetError { kind: kind.into(), detail, timeout, retryable }
+        NetError { kind, detail, retryable }
+    }
+}
+
+impl fmt::Display for NetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let what = match self.kind {
+            NetErrorKind::Connect => "connection failed",
+            NetErrorKind::Timeout => "timed out",
+            NetErrorKind::Protocol => "connection broken",
+            NetErrorKind::Read => "read failed",
+        };
+        write!(f, "{what}: {}", self.detail)
     }
 }
 
@@ -137,7 +161,7 @@ pub enum Error {
     Client(ClientError),
     Backend(BackendError),
     Net(NetError),
-    /// A bug or an unexpected input shape inside the engine (500 / "midir internal error" mid-stream).
+    /// A bug or an unexpected state inside Midir (500 / "midir internal error" mid-stream).
     Internal(String),
 }
 
@@ -164,18 +188,20 @@ impl Error {
     pub fn telemetry_type(&self) -> String {
         match self {
             Error::Backend(e) => format!("upstream_{}", e.status),
-            Error::Client(_) => "ClientError".into(),
-            Error::Net(n) => n.kind.clone(),
-            Error::Internal(_) => "Exception".into(),
+            Error::Client(_) => "client_error".into(),
+            Error::Net(n) => n.kind.label().into(),
+            Error::Internal(_) => "internal".into(),
         }
     }
+}
 
-    pub fn describe(&self) -> String {
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Backend(e) => e.describe(),
-            Error::Client(e) => e.message.clone(),
-            Error::Net(n) => n.repr(),
-            Error::Internal(m) => m.clone(),
+            Error::Backend(e) => e.fmt(f),
+            Error::Client(e) => f.write_str(&e.message),
+            Error::Net(n) => n.fmt(f),
+            Error::Internal(m) => f.write_str(m),
         }
     }
 }

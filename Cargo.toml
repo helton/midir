@@ -21,9 +21,8 @@ axum = { version = "0.7", default-features = false, features = ["http1", "tokio"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "io-util"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-indexmap = "2"
+indexmap = { version = "2", features = ["serde"] }
 regex = "1"
-fancy-regex = "0.13"
 toml = { version = "0.8", default-features = false, features = ["parse", "preserve_order"] }
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 async-stream = "0.3"
@@ -34,6 +33,14 @@ getrandom = "0.2"
 libc = "0.2"
 # idna_adapter >= 1.2.1 pulls icu 2.x, which needs rustc 1.82; pinned for the 1.81 toolchain.
 idna_adapter = "=1.2.0"
+serde = { version = "1", features = ["derive"] }
+serde_path_to_error = "0.1"
+clap = { version = "=4.5.20", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+tower-http = { version = "0.6", default-features = false, features = ["normalize-path"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
 
 [dev-dependencies]
 # the black-box suite (tests/): the binary as a process, a StackSpot stand-in on axum, plain HTTP as the clients see it

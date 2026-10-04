@@ -1,14 +1,14 @@
-//! HTTP layer: the OpenAI and Anthropic endpoints, errors in each protocol's own format, health and
-//! readiness, SSE keepalives and error events mid-stream. Routing follows Starlette's rules (404/405 bodies,
-//! trailing-slash redirects).
+//! HTTP layer: the OpenAI and Anthropic endpoints, errors in each protocol's own format, health and readiness, SSE
+//! keepalives and error events mid-stream.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
-use axum::extract::{Request, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
-use axum::response::Response;
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use axum::Router;
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -21,12 +21,21 @@ use crate::emulation::engine::{EmulationEngine, EventStream};
 use crate::emulation::prompt::render_prompt;
 use crate::errors::{ClientError, Error};
 use crate::gateway::Gateway;
-use crate::protocols::{chat_completions, common, messages, responses};
-use crate::py::json as pyjson;
-use crate::py::text;
+use crate::protocols::responses::Envelope;
+use crate::protocols::{chat_completions, messages, responses};
 use crate::telemetry::{self, observe, observe_complete};
+use crate::text::prefix;
 
-const LOG: &str = "midir.app";
+/// Request bodies can be large (whole conversations with tool output); this is far above any backend's input limit.
+const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Which error format a route answers in.
+#[derive(Clone, Copy, PartialEq)]
+enum Flavor {
+    OpenAi,
+    Responses,
+    Anthropic,
+}
 
 fn error_type(status: u16, default: &'static str) -> &'static str {
     match status {
@@ -40,42 +49,32 @@ fn error_type(status: u16, default: &'static str) -> &'static str {
 }
 
 fn json_response(status: u16, body: &Value) -> Response {
-    let mut r = Response::new(Body::from(pyjson::dumps(body, pyjson::COMPACT)));
+    let mut r = Response::new(Body::from(body.to_string()));
     *r.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     r.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
     r
 }
 
-fn internal_error() -> Response {
-    let mut r = Response::new(Body::from("Internal Server Error"));
-    *r.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-    r.headers_mut().insert("content-type", HeaderValue::from_static("text/plain; charset=utf-8"));
-    r
-}
-
-fn openai_error(status: u16, message: &str, typ: &str, code: Option<&str>) -> Response {
-    json_response(status, &json!({"error": {"message": message, "type": typ, "code": code, "param": null}}))
-}
-
-fn anthropic_error(status: u16, message: &str, typ: &str) -> Response {
-    json_response(status, &json!({"type": "error", "error": {"type": typ, "message": message}}))
+fn error_body(flavor: Flavor, status: u16, message: &str, typ: &str, code: Option<&str>) -> Response {
+    match flavor {
+        Flavor::Anthropic => json_response(status, &json!({"type": "error", "error": {"type": typ, "message": message}})),
+        _ => json_response(status, &json!({"error": {"message": message, "type": typ, "code": code, "param": null}})),
+    }
 }
 
 /// An error in the middle of a stream becomes an error event in the protocol's format.
-fn stream_error(flavor: &str, message: &str, typ: &str) -> String {
+fn stream_error(flavor: Flavor, message: &str, typ: &str) -> String {
     match flavor {
-        "anthropic" => format!(
-            "event: error\ndata: {}\n\n",
-            pyjson::dumps(&json!({"type": "error", "error": {"type": typ, "message": message}}), pyjson::DEFAULT)
-        ),
-        "responses" => format!(
-            "event: error\ndata: {}\n\n",
-            pyjson::dumps(&json!({"type": "error", "code": typ, "message": message, "param": null, "sequence_number": 0}), pyjson::DEFAULT)
-        ),
-        _ => format!(
-            "data: {}\n\ndata: [DONE]\n\n",
-            pyjson::dumps(&json!({"error": {"message": message, "type": typ, "code": null, "param": null}}), pyjson::DEFAULT)
-        ),
+        Flavor::Anthropic => format!("event: error\ndata: {}\n\n", json!({"type": "error", "error": {"type": typ, "message": message}})),
+        Flavor::Responses => {
+            format!(
+                "event: error\ndata: {}\n\n",
+                json!({"type": "error", "code": typ, "message": message, "param": null, "sequence_number": 0})
+            )
+        }
+        Flavor::OpenAi => {
+            format!("data: {}\n\ndata: [DONE]\n\n", json!({"error": {"message": message, "type": typ, "code": null, "param": null}}))
+        }
     }
 }
 
@@ -113,7 +112,7 @@ pub fn with_keepalive(events: EventStream, interval: f64) -> EventStream {
 fn guarded(
     gen: BoxStream<'static, Result<String, Error>>,
     rid: String,
-    flavor: &'static str,
+    flavor: Flavor,
 ) -> BoxStream<'static, Result<Bytes, std::io::Error>> {
     Box::pin(async_stream::stream! {
         let mut gen = gen;
@@ -123,16 +122,16 @@ fn guarded(
                 Err(e) => {
                     let ev = match &e {
                         Error::Backend(b) => {
-                            crate::error!(LOG, "{rid} backend error mid-stream: {}", b.describe());
+                            tracing::error!("{rid} backend error mid-stream: {b}");
                             stream_error(flavor, &b.message(), "api_error")
                         }
                         Error::Client(c) => stream_error(flavor, &c.message, "invalid_request_error"),
                         Error::Net(n) => {
-                            crate::error!(LOG, "{rid} network error mid-stream: {}", n.repr());
-                            stream_error(flavor, &format!("error talking to the backend: {}", n.repr()), "api_error")
+                            tracing::error!("{rid} network error mid-stream: {n}");
+                            stream_error(flavor, &format!("error talking to the backend: {n}"), "api_error")
                         }
                         Error::Internal(m) => {
-                            crate::error!(LOG, "{rid} internal error mid-stream: {m}");
+                            tracing::error!("{rid} internal error mid-stream: {m}");
                             stream_error(flavor, &format!("midir internal error: {m}"), "api_error")
                         }
                     };
@@ -157,36 +156,30 @@ fn now_s() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
+/// A request routed to its model: the canonical request, its runner, the model name to answer with, stream or not.
+struct Prepared {
+    req: Arc<CanonicalRequest>,
+    runner: Arc<EmulationEngine>,
+    model: String,
+    stream: bool,
+}
+
 pub struct App {
     pub gateway: Arc<Gateway>,
 }
 
 impl App {
-    fn is_anthropic(path: &str) -> bool {
-        path.starts_with("/v1/messages")
-    }
-
-    fn client_error(&self, path: &str, e: &ClientError) -> Response {
-        crate::warn!(LOG, "{path} {}: {}", e.code, e.message);
-        if Self::is_anthropic(path) {
-            anthropic_error(e.status, &e.message, error_type(e.status, "invalid_request_error"))
-        } else {
-            openai_error(e.status, &e.message, error_type(e.status, "invalid_request_error"), Some(&e.code))
-        }
-    }
-
-    fn error_response(&self, path: &str, e: Error) -> Response {
+    fn error_response(&self, flavor: Flavor, e: Error) -> Response {
         match e {
-            Error::Client(c) => self.client_error(path, &c),
+            Error::Client(c) => {
+                tracing::warn!("{} {}: {}", c.status, c.code, c.message);
+                error_body(flavor, c.status, &c.message, error_type(c.status, "invalid_request_error"), Some(&c.code))
+            }
             Error::Backend(b) => {
-                crate::error!(LOG, "{} {} {}: {}", b.backend, b.where_, b.status, text::head(&text::str_of(&b.body), 500));
+                tracing::error!("{b}");
                 let status = b.http_status();
-                let typ = error_type(status, "api_error");
-                let mut resp = if Self::is_anthropic(path) {
-                    anthropic_error(status, &b.message(), typ)
-                } else {
-                    openai_error(status, &b.message(), typ, Some(&format!("upstream_{}", b.status)))
-                };
+                let mut resp =
+                    error_body(flavor, status, &b.message(), error_type(status, "api_error"), Some(&format!("upstream_{}", b.status)));
                 if status == 429 {
                     if let Some(backend) = self.gateway.backend_of(&b.backend) {
                         if let Ok(v) = HeaderValue::from_str(&backend.limiter.retry_after().to_string()) {
@@ -197,105 +190,87 @@ impl App {
                 resp
             }
             Error::Net(n) => {
-                let status = if n.timeout { 504 } else { 502 };
-                let message = format!("error talking to the backend: {}", n.repr());
-                if Self::is_anthropic(path) {
-                    anthropic_error(status, &message, "api_error")
-                } else {
-                    openai_error(status, &message, "api_error", Some("upstream_network"))
-                }
+                tracing::error!("{n}");
+                let status = if n.kind == crate::errors::NetErrorKind::Timeout { 504 } else { 502 };
+                error_body(flavor, status, &format!("error talking to the backend: {n}"), "api_error", Some("upstream_network"))
             }
             Error::Internal(m) => {
-                crate::error!(LOG, "Exception in ASGI application: {m}");
-                internal_error()
+                tracing::error!("internal error: {m}");
+                error_body(flavor, 500, &format!("midir internal error: {m}"), "api_error", Some("internal_error"))
             }
         }
     }
 
-    fn read_json(body: &[u8]) -> Result<Value, ClientError> {
-        match pyjson::loads_bytes(body) {
-            None => Err(ClientError::new("request body is not valid JSON", "invalid_json")),
-            Some(v @ Value::Object(_)) => Ok(v),
-            Some(_) => Err(ClientError::new("request body must be a JSON object", "invalid_json")),
+    fn read_json(raw: &[u8]) -> Result<Value, ClientError> {
+        match serde_json::from_slice::<Value>(raw) {
+            Ok(v @ Value::Object(_)) => Ok(v),
+            Ok(_) => Err(ClientError::new("request body must be a JSON object", "invalid_json")),
+            Err(e) => Err(ClientError::new(format!("request body is not valid JSON ({e})"), "invalid_json")),
         }
     }
 
-    /// Canonical request routed to its model: (request, runner, requested model name, stream?).
-    fn prepare(
-        &self,
-        headers: &HeaderMap,
-        body: &Value,
-        mut req: CanonicalRequest,
-        protocol: &str,
-        rid: &str,
-    ) -> Result<(Arc<CanonicalRequest>, Arc<EmulationEngine>, Value, bool), Error> {
-        let model_name = match body.get("model") {
-            Some(m) if text::truthy(m) => m.clone(),
-            _ => json!(DEFAULT_MODEL_NAME),
+    fn prepare(&self, headers: &HeaderMap, body: &Value, mut req: CanonicalRequest, protocol: &str, rid: &str) -> Result<Prepared, Error> {
+        let model = match body.get("model") {
+            None | Some(Value::Null) => DEFAULT_MODEL_NAME.to_string(),
+            Some(Value::String(s)) if s.trim().is_empty() => DEFAULT_MODEL_NAME.to_string(),
+            Some(Value::String(s)) => s.clone(),
+            Some(_) => return Err(ClientError::new("invalid request: model: expected a string", "invalid_request").into()),
         };
-        let Value::String(model_str) = &model_name else {
-            return Err(Error::Internal(format!("AttributeError(\"'{}' object has no attribute 'strip'\")", text::type_name(&model_name))));
-        };
-        let stream = body.get("stream").map_or(false, text::truthy);
-        let (route, runner) = self.gateway.route(model_str);
+        let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+        let (route, runner) = self.gateway.route(&model);
         req.route = Some(route.clone());
-        telemetry::request_meta(headers, body, protocol, model_str, &route, &req, rid, &self.gateway.store);
+        telemetry::request_meta(headers, body, protocol, &model, &route, &req, rid, &self.gateway.store);
         {
             let m = req.meta();
-            let prev = match body.get("previous_response_id") {
-                Some(p) if text::truthy(p) => format!(" previous={}", text::str_of(p)),
-                _ => String::new(),
-            };
-            crate::info!(
-                LOG,
-                "{rid} {protocol} model={model_str}->{}/{} stream={} tools={} choice={} json={}{prev} client={} session={}",
+            let prev = body.get("previous_response_id").and_then(Value::as_str).map_or(String::new(), |p| format!(" previous={p}"));
+            tracing::info!(
+                "{rid} {protocol} model={model}->{}/{} stream={stream} tools={} choice={} json={}{prev} client={} session={}",
                 route.backend,
                 route.name,
-                if stream { "True" } else { "False" },
                 req.tools.len(),
-                req.tool_choice.display(),
-                if req.json_schema.is_some() { "True" } else { "False" },
+                req.tool_choice,
+                req.json_schema.is_some(),
                 m.client,
-                text::head(&m.session, 12)
+                prefix(&m.session, 12)
             );
         }
-        Ok((Arc::new(req), runner, model_name, stream))
+        Ok(Prepared { req: Arc::new(req), runner, model, stream })
     }
 
     fn keepalive_s(&self) -> f64 {
         self.gateway.config.server.keepalive_s
     }
 
-    async fn health(&self) -> Response {
+    fn health(&self) -> Response {
         let cfg = &self.gateway.config;
         let backends: Map<String, Value> =
             self.gateway.backends.iter().map(|(n, b)| (n.clone(), json!({"type": b.type_, "queue": b.limiter.state()}))).collect();
         json_response(
             200,
-            &json!({"ok": true, "version": buildinfo::full_version(), "build": buildinfo::build().as_dict(), "config": cfg.source, "default": cfg.default.name,
+            &json!({"ok": true, "version": buildinfo::full_version(), "build": buildinfo::build().as_json(), "config": cfg.source, "default": cfg.default.name,
                     "models": self.gateway.describe_models(), "backends": backends, "protocols": ["chat-completions", "responses", "messages"]}),
         )
     }
 
     async fn ready(&self) -> Response {
         let status = self.gateway.ready().await;
-        let failed: Vec<String> = status.values().filter_map(|w| w.clone()).collect();
-        let mut backends = Map::new();
-        for (n, why) in &status {
-            let mut b = Map::new();
-            b.insert("ok".into(), json!(why.is_none()));
-            if let Some(w) = why {
-                b.insert("error".into(), json!(w));
-            }
-            b.insert("queue".into(), self.gateway.backends[n].limiter.state());
-            backends.insert(n.clone(), Value::Object(b));
+        let failed: Vec<&str> = status.values().filter_map(|w| w.as_deref()).collect();
+        let backends: Map<String, Value> = status
+            .iter()
+            .map(|(n, why)| {
+                let mut b = json!({"ok": why.is_none(), "queue": self.gateway.backends[n].limiter.state()});
+                if let Some(w) = why {
+                    b["error"] = json!(w);
+                }
+                (n.clone(), b)
+            })
+            .collect();
+        let mut body = json!({"ok": failed.is_empty(), "version": buildinfo::full_version(), "build": buildinfo::build().as_json(), "backends": backends});
+        if failed.is_empty() {
+            return json_response(200, &body);
         }
-        let mut body = json!({"ok": failed.is_empty(), "version": buildinfo::full_version(), "build": buildinfo::build().as_dict(), "backends": backends});
-        if !failed.is_empty() {
-            body["error"] = json!(failed.join("; "));
-            return json_response(503, &body);
-        }
-        json_response(200, &body)
+        body["error"] = json!(failed.join("; "));
+        json_response(503, &body)
     }
 
     fn models(&self) -> Response {
@@ -317,29 +292,20 @@ impl App {
         )
     }
 
-    async fn chat(&self, path: &str, headers: &HeaderMap, raw: &[u8]) -> Result<Response, Error> {
+    async fn chat(&self, headers: &HeaderMap, raw: &[u8]) -> Result<Response, Error> {
         let body = Self::read_json(raw)?;
         let cid = format!("chatcmpl-{}", hex_id(24));
         let created = now_s();
-        let req = common::to_canonical("ChatCompletions", chat_completions::to_canonical(&body))?;
-        let (req, runner, model, stream) = self.prepare(headers, &body, req, "chat", &cid)?;
+        let req = chat_completions::to_canonical(&body)?;
+        let p = self.prepare(headers, &body, req, "chat", &cid)?;
         let tel = self.gateway.telemetry.clone();
-        if !stream {
-            let r = observe_complete(&tel, runner.complete(req.clone(), &cid), &req, &cid).await?;
-            return Ok(json_response(200, &chat_completions::response(&r, &cid, created, &model)));
+        if !p.stream {
+            let r = observe_complete(&tel, p.runner.complete(p.req.clone(), &cid), &p.req, &cid).await?;
+            return Ok(json_response(200, &chat_completions::response(&r, &cid, created, &p.model)));
         }
-        let include_usage = match body.get("stream_options") {
-            Some(o) if text::truthy(o) => match o {
-                Value::Object(m) => m.get("include_usage").map_or(true, text::truthy),
-                other => {
-                    return Err(Error::Internal(format!("AttributeError(\"'{}' object has no attribute 'get'\")", text::type_name(other))))
-                }
-            },
-            _ => true,
-        };
-        let events = with_keepalive(observe(tel, runner.run(req.clone(), cid.clone()), &req, &cid), self.keepalive_s());
-        let _ = path;
-        Ok(sse_response(guarded(chat_completions::stream(events, cid.clone(), created, model, include_usage), cid, "openai")))
+        let events = with_keepalive(observe(tel, p.runner.run(p.req.clone(), cid.clone()), &p.req, &cid), self.keepalive_s());
+        let stream = chat_completions::stream(events, cid.clone(), created, p.model, chat_completions::include_usage(&body));
+        Ok(sse_response(guarded(stream, cid, Flavor::OpenAi)))
     }
 
     async fn responses(&self, headers: &HeaderMap, raw: &[u8]) -> Result<Response, Error> {
@@ -347,15 +313,17 @@ impl App {
         let rid = format!("resp_{}", hex_id(24));
         let created = now_s();
         let store = self.gateway.store.clone();
-        let req = common::to_canonical("Responses", responses::to_canonical(&body, &store))?;
-        let (req, runner, model, stream) = self.prepare(headers, &body, req, "responses", &rid)?;
+        let req = responses::to_canonical(&body, &store)?;
+        let p = self.prepare(headers, &body, req, "responses", &rid)?;
         let tel = self.gateway.telemetry.clone();
-        if !stream {
-            let r = observe_complete(&tel, runner.complete(req.clone(), &rid), &req, &rid).await?;
-            return Ok(json_response(200, &responses::complete_response(&body, &rid, created, &model, req, r, &store)));
+        if !p.stream {
+            let r = observe_complete(&tel, p.runner.complete(p.req.clone(), &rid), &p.req, &rid).await?;
+            let env = Envelope { body: &body, rid: &rid, created, model: &p.model };
+            return Ok(json_response(200, &responses::complete_response(&env, p.req, r, &store)));
         }
-        let events = with_keepalive(observe(tel, runner.run(req.clone(), rid.clone()), &req, &rid), self.keepalive_s());
-        Ok(sse_response(guarded(responses::stream(events, Arc::new(body), rid.clone(), created, model, req, store), rid, "responses")))
+        let events = with_keepalive(observe(tel, p.runner.run(p.req.clone(), rid.clone()), &p.req, &rid), self.keepalive_s());
+        let stream = responses::stream(events, Arc::new(body), rid.clone(), created, p.model, p.req, store);
+        Ok(sse_response(guarded(stream, rid, Flavor::Responses)))
     }
 
     fn get_response(&self, rid: &str) -> Result<Response, Error> {
@@ -363,150 +331,113 @@ impl App {
             return Err(ClientError::with_status(format!("response '{rid}' not found (expired or never existed)"), "not_found", 404).into());
         };
         let items = responses::output_items(&r, &format!("msg_{}", hex_id(24)), &req.custom_tool_names());
-        Ok(json_response(
-            200,
-            &responses::envelope(
-                &json!({}),
-                rid,
-                ts as i64,
-                &json!(DEFAULT_MODEL_NAME),
-                "completed",
-                items,
-                responses::usage(&r.usage),
-                Some(&r),
-            ),
-        ))
+        let env = Envelope { body: &json!({}), rid, created: ts as i64, model: DEFAULT_MODEL_NAME };
+        Ok(json_response(200, &env.render("completed", items, responses::usage(&r.usage), Some(&r))))
     }
 
     async fn messages(&self, headers: &HeaderMap, raw: &[u8]) -> Result<Response, Error> {
         let body = Self::read_json(raw)?;
         let mid = format!("msg_{}", hex_id(24));
-        let req = common::to_canonical("Messages", messages::to_canonical(&body))?;
-        let (req, runner, model, stream) = self.prepare(headers, &body, req, "messages", &mid)?;
+        let req = messages::to_canonical(&body)?;
+        let p = self.prepare(headers, &body, req, "messages", &mid)?;
         let tel = self.gateway.telemetry.clone();
-        if !stream {
-            let r = observe_complete(&tel, runner.complete(req.clone(), &mid), &req, &mid).await?;
-            return Ok(json_response(200, &messages::response(&r, &mid, &model)));
+        if !p.stream {
+            let r = observe_complete(&tel, p.runner.complete(p.req.clone(), &mid), &p.req, &mid).await?;
+            return Ok(json_response(200, &messages::response(&r, &mid, &p.model)));
         }
-        let events = with_keepalive(observe(tel, runner.run(req.clone(), mid.clone()), &req, &mid), self.keepalive_s());
-        Ok(sse_response(guarded(messages::stream(events, mid.clone(), model), mid, "anthropic")))
+        let events = with_keepalive(observe(tel, p.runner.run(p.req.clone(), mid.clone()), &p.req, &mid), self.keepalive_s());
+        Ok(sse_response(guarded(messages::stream(events, mid.clone(), p.model), mid, Flavor::Anthropic)))
     }
 
     fn count_tokens(&self, raw: &[u8]) -> Result<Response, Error> {
         let body = Self::read_json(raw)?;
-        let req = common::to_canonical("Messages", messages::to_canonical(&body))?;
-        let (prompt, _) = render_prompt(&req, 1_000_000_000, true, 0);
+        let req = messages::to_canonical(&body)?;
+        let (prompt, _) = render_prompt(&req, i64::MAX, true, 0);
         Ok(json_response(200, &json!({"input_tokens": estimate_tokens(&prompt)})))
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Route {
-    Health,
-    Ready,
-    Models,
-    Model,
-    Embeddings,
-    Chat,
-    Responses,
-    GetResponse,
-    Messages,
-    CountTokens,
+type AppState = State<Arc<App>>;
+
+fn answer(app: &App, flavor: Flavor, r: Result<Response, Error>) -> Response {
+    r.unwrap_or_else(|e| app.error_response(flavor, e))
 }
 
-fn match_route(path: &str) -> Option<(Route, &'static [&'static str], String)> {
-    const GET: &[&str] = &["GET", "HEAD"];
-    const POST: &[&str] = &["POST"];
-    let r = match path {
-        "/health" => (Route::Health, GET, String::new()),
-        "/ready" => (Route::Ready, GET, String::new()),
-        "/v1/models" => (Route::Models, GET, String::new()),
-        "/v1/embeddings" => (Route::Embeddings, POST, String::new()),
-        "/v1/chat/completions" => (Route::Chat, POST, String::new()),
-        "/v1/responses" => (Route::Responses, POST, String::new()),
-        "/v1/messages" => (Route::Messages, POST, String::new()),
-        "/v1/messages/count_tokens" => (Route::CountTokens, POST, String::new()),
-        p => {
-            if let Some(id) = p.strip_prefix("/v1/models/").filter(|s| !s.is_empty() && !s.contains('/')) {
-                (Route::Model, GET, id.to_string())
-            } else if let Some(id) = p.strip_prefix("/v1/responses/").filter(|s| !s.is_empty() && !s.contains('/')) {
-                (Route::GetResponse, GET, id.to_string())
-            } else {
-                return None;
-            }
-        }
-    };
-    Some(r)
+async fn health(State(app): AppState) -> Response {
+    app.health()
 }
 
-fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(h), Some(l)) = ((b[i + 1] as char).to_digit(16), (b[i + 2] as char).to_digit(16)) {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
+async fn ready(State(app): AppState) -> Response {
+    app.ready().await
 }
 
-async fn handle(State(app): State<Arc<App>>, request: Request) -> Response {
-    let (parts, body) = request.into_parts();
-    let path = percent_decode(parts.uri.path());
-    let Some((route, methods, param)) = match_route(&path) else {
-        // Starlette's redirect_slashes: the same path with/without a trailing slash exists -> 307
-        if path != "/" {
-            let alt = if path.ends_with('/') { path.trim_end_matches('/').to_string() } else { format!("{path}/") };
-            if match_route(&alt).is_some() {
-                let host = parts.headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or("127.0.0.1");
-                let query = parts.uri.query().map_or(String::new(), |q| format!("?{q}"));
-                let mut r = Response::new(Body::empty());
-                *r.status_mut() = StatusCode::TEMPORARY_REDIRECT;
-                if let Ok(v) = HeaderValue::from_str(&format!("http://{host}{alt}{query}")) {
-                    r.headers_mut().insert("location", v);
-                }
-                return r;
-            }
-        }
-        return json_response(404, &json!({"detail": "Not Found"}));
-    };
-    if !methods.contains(&parts.method.as_str()) {
-        let mut r = json_response(405, &json!({"detail": "Method Not Allowed"}));
-        if let Ok(v) = HeaderValue::from_str(&methods.join(", ")) {
-            r.headers_mut().insert("allow", v);
-        }
-        return r;
+async fn models(State(app): AppState) -> Response {
+    app.models()
+}
+
+async fn model(State(app): AppState, Path(id): Path<String>) -> Response {
+    app.model(&id)
+}
+
+async fn embeddings(State(app): AppState) -> Response {
+    let e = ClientError::with_status("no configured backend provides embeddings", "unsupported_endpoint", 404);
+    app.error_response(Flavor::OpenAi, e.into())
+}
+
+async fn chat(State(app): AppState, headers: HeaderMap, raw: Bytes) -> Response {
+    answer(&app, Flavor::OpenAi, app.chat(&headers, &raw).await)
+}
+
+async fn create_response(State(app): AppState, headers: HeaderMap, raw: Bytes) -> Response {
+    answer(&app, Flavor::Responses, app.responses(&headers, &raw).await)
+}
+
+async fn get_response(State(app): AppState, Path(id): Path<String>) -> Response {
+    answer(&app, Flavor::Responses, app.get_response(&id))
+}
+
+async fn create_message(State(app): AppState, headers: HeaderMap, raw: Bytes) -> Response {
+    answer(&app, Flavor::Anthropic, app.messages(&headers, &raw).await)
+}
+
+async fn count_tokens(State(app): AppState, raw: Bytes) -> Response {
+    answer(&app, Flavor::Anthropic, app.count_tokens(&raw))
+}
+
+fn flavor_of(path: &str) -> Flavor {
+    if path.starts_with("/v1/messages") {
+        Flavor::Anthropic
+    } else {
+        Flavor::OpenAi
     }
-    let raw = if parts.method == Method::POST { axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default() } else { Bytes::new() };
-    let result = match route {
-        Route::Health => Ok(app.health().await),
-        Route::Ready => Ok(app.ready().await),
-        Route::Models => Ok(app.models()),
-        Route::Model => Ok(app.model(&param)),
-        Route::Embeddings => Err(ClientError::with_status("no configured backend provides embeddings", "unsupported_endpoint", 404).into()),
-        Route::Chat => app.chat(&path, &parts.headers, &raw).await,
-        Route::Responses => app.responses(&parts.headers, &raw).await,
-        Route::GetResponse => app.get_response(&param),
-        Route::Messages => app.messages(&parts.headers, &raw).await,
-        Route::CountTokens => app.count_tokens(&raw),
-    };
-    let mut resp = match result {
-        Ok(r) => r,
-        Err(e) => app.error_response(&path, e),
-    };
-    if parts.method == Method::HEAD {
-        *resp.body_mut() = Body::empty();
-    }
-    resp
+}
+
+async fn not_found(request: Request) -> Response {
+    let (method, path) = (request.method().clone(), request.uri().path().to_string());
+    let message = format!("no endpoint {method} {path} (see GET /health for what this gateway serves)");
+    error_body(flavor_of(&path), 404, &message, "not_found_error", Some("unknown_endpoint"))
+}
+
+async fn method_not_allowed(request: Request) -> Response {
+    let (method, path) = (request.method().clone(), request.uri().path().to_string());
+    let message = format!("{path} does not accept {method}");
+    error_body(flavor_of(&path), 405, &message, "invalid_request_error", Some("method_not_allowed")).into_response()
 }
 
 pub fn router(app: Arc<App>) -> Router {
-    Router::new().fallback(handle).with_state(app)
+    Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/v1/models", get(models))
+        .route("/v1/models/:id", get(model))
+        .route("/v1/embeddings", post(embeddings))
+        .route("/v1/chat/completions", post(chat))
+        .route("/v1/responses", post(create_response))
+        .route("/v1/responses/:id", get(get_response))
+        .route("/v1/messages", post(create_message))
+        .route("/v1/messages/count_tokens", post(count_tokens))
+        .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .with_state(app)
 }

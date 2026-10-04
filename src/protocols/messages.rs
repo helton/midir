@@ -2,14 +2,13 @@
 
 use futures::stream::BoxStream;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use super::common::{ignored_params, is_media, text_of, text_of_value, tool_params, Adapted};
-use crate::canonical::{hex_id, CanonicalRequest, CanonicalResponse, Event, ToolCall, ToolChoice, ToolResult, ToolSpec, Usage};
+use super::common::{decode, ignored_params, placeholder, positive, stops, tool_params, Stop, MEDIA_TYPES};
+use crate::canonical::{hex_id, CanonicalRequest, CanonicalResponse, Event, Finish, ToolCall, ToolChoice, ToolResult, ToolSpec, Usage};
 use crate::errors::{ClientError, Error};
-use crate::py::json as pyjson;
-use crate::py::obj::{self, PyResult};
-use crate::py::text::{self, truthy};
+use crate::text::readable_json;
 
 const IGNORED: [&str; 10] = [
     "temperature",
@@ -23,143 +22,208 @@ const IGNORED: [&str; 10] = [
     "mcp_servers",
     "context_management",
 ];
+/// Blocks with no equivalent for a text backend: dropped from the history.
 const SKIPPED_BLOCKS: [&str; 4] = ["thinking", "redacted_thinking", "server_tool_use", "web_search_tool_result"];
 
-pub fn to_canonical(body: &Value) -> PyResult<Result<Adapted, ClientError>> {
-    let messages = match body.get("messages") {
-        Some(Value::Array(a)) if !a.is_empty() => a,
-        _ => return Ok(Err(ClientError::new("'messages' is required and must be a non-empty list", "invalid_request_error"))),
-    };
-    let mut req = CanonicalRequest { ignored: ignored_params(body, &IGNORED), ..Default::default() };
-    if let Some(system) = body.get("system").filter(|s| truthy(s)) {
-        match system {
-            Value::String(s) => req.system.push(s.clone()),
-            other => {
-                let mut parts = vec![];
-                for b in obj::iter(other)? {
-                    parts.push(text_of_value(&Value::Array(vec![b]), "system")?);
-                }
-                req.system.push(parts.join("\n"));
-            }
+#[derive(Deserialize)]
+struct Request {
+    messages: Option<Vec<Message>>,
+    system: Option<Blocks>,
+    #[serde(default)]
+    tools: Vec<Tool>,
+    tool_choice: Option<Choice>,
+    stop_sequences: Option<Stop>,
+    max_tokens: Option<i64>,
+    output_config: Option<OutputConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(expecting = "a message object")]
+struct Message {
+    role: Option<String>,
+    content: Option<Blocks>,
+}
+
+/// A string or a list of content blocks.
+#[derive(Deserialize)]
+#[serde(untagged, expecting = "a string or a list of content blocks")]
+enum Blocks {
+    Text(String),
+    List(Vec<Block>),
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(expecting = "a content block object")]
+struct Block {
+    #[serde(rename = "type", default, skip_serializing_if = "String::is_empty")]
+    kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    input: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_use_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content: Option<BlockContent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    is_error: Option<bool>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+/// A tool result's content: a string or blocks.
+#[derive(Deserialize, Serialize)]
+#[serde(untagged, expecting = "a string or a list of content blocks")]
+enum BlockContent {
+    Text(String),
+    List(Vec<Block>),
+}
+
+#[derive(Deserialize)]
+#[serde(expecting = "a tool object")]
+struct Tool {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    name: Option<String>,
+    description: Option<String>,
+    input_schema: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(expecting = "a tool_choice object")]
+struct Choice {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OutputConfig {
+    format: Option<Format>,
+}
+
+#[derive(Deserialize)]
+struct Format {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    schema: Option<Value>,
+}
+
+impl Block {
+    /// A non-tool block as text: text as it is, media as a placeholder, anything else as its JSON.
+    fn as_text(&self, place: &str) -> String {
+        match self.kind.as_str() {
+            "text" => self.text.clone().unwrap_or_default(),
+            k if MEDIA_TYPES.contains(&k) => placeholder(k, place),
+            _ => readable_json(self),
         }
     }
+}
+
+fn blocks_text(blocks: &[Block], place: &str) -> String {
+    blocks.iter().filter(|b| !SKIPPED_BLOCKS.contains(&b.kind.as_str())).map(|b| b.as_text(place)).collect::<Vec<_>>().join("\n")
+}
+
+/// The request as a canonical request (`max_tokens` included).
+pub fn to_canonical(body: &Value) -> Result<CanonicalRequest, ClientError> {
+    let r: Request = decode(body)?;
+    let messages = r
+        .messages
+        .filter(|m| !m.is_empty())
+        .ok_or_else(|| ClientError::new("'messages' is required and must be a non-empty list", "invalid_request_error"))?;
+    let mut req = CanonicalRequest { ignored: ignored_params(body, &IGNORED), ..Default::default() };
+    match r.system {
+        Some(Blocks::Text(s)) if !s.is_empty() => req.system.push(s),
+        Some(Blocks::List(blocks)) if !blocks.is_empty() => req.system.push(blocks_text(&blocks, "system")),
+        _ => {}
+    }
     for m in messages {
-        let role = if obj::is_str(obj::get(m, "role")?, "assistant") { "assistant" } else { "user" };
-        let content = obj::get(m, "content")?;
-        if let Some(Value::String(s)) = content {
-            req.add(role, s, vec![], vec![]);
-            continue;
-        }
-        let mut texts: Vec<String> = vec![];
-        let mut after: Vec<String> = vec![];
-        let mut calls: Vec<ToolCall> = vec![];
-        let mut results: Vec<ToolResult> = vec![];
-        for b in obj::iter_or_empty(content)? {
-            let t = obj::get(&b, "type")?.cloned().unwrap_or(Value::Null);
-            if obj::is_str(Some(&t), "text") {
-                let s = text::str_of(obj::get(&b, "text")?.unwrap_or(&json!("")));
-                if results.is_empty() {
-                    texts.push(s)
-                } else {
-                    after.push(s)
-                }
-            } else if obj::is_str(Some(&t), "tool_use") {
-                let id = match obj::get(&b, "id")? {
-                    Some(v) if truthy(v) => text::str_of(v),
-                    _ => format!("toolu_{}", hex_id(24)),
-                };
-                let name = match obj::get(&b, "name")? {
-                    None | Some(Value::Null) => String::new(),
-                    Some(v) => text::str_of(v),
-                };
-                let input = match obj::get(&b, "input")? {
-                    None | Some(Value::Null) => json!({}),
-                    Some(v) => v.clone(),
-                };
-                calls.push(ToolCall { id, name, arguments: input });
-            } else if obj::is_str(Some(&t), "tool_result") {
-                let c = obj::get(&b, "content")?;
-                let txt = match c {
-                    Some(Value::String(s)) => s.clone(),
-                    other => {
-                        let mut parts = vec![];
-                        for p in obj::iter_or_empty(other)? {
-                            parts.push(text_of_value(&Value::Array(vec![p]), "tool_result")?);
-                        }
-                        parts.join("\n")
-                    }
-                };
-                let call_id = obj::get(&b, "tool_use_id")?.map(text::str_of).unwrap_or_default();
-                results.push(ToolResult {
-                    call_id,
-                    content: txt,
-                    name: String::new(),
-                    is_error: text::truthy_opt(obj::get(&b, "is_error")?),
-                });
-            } else if is_media(&t)? {
-                texts.push(text_of(Some(&Value::Array(vec![b.clone()])), role)?);
-            } else if matches!(&t, Value::String(s) if SKIPPED_BLOCKS.contains(&s.as_str())) {
+        let role = if m.role.as_deref() == Some("assistant") { "assistant" } else { "user" };
+        let blocks = match m.content {
+            None => vec![],
+            Some(Blocks::Text(s)) => {
+                req.add_text(role, &s);
                 continue;
-            } else {
-                texts.push(pyjson::dumps(&b, pyjson::DEFAULT));
+            }
+            Some(Blocks::List(b)) => b,
+        };
+        // text before the tool results belongs to the turn; text after them stays after them in the prompt
+        let (mut texts, mut after, mut calls, mut results) = (vec![], vec![], vec![], vec![]);
+        for b in blocks {
+            match b.kind.as_str() {
+                "tool_use" => calls.push(ToolCall {
+                    id: b.id.filter(|i| !i.is_empty()).unwrap_or_else(|| format!("toolu_{}", hex_id(24))),
+                    name: b.name.unwrap_or_default(),
+                    arguments: b.input.filter(|i| !i.is_null()).unwrap_or_else(|| json!({})),
+                }),
+                "tool_result" => {
+                    let content = match &b.content {
+                        None => String::new(),
+                        Some(BlockContent::Text(s)) => s.clone(),
+                        Some(BlockContent::List(inner)) => blocks_text(inner, "tool_result"),
+                    };
+                    results.push(ToolResult {
+                        call_id: b.tool_use_id.unwrap_or_default(),
+                        content,
+                        name: String::new(),
+                        is_error: b.is_error.unwrap_or(false),
+                    });
+                }
+                k if SKIPPED_BLOCKS.contains(&k) => {}
+                _ => {
+                    let text = b.as_text(role);
+                    if results.is_empty() {
+                        texts.push(text);
+                    } else {
+                        after.push(text);
+                    }
+                }
             }
         }
         req.add(role, &texts.join("\n"), calls, results);
         if !after.is_empty() {
-            req.add(role, &after.join("\n"), vec![], vec![]);
+            req.add_text(role, &after.join("\n"));
         }
     }
-    for t in obj::iter_or_empty(body.get("tools"))? {
-        let typ = match obj::get(&t, "type")? {
-            Some(v) if truthy(v) => v.clone(),
-            _ => json!("custom"),
-        };
-        if !text::truthy_opt(obj::get(&t, "input_schema")?) && !obj::is_str(Some(&typ), "custom") {
-            req.ignored.push(format!("tool:{}", text::str_of(&typ)));
+    for t in r.tools {
+        // client tools have an input_schema (or type "custom"); server tools (web_search, ...) have a type and no schema
+        let kind = t.kind.filter(|k| !k.is_empty()).unwrap_or_else(|| "custom".into());
+        if t.input_schema.is_none() && kind != "custom" {
+            req.ignored.push(format!("tool:{kind}"));
             continue;
         }
-        let name = obj::get(&t, "name")?.cloned().unwrap_or(json!(""));
-        let desc = obj::get(&t, "description")?.filter(|d| truthy(d)).cloned().unwrap_or(json!(""));
-        req.tools.push(ToolSpec::new(Some(&name), Some(&desc), tool_params(obj::get(&t, "input_schema")?), false));
+        req.tools.push(ToolSpec::new(t.name.unwrap_or_default(), t.description.unwrap_or_default(), tool_params(t.input_schema), false));
     }
-    let choice = body.get("tool_choice").filter(|c| truthy(c)).cloned().unwrap_or(json!({}));
-    let typ = match &choice {
-        Value::Object(m) => m.get("type").cloned().unwrap_or(json!("auto")),
-        _ => json!("auto"),
-    };
-    obj::hashable(&typ)?;
-    req.tool_choice = match typ.as_str() {
-        Some("auto") => ToolChoice::Auto,
-        Some("any") => ToolChoice::Required,
-        Some("none") => ToolChoice::None,
-        Some("tool") => match choice.get("name") {
-            Some(n) if truthy(n) => ToolChoice::Named(n.clone()),
-            _ => ToolChoice::Required,
+    req.tool_choice = match r.tool_choice {
+        None => ToolChoice::Auto,
+        Some(c) => match c.kind.as_deref().unwrap_or("auto") {
+            "any" => ToolChoice::Required,
+            "none" => ToolChoice::None,
+            "tool" => c.name.filter(|n| !n.is_empty()).map_or(ToolChoice::Required, ToolChoice::Named),
+            _ => ToolChoice::Auto,
         },
-        _ => ToolChoice::Auto,
     };
-    req.stop = match body.get("stop_sequences") {
-        Some(Value::String(s)) => vec![s.clone()],
-        other => obj::iter_or_empty(other)?.into_iter().filter_map(|s| s.as_str().map(String::from)).collect(),
-    };
-    let max_tokens = body.get("max_tokens").cloned();
-    let oc = body.get("output_config").filter(|c| truthy(c)).cloned().unwrap_or(json!({}));
-    let fmt = obj::get_truthy(&oc, "format")?.cloned().unwrap_or(json!({}));
-    if obj::is_str(obj::get(&fmt, "type")?, "json_schema") {
-        req.json_schema = Some(match fmt.get("schema") {
-            Some(s) if truthy(s) => s.clone(),
-            _ => json!({"type": "object"}),
-        });
+    req.stop = stops(r.stop_sequences);
+    req.max_tokens = positive("max_tokens", r.max_tokens)?;
+    if let Some(Format { kind: Some(k), schema }) = r.output_config.and_then(|o| o.format) {
+        if k == "json_schema" {
+            req.json_schema =
+                Some(schema.filter(|s| s.as_object().is_some_and(|m| !m.is_empty())).unwrap_or_else(|| json!({"type": "object"})));
+        }
     }
-    Ok(Ok(Adapted { req, max_tokens }))
+    Ok(req)
 }
 
 pub fn stop_reason(r: &CanonicalResponse) -> &'static str {
-    match r.finish.as_str() {
-        "tool_calls" => "tool_use",
-        "length" => "max_tokens",
-        "stop_sequence" => "stop_sequence",
-        _ => "end_turn",
+    match r.finish {
+        Finish::ToolCalls => "tool_use",
+        Finish::Length => "max_tokens",
+        Finish::StopSequence => "stop_sequence",
+        Finish::Stop => "end_turn",
     }
 }
 
@@ -175,7 +239,7 @@ pub fn tool_use_id(call_id: &str) -> String {
     }
 }
 
-/// CAVEAT: invalid JSON arrives as {"_raw": ...}.
+/// CAVEAT: arguments that are not a JSON object arrive as {"_raw": ...}.
 pub fn tool_input(c: &ToolCall) -> Value {
     if c.arguments.is_object() {
         c.arguments.clone()
@@ -189,34 +253,32 @@ pub fn content_blocks(r: &CanonicalResponse) -> Value {
     if !r.text.is_empty() || r.tool_calls.is_empty() {
         blocks.push(json!({"type": "text", "text": r.text}));
     }
-    for c in &r.tool_calls {
-        blocks.push(json!({"type": "tool_use", "id": tool_use_id(&c.id), "name": c.name, "input": tool_input(c)}));
-    }
+    blocks
+        .extend(r.tool_calls.iter().map(|c| json!({"type": "tool_use", "id": tool_use_id(&c.id), "name": c.name, "input": tool_input(c)})));
     Value::Array(blocks)
 }
 
-pub fn response(r: &CanonicalResponse, mid: &str, model: &Value) -> Value {
+pub fn response(r: &CanonicalResponse, mid: &str, model: &str) -> Value {
     json!({"id": mid, "type": "message", "role": "assistant", "model": model, "content": content_blocks(r), "stop_reason": stop_reason(r),
            "stop_sequence": r.stop_sequence, "usage": usage(&r.usage)})
 }
 
 fn ev(name: &str, data: Value) -> String {
-    let mut m = Map::new();
-    m.insert("type".into(), json!(name));
+    let mut m = Map::from_iter([("type".to_string(), json!(name))]);
     if let Value::Object(d) = data {
         m.extend(d);
     }
-    format!("event: {name}\ndata: {}\n\n", pyjson::dumps(&Value::Object(m), pyjson::DEFAULT))
+    format!("event: {name}\ndata: {}\n\n", Value::Object(m))
 }
 
-pub fn stream(events: BoxStream<'static, Result<Event, Error>>, mid: String, model: Value) -> BoxStream<'static, Result<String, Error>> {
+pub fn stream(events: BoxStream<'static, Result<Event, Error>>, mid: String, model: String) -> BoxStream<'static, Result<String, Error>> {
     Box::pin(async_stream::try_stream! {
         yield ev("message_start", json!({"message": {"id": mid, "type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": null,
                  "stop_sequence": null, "usage": {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}}));
         yield ev("ping", json!({}));
         let mut index = 0usize;
         let mut text_open = false;
-        let mut final_: Option<CanonicalResponse> = None;
+        let mut done: Option<CanonicalResponse> = None;
         let mut events = events;
         while let Some(e) = events.next().await {
             match e? {
@@ -234,18 +296,18 @@ pub fn stream(events: BoxStream<'static, Result<Event, Error>>, mid: String, mod
                         index += 1;
                     }
                     yield ev("content_block_start", json!({"index": index, "content_block": {"type": "tool_use", "id": tool_use_id(&c.id), "name": c.name, "input": {}}}));
-                    yield ev("content_block_delta", json!({"index": index, "delta": {"type": "input_json_delta", "partial_json": pyjson::dumps(&tool_input(&c), pyjson::DEFAULT)}}));
+                    yield ev("content_block_delta", json!({"index": index, "delta": {"type": "input_json_delta", "partial_json": tool_input(&c).to_string()}}));
                     yield ev("content_block_stop", json!({"index": index}));
                     index += 1;
                 }
                 Event::Keepalive => yield ev("ping", json!({})),
-                Event::Done(r) => final_ = Some(r),
+                Event::Done(r) => done = Some(r),
             }
         }
         if text_open {
             yield ev("content_block_stop", json!({"index": index}));
         }
-        let r = final_.unwrap_or_default();
+        let r = done.unwrap_or_default();
         yield ev("message_delta", json!({"delta": {"stop_reason": stop_reason(&r), "stop_sequence": r.stop_sequence},
                  "usage": {"output_tokens": r.usage.completion_tokens, "input_tokens": r.usage.prompt_tokens}}));
         yield ev("message_stop", json!({}));

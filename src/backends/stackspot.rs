@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use regex::Regex;
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{Completion, Item, ItemStream};
@@ -15,13 +16,9 @@ use crate::canonical::{SharedMeta, Usage};
 use crate::config::{BackendSettings, ConfigError};
 use crate::errors::{BackendError, Error, NetError};
 use crate::limiter::{monotonic, UpstreamLimiter};
-use crate::py::json as pyjson;
-use crate::py::text;
 use crate::store::time_now;
 use crate::telemetry::Telemetry;
-
-const LOG: &str = "midir.backends.stackspot";
-const LOG_BASE: &str = "midir.backends.base";
+use crate::text::prefix;
 const DEFAULT_AGENT_BASE: &str = "https://genai-inference-app.stackspot.com/v1/agent";
 const DEFAULT_IDM_BASE: &str = "https://idm.stackspot.com";
 static TOO_LONG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)limit of (\d+) tokens.*?resulted in (\d+) tokens").unwrap());
@@ -48,52 +45,50 @@ pub struct StackSpotBackend {
     backoff_s: f64,
 }
 
+/// A token count as the Agent API sends it: a number, a numeric string or null.
+fn count(v: Option<&Value>) -> i64 {
+    match v {
+        Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)).unwrap_or(0),
+        Some(Value::String(s)) => s.trim().parse().unwrap_or(0),
+        _ => 0,
+    }
+    .max(0)
+}
+
 /// The final event's `tokens` ({"input", "output"}) as usage; None when absent or zero.
 fn usage_from(tokens: Option<&Value>) -> Option<Usage> {
-    let t = tokens.and_then(Value::as_object);
-    let num = |k: &str| -> i64 {
-        let v = t.and_then(|m| m.get(k)).cloned().unwrap_or(Value::Null);
-        let v = if text::truthy(&v) { v } else { json!(0) };
-        let n = match &v {
-            Value::String(s) => text::parse_int(s),
-            Value::Number(_) | Value::Bool(_) => text::int_of(&v),
-            _ => None,
-        };
-        n.unwrap_or(0).max(0)
-    };
-    let (p, c) = (num("input"), num("output"));
-    if p == 0 && c == 0 {
-        None
-    } else {
-        Some(Usage { prompt_tokens: p, completion_tokens: c, total_tokens: p + c })
-    }
+    let (p, c) = (count(tokens.and_then(|t| t.get("input"))), count(tokens.and_then(|t| t.get("output"))));
+    (p != 0 || c != 0).then(|| Usage::new(p, c))
 }
 
-fn headers_of(r: &reqwest::Response) -> Vec<(String, String)> {
-    r.headers().iter().map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned())).collect()
-}
-
+/// An error body: JSON when it is JSON, else its text.
 async fn body_of(r: reqwest::Response) -> Value {
     let bytes = r.bytes().await.unwrap_or_default();
-    let s = String::from_utf8_lossy(&bytes).into_owned();
-    pyjson::loads(&s).unwrap_or(Value::String(s))
+    serde_json::from_slice(&bytes).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    #[serde(default)]
+    expires_in: Option<Value>,
 }
 
 impl StackSpotBackend {
     pub fn new(settings: &BackendSettings, env: &indexmap::IndexMap<String, String>, telemetry: Arc<Telemetry>, backoff_s: f64) -> Self {
         let o = &settings.options;
-        let get = |key: &str, env_name: &str| -> Option<Value> {
-            let v = match env.get(env_name).filter(|v| !v.is_empty()) {
-                Some(e) => Some(Value::String(e.clone())),
-                None => o.get(key).cloned(),
-            };
-            v.filter(|v| !v.is_null() && v.as_str() != Some(""))
+        // an environment variable wins over the [backends.<name>] option
+        let get = |key: &str, env_name: &str| -> Option<String> {
+            env.get(env_name).filter(|v| !v.is_empty()).cloned().or_else(|| match o.get(key) {
+                Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+                Some(Value::Null) | None => None,
+                Some(Value::String(_)) => None,
+                Some(other) => Some(other.to_string()),
+            })
         };
-        let s = |key: &str, env_name: &str, default: &str| -> String {
-            get(key, env_name).map(|v| text::str_of(&v)).unwrap_or_else(|| default.to_string())
-        };
+        let s = |key: &str, env_name: &str, default: &str| -> String { get(key, env_name).unwrap_or_else(|| default.to_string()) };
         let limiter = Arc::new(UpstreamLimiter::new(&settings.limits, telemetry.clone(), &settings.name));
-        let ca_bundle = get("ca_bundle", "STACKSPOT_CA_BUNDLE").map(|v| text::str_of(&v));
+        let ca_bundle = get("ca_bundle", "STACKSPOT_CA_BUNDLE");
         let n = (limiter.max_concurrent + 2).max(4) as usize;
         let mut builder = reqwest::Client::builder()
             .user_agent(format!("midir/{}", crate::buildinfo::VERSION))
@@ -121,9 +116,9 @@ impl StackSpotBackend {
         StackSpotBackend {
             name: settings.name.clone(),
             type_: "stackspot".into(),
-            realm: text::strip(&s("realm", "STACKSPOT_REALM", "")).to_string(),
-            client_id: text::strip(&s("client_id", "STACKSPOT_CLIENT_ID", "")).to_string(),
-            client_secret: text::strip(&s("client_secret", "STACKSPOT_CLIENT_SECRET", "")).to_string(),
+            realm: s("realm", "STACKSPOT_REALM", "").trim().to_string(),
+            client_id: s("client_id", "STACKSPOT_CLIENT_ID", "").trim().to_string(),
+            client_secret: s("client_secret", "STACKSPOT_CLIENT_SECRET", "").trim().to_string(),
             idm_base: s("idm_base_url", "STACKSPOT_IDM_BASE_URL", DEFAULT_IDM_BASE).trim_end_matches('/').to_string(),
             agent_base: s("agent_base_url", "STACKSPOT_AGENT_BASE_URL", DEFAULT_AGENT_BASE).trim_end_matches('/').to_string(),
             http,
@@ -147,10 +142,10 @@ impl StackSpotBackend {
         .map(|(n, _)| *n)
         .collect();
         if !missing.is_empty() {
-            return Err(ConfigError(format!("backend {} (stackspot): missing {}", text::repr_str(&self.name), missing.join(", "))));
+            return Err(ConfigError(format!("backend {:?} (stackspot): missing {}", self.name, missing.join(", "))));
         }
         if let Some(e) = &self.http_error {
-            return Err(ConfigError(format!("backend {} (stackspot): {e}", text::repr_str(&self.name))));
+            return Err(ConfigError(format!("backend {:?} (stackspot): {e}", self.name)));
         }
         Ok(())
     }
@@ -164,7 +159,7 @@ impl StackSpotBackend {
     }
 
     pub fn describe_target(&self, target: &str) -> String {
-        format!("{}...", text::head(target, 6))
+        format!("{}...", prefix(target, 6))
     }
 
     fn cached_token(&self) -> Option<String> {
@@ -188,19 +183,19 @@ impl StackSpotBackend {
         let r = self.http.post(self.idm_url()).form(&form).send().await.map_err(|e| NetError::from_reqwest(&e, false))?;
         let status = r.status().as_u16();
         if status != 200 {
-            let headers = headers_of(&r);
-            return Err(BackendError::new(status, body_of(r).await, headers, "idm", &self.name).into());
+            return Err(BackendError::new(status, body_of(r).await, "idm", &self.name).into());
         }
         let bytes = r.bytes().await.map_err(|e| NetError::from_reqwest(&e, true))?;
-        let j = pyjson::loads(&String::from_utf8_lossy(&bytes))
-            .map_err(|e| Error::Internal(format!("JSONDecodeError({})", text::repr_str(&e.text))))?;
-        let access = j.get("access_token").ok_or_else(|| Error::Internal("KeyError('access_token')".into()))?;
-        let expires = j.get("expires_in").cloned().unwrap_or(json!(300));
-        let expires_n = text::int_of(&expires).ok_or_else(|| Error::Internal(format!("ValueError({})", text::repr(&expires))))?;
-        tok.value = text::str_of(access);
-        tok.expires_at = time_now() + expires_n as f64;
+        let answer: TokenResponse =
+            serde_json::from_slice(&bytes).map_err(|e| Error::Internal(format!("{} idm: unexpected token response ({e})", self.name)))?;
+        let expires_in = match &answer.expires_in {
+            None | Some(Value::Null) => 300,
+            some => count(some.as_ref()).max(1),
+        };
+        tok.value = answer.access_token;
+        tok.expires_at = time_now() + expires_in as f64;
         *self.token_cache.lock().unwrap_or_else(|e| e.into_inner()) = (tok.value.clone(), tok.expires_at);
-        crate::info!(LOG, "{} token renewed, expires in {}s", self.name, j.get("expires_in").map_or("None".into(), text::str_of));
+        tracing::info!("{} token renewed, expires in {expires_in}s", self.name);
         Ok(tok.value.clone())
     }
 
@@ -215,17 +210,15 @@ impl StackSpotBackend {
         }
         let body = match &error.body {
             Value::String(s) => s.clone(),
-            other => pyjson::dumps(other, pyjson::ASCII),
+            other => other.to_string(),
         };
         let c = TOO_LONG_RE.captures(&body)?;
         Some((c.get(1)?.as_str().parse().ok()?, c.get(2)?.as_str().parse().ok()?))
     }
 
     async fn open_once(&self, target: &str, prompt: &str, deadline: f64) -> Result<reqwest::Response, Error> {
-        let body = pyjson::dumps(
-            &json!({"streaming": true, "user_prompt": prompt, "stackspot_knowledge": false, "return_ks_in_response": false}),
-            pyjson::COMPACT,
-        );
+        let body =
+            json!({"streaming": true, "user_prompt": prompt, "stackspot_knowledge": false, "return_ks_in_response": false}).to_string();
         let mut resp = None;
         for attempt in 1..=2 {
             let token = self.token(attempt == 2).await?;
@@ -242,7 +235,7 @@ impl StackSpotBackend {
                 .map_err(|e| NetError::from_reqwest(&e, false))?;
             if r.status().as_u16() == 401 && attempt == 1 {
                 drop(r);
-                crate::warn!(LOG, "{}: 401 from the agent; renewing the token", self.name);
+                tracing::warn!("{}: 401 from the agent; renewing the token", self.name);
                 continue;
             }
             resp = Some(r);
@@ -254,11 +247,7 @@ impl StackSpotBackend {
             if status == 429 {
                 self.limiter.on_429();
             }
-            let headers = headers_of(&r);
-            let bytes = r.bytes().await.unwrap_or_default();
-            let raw = String::from_utf8_lossy(&bytes).into_owned();
-            let body = pyjson::loads(&raw).unwrap_or(Value::String(raw));
-            return Err(BackendError::new(status, body, headers, "agent", &self.name).into());
+            return Err(BackendError::new(status, body_of(r).await, "agent", &self.name).into());
         }
         Ok(r)
     }
@@ -283,7 +272,7 @@ impl StackSpotBackend {
         }
         self.telemetry.queue_wait(queued);
         if queued >= 1.0 {
-            crate::info!(LOG, "queued {queued:.1}s for a {} slot ({})", self.name, pyjson::dumps(&self.limiter.state(), pyjson::DEFAULT));
+            tracing::info!("queued {queued:.1}s for a {} slot ({})", self.name, self.limiter.state());
         }
         let mut attempt = 0;
         let r = loop {
@@ -293,16 +282,10 @@ impl StackSpotBackend {
                 Err(e) if Self::retryable(&e) && attempt < 4 => {
                     let b = self.backoff_s;
                     let wait = (b * 2f64.powi(attempt - 1)).min(4.0 * b).max(b).max(0.0);
-                    let what = match &e {
-                        Error::Backend(be) => format!("BackendError({})", text::repr_str(&be.describe())),
-                        Error::Net(n) => n.repr(),
-                        other => other.describe(),
-                    };
-                    crate::warn!(LOG_BASE, "{} attempt {attempt} failed ({what}); waiting {wait:.1}s", self.name);
+                    tracing::warn!("{} attempt {attempt} failed ({e}); waiting {wait:.1}s", self.name);
                     let status = match &e {
                         Error::Backend(be) => be.status.to_string(),
-                        Error::Net(n) => n.kind.clone(),
-                        _ => "Exception".into(),
+                        other => other.telemetry_type(),
                     };
                     self.telemetry.upstream_retry(&status);
                     tokio::time::sleep(Duration::from_secs_f64(wait)).await;
@@ -314,65 +297,48 @@ impl StackSpotBackend {
     }
 }
 
-/// httpx's LineDecoder: `str.splitlines()` boundaries over a stream, a trailing "\r" waits for a possible "\n".
+/// SSE lines from a byte stream: a line ends at "\n", "\r\n" or "\r" (a trailing "\r" waits for a possible "\n").
 #[derive(Default)]
 struct Lines {
-    pending: Vec<u8>,
-    buf: String,
+    buf: Vec<u8>,
 }
 
 impl Lines {
-    fn decode(&mut self, chunk: &[u8]) -> Vec<String> {
-        self.pending.extend_from_slice(chunk);
-        let valid_up_to = match std::str::from_utf8(&self.pending) {
-            Ok(_) => self.pending.len(),
-            Err(e) if e.error_len().is_none() => e.valid_up_to(),
-            Err(_) => self.pending.len(),
-        };
-        let rest = self.pending.split_off(valid_up_to);
-        let text_ = String::from_utf8_lossy(&self.pending).into_owned();
-        self.pending = rest;
-        self.buf.push_str(&text_);
-        self.take_lines(false)
+    fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.buf.extend_from_slice(chunk);
+        self.take(false)
     }
 
-    fn take_lines(&mut self, flush: bool) -> Vec<String> {
+    fn finish(&mut self) -> Vec<String> {
+        self.take(true)
+    }
+
+    fn take(&mut self, flush: bool) -> Vec<String> {
         let mut out = vec![];
         let mut start = 0;
-        let b = self.buf.clone();
-        let mut it = b.char_indices().peekable();
-        while let Some((i, c)) = it.next() {
-            if matches!(c, '\n' | '\r' | '\u{b}' | '\u{c}' | '\u{1c}' | '\u{1d}' | '\u{1e}' | '\u{85}' | '\u{2028}' | '\u{2029}') {
-                if c == '\r' {
-                    match it.peek() {
-                        None if !flush => break, // wait: it may be "\r\n"
-                        Some(&(_, '\n')) => {
-                            out.push(b[start..i].to_string());
-                            it.next();
-                            start = i + 2;
-                            continue;
-                        }
-                        _ => {}
-                    }
+        let mut i = 0;
+        while i < self.buf.len() {
+            match self.buf[i] {
+                b'\n' => {
+                    out.push(String::from_utf8_lossy(&self.buf[start..i]).into_owned());
+                    start = i + 1;
                 }
-                out.push(b[start..i].to_string());
-                start = i + c.len_utf8();
+                b'\r' if i + 1 == self.buf.len() && !flush => break, // wait: it may be "\r\n"
+                b'\r' => {
+                    out.push(String::from_utf8_lossy(&self.buf[start..i]).into_owned());
+                    start = if self.buf.get(i + 1) == Some(&b'\n') { i + 2 } else { i + 1 };
+                    i = start;
+                    continue;
+                }
+                _ => {}
             }
+            i += 1;
         }
-        self.buf = b[start..].to_string();
+        self.buf.drain(..start);
         if flush && !self.buf.is_empty() {
-            out.push(std::mem::take(&mut self.buf));
+            out.push(String::from_utf8_lossy(&std::mem::take(&mut self.buf)).into_owned());
         }
         out
-    }
-
-    fn flush(&mut self) -> Vec<String> {
-        if !self.pending.is_empty() {
-            let t = String::from_utf8_lossy(&self.pending).into_owned();
-            self.pending.clear();
-            self.buf.push_str(&t);
-        }
-        self.take_lines(true)
     }
 }
 
@@ -383,35 +349,28 @@ enum Line {
 }
 
 fn parse_line(line: &str) -> Line {
-    let line = line.trim_end_matches('\r');
     let Some(payload) = line.strip_prefix("data:") else { return Line::Skip };
-    let payload = text::strip(payload);
+    let payload = payload.trim();
     if payload.is_empty() {
         return Line::Skip;
     }
-    let ev = match pyjson::loads(payload) {
-        Ok(v) => v,
-        Err(_) => {
-            crate::warn!(LOG, "ignoring non-JSON SSE event: {}", text::repr_str(text::head(payload, 200)));
-            return Line::Skip;
-        }
+    let Ok(ev) = serde_json::from_str::<Value>(payload) else {
+        tracing::warn!("ignoring non-JSON SSE event: {:?}", prefix(payload, 200));
+        return Line::Skip;
     };
     let Value::Object(ev) = ev else {
-        crate::warn!(LOG, "ignoring SSE event that is not an object: {}", text::repr_str(text::head(payload, 200)));
+        tracing::warn!("ignoring SSE event that is not an object: {:?}", prefix(payload, 200));
         return Line::Skip;
     };
     if ev.contains_key("stop_reason") || ev.contains_key("tokens") {
-        return Line::Done(Completion {
-            usage: usage_from(ev.get("tokens")),
-            message_id: ev.get("message_id").cloned().unwrap_or(Value::Null),
-            stop_reason: ev.get("stop_reason").cloned().unwrap_or(Value::Null),
-        });
+        let message_id = ev.get("message_id").and_then(Value::as_str).map(String::from);
+        return Line::Done(Completion { usage: usage_from(ev.get("tokens")), message_id });
     }
     match ev.get("message") {
         Some(Value::String(m)) if !m.is_empty() => Line::Item(Item::Text(m.clone())),
         Some(Value::String(_)) | None | Some(Value::Null) => Line::Skip,
         Some(_) => {
-            crate::warn!(LOG, "ignoring SSE event with a non-text message: {}", text::repr_str(text::head(payload, 200)));
+            tracing::warn!("ignoring SSE event with a non-text message: {:?}", prefix(payload, 200));
             Line::Skip
         }
     }
@@ -431,7 +390,7 @@ fn read_sse(r: reqwest::Response, slot: crate::limiter::SlotGuard) -> ItemStream
                 Some(Err(e)) => Err(Error::Net(NetError::from_reqwest(&e, true)))?,
                 None => break,
             };
-            for line in lines.decode(&chunk) {
+            for line in lines.feed(&chunk) {
                 match parse_line(&line) {
                     Line::Item(i) => yield i,
                     Line::Done(c) => {
@@ -442,7 +401,7 @@ fn read_sse(r: reqwest::Response, slot: crate::limiter::SlotGuard) -> ItemStream
                 }
             }
         }
-        for line in lines.flush() {
+        for line in lines.finish() {
             match parse_line(&line) {
                 Line::Item(i) => yield i,
                 Line::Done(c) => {
@@ -453,8 +412,8 @@ fn read_sse(r: reqwest::Response, slot: crate::limiter::SlotGuard) -> ItemStream
             }
         }
         if !done {
-            crate::warn!(LOG, "stream ended without a final event");
-            yield Item::Completion(Completion { usage: None, message_id: Value::Null, stop_reason: json!("stop") });
+            tracing::warn!("stream ended without a final event");
+            yield Item::Completion(Completion::default());
         }
     })
 }

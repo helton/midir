@@ -9,9 +9,9 @@ use crate::backends::{create_backend, StackSpotBackend};
 use crate::config::{Config, ConfigError, ModelSpec};
 use crate::emulation::engine::EmulationEngine;
 use crate::errors::Error;
-use crate::py::text;
 use crate::store::ResponseStore;
 use crate::telemetry::Telemetry;
+use crate::text::prefix;
 
 pub struct Gateway {
     pub config: Arc<Config>,
@@ -65,9 +65,8 @@ impl Gateway {
         for (name, b) in &self.backends {
             let why = match b.ready().await {
                 Ok(()) => None,
-                Err(Error::Backend(e)) => Some(text::head(&e.message(), 500).to_string()),
-                Err(Error::Net(e)) => Some(text::head(&format!("{name}: {}", e.repr()), 500).to_string()),
-                Err(e) => Some(text::head(&format!("{name}: {}", e.describe()), 500).to_string()),
+                Err(Error::Backend(e)) => Some(prefix(&e.message(), 500).to_string()),
+                Err(e) => Some(prefix(&format!("{name}: {e}"), 500).to_string()),
             };
             out.insert(name.clone(), why);
         }

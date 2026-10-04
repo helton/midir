@@ -34,8 +34,8 @@ Around them:
 | `store.rs` | the Responses API store for `previous_response_id` (one JSON file per response, content-addressed blobs) |
 | `telemetry.rs`, `otlp.rs` | one OpenTelemetry span and a few metrics per request, exported over OTLP/HTTP protobuf (hand-written encoder, no SDK) |
 | `app.rs` | HTTP routes, errors in each protocol's format, SSE keepalive, `/health` and `/ready` |
-| `main.rs`, `buildinfo.rs`, `log.rs` | the `midir` command: arguments, banner, `.env`, build identification, logging, graceful stop |
-| `py/` | Python semantics Midir's behavior is defined by (below) |
+| `main.rs`, `buildinfo.rs`, `log.rs` | the `midir` command (clap): arguments, banner, `.env` (dotenvy), build identification, logging (tracing), graceful stop |
+| `text.rs` | character-based string helpers and the one-line JSON style used in prompts |
 
 ## Backends
 
@@ -62,25 +62,22 @@ For a service that already has messages and tools (OpenAI, Anthropic, Bedrock, O
 be skipped: give the gateway a second kind of runner that maps the canonical request to the service's own API, next
 to `EmulationEngine` (`Gateway::runners`). This is the planned extension point; no native backend exists yet.
 
-## Python semantics
+## Requests and prompts
 
-Midir was first written in Python (0.0.x; kept internally as a port). Its prompts, error messages and stored
-responses were defined by Python's `json` and `str`, and they are part of the observable behavior: prompts reach the
-model byte for byte, and the Responses store on disk is shared across versions. `src/py/` keeps them:
+Each protocol adapter decodes the request body into its own typed request (`serde`): a field of the wrong type is a
+400 that names it (`invalid request: messages[2].content: a string or a list of content parts`), and unknown fields
+are ignored. Parameters a text backend cannot honor are accepted and reported once per client in the log
+(`temperature`, `reasoning_effort`, ...); the few that would change the answer's meaning are refused (`n > 1`,
+`logprobs`).
 
-- `py/json.rs`: a decoder with `json.loads`/`raw_decode` behavior and CPython 3.12's error messages ("Expecting
-  value: line 1 column 1 (char 0)" reaches the JSON-mode repair prompt), and an encoder with `json.dumps` separators,
-  `ensure_ascii`, `sort_keys` and float `repr` (`1.0`, `1e+16`).
-- `py/text.rs`: `str.strip()`/`isspace()`, `splitlines()`, code-point lengths and slices (prompt cap, chars/4
-  estimates, output limiter), truthiness, `==` across ints/floats/bools, `str()`/`repr()`.
-- `py/obj.rs`: `x.get(k)` / `for y in x` on JSON values, so malformed client input fails at the same place and is
-  answered with a 400 that names the problem.
-- The lookbehind regexes are hand-written (`SENT_RE` in `emulation/followups.rs`, model names in `config.rs`); the
-  other patterns run on the `regex` crate (Unicode `\b`, `\w`, case folding), and `match` patterns in the
-  configuration on `fancy-regex` (Python syntax).
+What the model reads is plain text built by `emulation/prompt.rs`: the client's system prompt, the tool protocol with
+one compact JSON line per tool, the output format for JSON mode, the conversation, and the last turn. JSON values
+written into the conversation (earlier tool calls, schemas) use one-line JSON with a space after `:` and `,`
+(`{"name": "read_file", "arguments": {"path": "a.py"}}`), the same form the tool protocol shows the model. Lengths
+(the prompt cap, description limits, the four-characters-per-token estimates) count characters, not bytes.
 
-Known limits of the JSON value type: integers outside 64 bits become floats, `NaN`/`Infinity` become `null`, lone
-surrogate escapes become U+FFFD.
+`match` patterns in the configuration use the `regex` crate's syntax (case-insensitive; no lookaround or
+backreferences, matching in linear time).
 
 ## Tests
 

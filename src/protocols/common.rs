@@ -1,82 +1,126 @@
-//! Helpers shared by the protocol adapters: content parts as text, tool arguments, ignored
-//! parameters, and the guard that turns malformed input into a 400.
+//! What the protocol adapters share: OpenAI-style content (a string or a list of parts) as text, tool arguments,
+//! ignored parameters, `max_tokens` validation, and typed decoding with errors that name the offending field.
 
-use serde_json::{json, Value};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 
-use crate::canonical::CanonicalRequest;
 use crate::errors::ClientError;
-use crate::py::json as pyjson;
-use crate::py::obj::{self, PyErr, PyResult};
-use crate::py::text;
+use crate::text::readable_json;
 
+/// Content kinds a text-only backend cannot receive: they become a placeholder (CAVEAT).
 pub const MEDIA_TYPES: [&str; 8] = ["image_url", "input_image", "image", "input_audio", "audio", "file", "input_file", "document"];
-const LOG: &str = "midir.protocols.common";
 
-/// `t in MEDIA_TYPES` (a set: an unhashable `t` raises TypeError).
-pub fn is_media(t: &Value) -> PyResult<bool> {
-    obj::hashable(t)?;
-    Ok(matches!(t, Value::String(s) if MEDIA_TYPES.contains(&s.as_str())))
+/// The request body as a protocol's typed request; a mismatch is a 400 that says where.
+pub fn decode<T: DeserializeOwned>(body: &Value) -> Result<T, ClientError> {
+    serde_path_to_error::deserialize(body).map_err(|e| {
+        let path = e.path().to_string();
+        let at = if path == "." { String::new() } else { format!("{path}: ") };
+        ClientError::new(format!("invalid request: {at}{}", e.inner()), "invalid_request")
+    })
 }
 
-/// OpenAI-style content (string or list of parts) as text. Media parts become a placeholder (CAVEAT: text-only API).
-pub fn text_of(content: Option<&Value>, where_: &str) -> PyResult<String> {
-    let content = match content {
-        None | Some(Value::Null) => return Ok(String::new()),
-        Some(Value::String(s)) => return Ok(s.clone()),
-        Some(Value::Array(a)) => a,
-        Some(other) => return Ok(text::str_of(other)),
-    };
-    let mut parts: Vec<String> = vec![];
-    for p in content {
-        match p {
-            Value::String(s) => parts.push(s.clone()),
-            Value::Object(m) => {
-                let empty = json!("");
-                let t = m.get("type").unwrap_or(&empty);
-                if obj::is_str(Some(t), "text") || obj::is_str(Some(t), "input_text") || obj::is_str(Some(t), "output_text") {
-                    parts.push(text::str_of(m.get("text").unwrap_or(&empty)));
-                } else if obj::is_str(Some(t), "refusal") {
-                    parts.push(text::str_of(m.get("refusal").unwrap_or(&empty)));
-                } else if is_media(t)? {
-                    let t = text::str_of(t);
-                    crate::warn!(LOG, "{where_}: '{t}' content replaced by a placeholder (the StackSpot Agent API is text-only)");
-                    parts.push(format!("[{t} omitted: this model only receives text]"));
-                } else {
-                    parts.push(pyjson::dumps(p, pyjson::DEFAULT));
-                }
-            }
-            _ => continue,
+/// OpenAI content: a string, or a list of parts (strings or typed objects).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged, expecting = "a string or a list of content parts")]
+pub enum Content {
+    Text(String),
+    Parts(Vec<Part>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged, expecting = "a string or a content part object")]
+pub enum Part {
+    Text(String),
+    Block(PartBlock),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PartBlock {
+    #[serde(rename = "type", default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+pub fn placeholder(kind: &str, place: &str) -> String {
+    tracing::warn!("{place}: '{kind}' content replaced by a placeholder (the backend is text-only)");
+    format!("[{kind} omitted: this model only receives text]")
+}
+
+impl PartBlock {
+    /// Text parts as they are, refusals as their text, media as a placeholder, anything else as its JSON.
+    pub fn as_text(&self, place: &str) -> String {
+        match self.kind.as_str() {
+            "text" | "input_text" | "output_text" => self.text.clone().unwrap_or_default(),
+            "refusal" => self.refusal.clone().unwrap_or_default(),
+            k if MEDIA_TYPES.contains(&k) => placeholder(k, place),
+            _ => readable_json(self),
         }
     }
-    Ok(parts.join("\n"))
 }
 
-pub fn text_of_value(content: &Value, where_: &str) -> PyResult<String> {
-    text_of(Some(content), where_)
+impl Content {
+    /// The content as one text; parts are joined by newlines.
+    pub fn as_text(&self, place: &str) -> String {
+        match self {
+            Content::Text(s) => s.clone(),
+            Content::Parts(parts) => parts
+                .iter()
+                .map(|p| match p {
+                    Part::Text(s) => s.clone(),
+                    Part::Block(b) => b.as_text(place),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
 }
 
-pub fn parse_arguments(raw: Option<&Value>) -> Value {
+pub fn text_of(content: &Option<Content>, place: &str) -> String {
+    content.as_ref().map_or_else(String::new, |c| c.as_text(place))
+}
+
+/// One stop sequence or several.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged, expecting = "a string or a list of strings")]
+pub enum Stop {
+    One(String),
+    Many(Vec<String>),
+}
+
+pub fn stops(stop: Option<Stop>) -> Vec<String> {
+    match stop {
+        None => vec![],
+        Some(Stop::One(s)) => vec![s],
+        Some(Stop::Many(v)) => v,
+    }
+}
+
+/// Tool-call arguments as a JSON value: a JSON string is decoded (an empty one is `{}`); a string that is not JSON
+/// stays a string (CAVEAT: invalid JSON in a client's history is passed on as text).
+pub fn parse_arguments(raw: Option<Value>) -> Value {
     match raw {
-        Some(Value::String(s)) => {
-            if text::is_blank(s) {
-                json!({})
-            } else {
-                pyjson::loads(s).unwrap_or_else(|_| Value::String(s.clone()))
-            }
-        }
         None | Some(Value::Null) => json!({}),
-        Some(other) => other.clone(),
+        Some(Value::String(s)) if s.trim().is_empty() => json!({}),
+        Some(Value::String(s)) => serde_json::from_str(&s).unwrap_or(Value::String(s)),
+        Some(other) => other,
     }
 }
 
-pub fn arguments_str(a: &Value) -> String {
+/// Arguments as the JSON text clients expect in `arguments` fields.
+pub fn arguments_text(a: &Value) -> String {
     match a {
         Value::String(s) => s.clone(),
-        other => pyjson::dumps(other, pyjson::DEFAULT),
+        other => other.to_string(),
     }
 }
 
-/// Parameters accepted without effect: present and not None, False, [] or {}.
+/// Parameters accepted without effect: present and not null, false, empty or zero-length.
 pub fn ignored_params(body: &Value, names: &[&str]) -> Vec<String> {
     names
         .iter()
@@ -90,45 +134,15 @@ pub fn ignored_params(body: &Value, names: &[&str]) -> Vec<String> {
         .collect()
 }
 
-pub fn tool_params(p: Option<&Value>) -> Value {
-    match p {
-        Some(v) if text::truthy(v) => v.clone(),
-        _ => json!({"type": "object", "properties": {}}),
-    }
+/// A JSON Schema for tool parameters: the client's object, else an empty object schema.
+pub fn tool_params(p: Option<Value>) -> Option<Value> {
+    p.filter(|v| v.as_object().is_some_and(|m| !m.is_empty()))
 }
 
-/// Raw `max_tokens`-style value from the body, validated by `to_canonical`.
-pub struct Adapted {
-    pub req: CanonicalRequest,
-    pub max_tokens: Option<Value>,
-}
-
-/// Adapter call where malformed input is a 400, never a 500.
-pub fn to_canonical(adapter: &str, result: PyResult<Result<Adapted, ClientError>>) -> Result<CanonicalRequest, ClientError> {
-    let adapted = match result {
-        Ok(Ok(a)) => a,
-        Ok(Err(e)) => return Err(e),
-        Err(PyErr { kind, msg }) => {
-            crate::warn!(LOG, "malformed {adapter} request: {kind}({})", text::repr_str(&msg));
-            return Err(ClientError::new(
-                format!("malformed request ({kind}: {msg}); check the types of messages/input, content, tools and system"),
-                "invalid_request",
-            ));
-        }
-    };
-    let mut req = adapted.req;
-    match adapted.max_tokens {
-        None | Some(Value::Null) => {}
-        Some(v) => {
-            let ok = match &v {
-                Value::Number(n) if text::is_int(&v) => n.as_i64().map_or(n.as_u64().is_some(), |i| i > 0),
-                _ => false,
-            };
-            if !ok {
-                return Err(ClientError::new(format!("max_tokens must be a positive integer, got {}", text::repr(&v)), "invalid_request"));
-            }
-            req.max_tokens = Some(v.as_i64().unwrap_or(i64::MAX));
-        }
+/// `max_tokens` and its equivalents must be positive.
+pub fn positive(name: &str, v: Option<i64>) -> Result<Option<i64>, ClientError> {
+    match v {
+        Some(n) if n <= 0 => Err(ClientError::new(format!("{name} must be a positive integer, got {n}"), "invalid_request")),
+        other => Ok(other),
     }
-    Ok(req)
 }

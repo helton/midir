@@ -19,10 +19,8 @@ use crate::canonical::{CanonicalRequest, CanonicalResponse, Event, Meta, SharedM
 use crate::config::ModelSpec;
 use crate::errors::Error;
 use crate::otlp::{self, AttrValue, Attrs, MetricData, Points, SpanData};
-use crate::py::text;
 use crate::store::ResponseStore;
-
-const LOG: &str = "midir.telemetry";
+use crate::text::{prefix, round1, skip_chars};
 const SYSTEM_MARKERS: [(&str, &str); 3] = [("Hermes Agent", "hermes"), ("OpenClaw", "openclaw"), ("DeepSeek Harness", "deepseek-harness")];
 const SESSION_HEADERS: [&str; 7] = [
     "x-claude-code-session-id",
@@ -36,16 +34,15 @@ const SESSION_HEADERS: [&str; 7] = [
 const BUCKETS: [f64; 15] = [0.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0, 750.0, 1000.0, 2500.0, 5000.0, 7500.0, 10000.0];
 static VERSION_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"/(\d[\w.\-]*)").unwrap());
 
-/// A header as Starlette reads it (first value, latin-1).
+/// A header's (first) value as text.
 pub fn header(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers.get(name).map(|v| v.as_bytes().iter().map(|&b| b as char).collect())
+    headers.get(name).map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
 }
 
 /// (client name, version) from the User-Agent and a few client headers; clients that only send their SDK's
 /// User-Agent are recognized by the opening of their system prompt. Labels only.
 pub fn client_of(headers: &HeaderMap, system: &str) -> (String, String) {
-    let ua = header(headers, "user-agent").unwrap_or_default();
-    let ua = text::strip(&ua).to_string();
+    let ua = header(headers, "user-agent").unwrap_or_default().trim().to_string();
     let low = ua.to_lowercase();
     let version = VERSION_RE.captures(&ua).and_then(|c| c.get(1)).map(|m| m.as_str().to_string()).unwrap_or_default();
     if low.contains("claude-cli") || low.contains("claude-code") {
@@ -65,7 +62,7 @@ pub fn client_of(headers: &HeaderMap, system: &str) -> (String, String) {
     {
         return ("copilot".into(), version);
     }
-    let head = text::head(system, 600);
+    let head = prefix(system, 600);
     for (marker, name) in SYSTEM_MARKERS {
         if head.contains(marker) {
             return (name.into(), version);
@@ -75,7 +72,7 @@ pub fn client_of(headers: &HeaderMap, system: &str) -> (String, String) {
         return ("sdk-python".into(), version);
     }
     let first = ua.split('/').next().unwrap_or("");
-    let name = text::head(first, 30).to_lowercase();
+    let name = prefix(first, 30).to_lowercase();
     (if name.is_empty() { "unknown".into() } else { name }, version)
 }
 
@@ -94,28 +91,25 @@ pub fn request_meta(
     let (client, version) = client_of(headers, req.system.first().map(String::as_str).unwrap_or(""));
     let mut session: Option<String> = SESSION_HEADERS.iter().find_map(|h| header(headers, h).filter(|v| !v.is_empty()));
     if session.is_none() && protocol == "messages" {
-        session = (|| {
-            let md = body.get("metadata").filter(|m| text::truthy(m))?;
-            let uid = md.as_object()?.get("user_id").filter(|u| text::truthy(u)).cloned().unwrap_or(Value::String("{}".into()));
-            let parsed = crate::py::json::loads(uid.as_str()?).ok()?;
-            let sid = parsed.as_object()?.get("session_id")?;
-            if !text::truthy(sid) {
-                None
-            } else {
-                Some(text::str_of(sid))
-            }
-        })();
+        // Claude Code: metadata.user_id is a JSON string holding the session id
+        session = body
+            .pointer("/metadata/user_id")
+            .and_then(Value::as_str)
+            .and_then(|uid| serde_json::from_str::<Value>(uid).ok())
+            .and_then(|v| v.get("session_id").and_then(Value::as_str).map(String::from))
+            .filter(|s| !s.is_empty());
     }
     if session.is_none() && protocol == "responses" {
-        let from_body = ["prompt_cache_key", "user"].iter().find_map(|k| body.get(*k).filter(|v| text::truthy(v)).map(text::str_of));
-        session = from_body;
+        session = ["prompt_cache_key", "user"]
+            .iter()
+            .find_map(|k| body.get(*k).and_then(Value::as_str).filter(|v| !v.is_empty()).map(String::from));
         if session.is_none() {
-            if let Some(Value::String(prev)) = body.get("previous_response_id").filter(|p| text::truthy(p)) {
+            if let Some(prev) = body.get("previous_response_id").and_then(Value::as_str).filter(|p| !p.is_empty()) {
                 session = store.session_of(prev).filter(|s| !s.is_empty());
             }
         }
         if session.is_none() {
-            session = Some(format!("chain-{}", text::slice(rid, 5, 15)));
+            session = Some(format!("chain-{}", prefix(skip_chars(rid, 5), 10)));
         }
     }
     let session = session.unwrap_or_else(|| {
@@ -123,7 +117,7 @@ pub fn request_meta(
         if first_user.is_empty() {
             rid.to_string()
         } else {
-            let digest = Sha1::digest(text::head(first_user, 500).as_bytes());
+            let digest = Sha1::digest(prefix(first_user, 500).as_bytes());
             format!("conv-{}", &crate::canonical::hex(&digest)[..10])
         }
     });
@@ -137,16 +131,15 @@ pub fn request_meta(
     let mut m = req.meta();
     m.client = client;
     m.client_version = version;
-    m.session = text::head(&session, 64).to_string();
+    m.session = prefix(&session, 64).to_string();
     m.initiator = initiator;
     m.protocol = protocol.into();
     m.model = model.into();
     m.agent = route.name.clone();
     m.backend = route.backend.clone();
-    m.stream = body.get("stream").map_or(false, text::truthy);
+    m.stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     m.tools_declared = req.tools.len() as i64;
     m.json_mode = req.json_schema.is_some();
-    m.labeled = true;
 }
 
 fn now_ns() -> u64 {
@@ -273,7 +266,7 @@ impl Telemetry {
             ("telemetry.sdk.version".into(), s("midir-otlp")),
         ];
         let mut id = random::<16>();
-        id[6] = (id[6] & 0x0f) | 0x40; // uuid4, like the Python SDK's service.instance.id
+        id[6] = (id[6] & 0x0f) | 0x40; // a random (version 4) UUID
         id[8] = (id[8] & 0x3f) | 0x80;
         let hex = crate::canonical::hex(&id);
         let uuid = format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]);
@@ -299,7 +292,7 @@ impl Telemetry {
             start_ns: now_ns(),
             closed: AtomicBool::new(false),
         });
-        crate::info!(LOG, "telemetry on: OTLP/HTTP -> {endpoint} (service {service_name})");
+        tracing::info!("telemetry on: OTLP/HTTP -> {endpoint} (service {service_name})");
         Telemetry { exp: Some(exp) }
     }
 
@@ -424,13 +417,13 @@ impl Telemetry {
             ("midir.parse_errors".into(), AttrValue::Int(meta.parse_errors)),
             ("midir.repairs".into(), AttrValue::Int(meta.repairs)),
             ("midir.upstream_calls".into(), AttrValue::Int(meta.upstream_calls)),
-            ("midir.queue_wait_ms".into(), meta.queue_wait_ms.map_or(AttrValue::Int(0), |q| AttrValue::Double(text::round1(q)))),
+            ("midir.queue_wait_ms".into(), meta.queue_wait_ms.map_or(AttrValue::Int(0), |q| AttrValue::Double(round1(q)))),
             ("midir.prompt_chars".into(), AttrValue::Int(meta.prompt_chars)),
             ("midir.dropped_turns".into(), AttrValue::Int(meta.dropped_turns)),
-            ("midir.duration_ms".into(), AttrValue::Double(text::round1(duration_ms))),
+            ("midir.duration_ms".into(), AttrValue::Double(round1(duration_ms))),
         ];
         if let Some(t) = ttfb {
-            attrs.push(("midir.ttfb_ms".into(), AttrValue::Double(text::round1(t * 1000.0))));
+            attrs.push(("midir.ttfb_ms".into(), AttrValue::Double(round1(t * 1000.0))));
         }
         if let Some(e) = &error {
             attrs.push(("error.type".into(), s(e)));
@@ -492,8 +485,8 @@ impl Exporter {
         }
         match rb.send().await {
             Ok(r) if r.status().is_success() => {}
-            Ok(r) => crate::warn!(LOG, "OTLP export to {url} failed: HTTP {}", r.status().as_u16()),
-            Err(e) => crate::warn!(LOG, "OTLP export to {url} failed: {e}"),
+            Ok(r) => tracing::warn!("OTLP export to {url} failed: HTTP {}", r.status().as_u16()),
+            Err(e) => tracing::warn!("OTLP export to {url} failed: {e}"),
         }
     }
 

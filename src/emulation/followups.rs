@@ -1,15 +1,14 @@
 //! Detectors for replies that need one automatic follow-up: announce and stop, redundant
 //! confirmation, false incapacity; and how two calls are compared when deduplicating the invalid-JSON repair.
-//! CAVEAT: heuristics, pt/en/es. SENT_RE (a lookbehind) is hand-written.
+//! CAVEAT: heuristics, pt/en/es.
 
 use std::sync::LazyLock;
 
 use regex::Regex;
 use serde_json::Value;
 
-use crate::canonical::{CanonicalRequest, CanonicalResponse, ToolCall, ToolChoice};
-use crate::py::json as pyjson;
-use crate::py::text;
+use crate::canonical::{CanonicalRequest, CanonicalResponse, Finish, ToolCall};
+use crate::text::char_len;
 
 fn re(p: &str) -> Regex {
     Regex::new(p).unwrap()
@@ -107,7 +106,7 @@ static NEVER: LazyLock<Regex> = LazyLock::new(|| re(r"$^"));
 const TARGET_KEYS: [&str; 13] =
     ["path", "file_path", "filePath", "filepath", "file", "filename", "target", "command", "cmd", "url", "uri", "query", "pattern"];
 
-/// `re.split(r"(?<=[.!?:])\s+|\n+", s)`.
+/// Sentences: split after `.`, `!`, `?` or `:` followed by whitespace, and at line breaks.
 pub fn sent_split(s: &str) -> Vec<&str> {
     let chars: Vec<(usize, char)> = s.char_indices().collect();
     let byte = |i: usize| if i < chars.len() { chars[i].0 } else { s.len() };
@@ -117,9 +116,9 @@ pub fn sent_split(s: &str) -> Vec<&str> {
     while i < chars.len() {
         let c = chars[i].1;
         let after_punct = i > 0 && matches!(chars[i - 1].1, '.' | '!' | '?' | ':');
-        if after_punct && text::is_space(c) {
+        if after_punct && c.is_whitespace() {
             let mut j = i;
-            while j < chars.len() && text::is_space(chars[j].1) {
+            while j < chars.len() && chars[j].1.is_whitespace() {
                 j += 1;
             }
             out.push(&s[last..byte(i)]);
@@ -152,30 +151,42 @@ pub fn call_target(c: &ToolCall) -> String {
             }
         }
     }
-    pyjson::dumps(&c.arguments, pyjson::Style { ensure_ascii: false, compact: false, sort_keys: true })
+    sorted_json(&c.arguments)
+}
+
+/// JSON text with object keys sorted at every level: equal values give equal text.
+pub fn sorted_json(v: &Value) -> String {
+    fn sort(v: &Value) -> Value {
+        match v {
+            Value::Object(m) => {
+                let mut keys: Vec<&String> = m.keys().collect();
+                keys.sort();
+                Value::Object(keys.into_iter().map(|k| (k.clone(), sort(&m[k]))).collect())
+            }
+            Value::Array(a) => Value::Array(a.iter().map(sort).collect()),
+            other => other.clone(),
+        }
+    }
+    sort(v).to_string()
 }
 
 pub fn call_key(c: &ToolCall) -> (String, String) {
     (c.name.clone(), call_target(c))
 }
 
-fn tools_on(req: &CanonicalRequest) -> bool {
-    !req.tools.is_empty() && req.tool_choice != ToolChoice::None
-}
-
 pub fn false_incapacity(req: &CanonicalRequest, resp: &CanonicalResponse, text_: &str, calls: &[ToolCall]) -> bool {
-    if !calls.is_empty() || !tools_on(req) || resp.finish != "stop" {
+    if !calls.is_empty() || !req.tools_on() || resp.finish != Finish::Stop {
         return false;
     }
-    let t = text::strip(text_);
-    if t.is_empty() || text::len(t) > 800 || !INCAPACITY_RE.is_match(t) {
+    let t = text_.trim();
+    if t.is_empty() || char_len(t) > 800 || !INCAPACITY_RE.is_match(t) {
         return false;
     }
     req.tools.iter().any(|tool| TOOL_ABILITY_RE.is_match(&format!("{} {}", tool.name, tool.description)))
 }
 
 pub fn promise_only(req: &CanonicalRequest, resp: &CanonicalResponse, text_: &str, calls: &[ToolCall]) -> bool {
-    if !calls.is_empty() || !tools_on(req) || resp.finish != "stop" {
+    if !calls.is_empty() || !req.tools_on() || resp.finish != Finish::Stop {
         return false;
     }
     announces_without_acting(text_) || redundant_confirmation(req, text_).is_some()
@@ -184,8 +195,8 @@ pub fn promise_only(req: &CanonicalRequest, resp: &CanonicalResponse, text_: &st
 /// The action name when the reply's closing question asks permission for, or its closing lines report as still
 /// pending, something the first user request already orders.
 pub fn redundant_confirmation(req: &CanonicalRequest, text_: &str) -> Option<&'static str> {
-    let prose = CODE_RE.replace_all(text::strip(text_), " ").into_owned();
-    let sents: Vec<&str> = sent_split(&prose).into_iter().filter(|x| !x.is_empty() && !text::is_blank(x)).map(text::strip).collect();
+    let prose = CODE_RE.replace_all(text_.trim(), " ").into_owned();
+    let sents: Vec<&str> = sent_split(&prose).into_iter().map(str::trim).filter(|x| !x.is_empty()).collect();
     let last = *sents.last()?;
     let asks = last.ends_with('?') && CONFIRM_RE.is_match(last);
     let tail = sents[sents.len().saturating_sub(3)..].join(" ");
@@ -206,19 +217,15 @@ pub fn redundant_confirmation(req: &CanonicalRequest, text_: &str) -> Option<&'s
 }
 
 pub fn announces_without_acting(text_: &str) -> bool {
-    let t = text::strip(text_);
+    let t = text_.trim();
     if t.is_empty() {
         return false;
     }
     let prose = CODE_RE.replace_all(t, " ").into_owned();
-    let sents: Vec<&str> = sent_split(&prose)
-        .into_iter()
-        .filter(|x| !x.is_empty() && !text::is_blank(x) && WORD_RE.is_match(x))
-        .map(text::strip)
-        .filter(|x| !OFFER_RE.is_match(x))
-        .collect();
+    let sents: Vec<&str> =
+        sent_split(&prose).into_iter().map(str::trim).filter(|x| !x.is_empty() && WORD_RE.is_match(x) && !OFFER_RE.is_match(x)).collect();
     let Some(last) = sents.last() else { return false };
-    if text::rstrip(last).ends_with('?') {
+    if last.ends_with('?') {
         return false; // it asks the user something
     }
     let last4 = sents[sents.len().saturating_sub(4)..].join(" ");
@@ -229,7 +236,7 @@ pub fn announces_without_acting(text_: &str) -> bool {
     if (INTENT_RE.is_match(&last2.join(" ")) || last2.iter().any(|x| GERUND_OPEN_RE.is_match(x))) && !PAST_RE.is_match(last) {
         return true; // the last thing it says is an action it is about to do
     }
-    if text::rstrip(&prose).ends_with(':') && !t.ends_with("```") {
+    if prose.trim_end().ends_with(':') && !t.ends_with("```") {
         return true;
     }
     if DONE_RE.is_match(&prose) {
@@ -238,7 +245,7 @@ pub fn announces_without_acting(text_: &str) -> bool {
     if INTENT_RE.is_match(sents[0]) || GERUND_OPEN_RE.is_match(sents[0]) {
         return true; // opens with an announcement and never acts
     }
-    let lines: Vec<&str> = text::splitlines(&prose).into_iter().filter(|l| !text::is_blank(l)).collect();
+    let lines: Vec<&str> = prose.lines().filter(|l| !l.trim().is_empty()).collect();
     let Some(plan_at) = lines.iter().position(|l| PLAN_RE.is_match(l)) else { return false };
     lines[plan_at + 1..].iter().filter(|l| STEP_RE.is_match(l)).count() >= 2
 }

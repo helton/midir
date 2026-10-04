@@ -1,20 +1,20 @@
-//! Configuration: config/midir.toml (or MIDIR_CONFIG) plus the environment. `${NAME}` references are
-//! expanded from the environment; an environment variable with the same meaning always wins over the file. The
-//! pre-0.0.1 layout (`default`, `[stackspot]`, `[limits]`, `[[agents]]`) is still read, with a warning.
+//! Configuration: config/midir.toml (or MIDIR_CONFIG) plus the environment. `${NAME}` references are expanded from
+//! the environment; an environment variable with the same meaning always wins over the file. The pre-0.0.1 layout
+//! (`default`, `[stackspot]`, `[limits]`, `[[agents]]`) is still read, with a warning.
 
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
 use regex::Regex;
+use serde::de::{self, Deserializer};
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use crate::py::obj;
-use crate::py::text::{self, str_of, truthy};
+use crate::text::char_len;
 
 pub const DEFAULT_MODEL_NAME: &str = "default";
-const FALSE: [&str; 4] = ["0", "false", "no", "off"];
-const LOG: &str = "midir.config";
 
 #[derive(Debug, Clone)]
 pub struct LimitSettings {
@@ -28,6 +28,7 @@ pub struct LimitSettings {
 pub struct BackendSettings {
     pub name: String,
     pub type_: String,
+    /// The backend's own options, `${NAME}` already expanded.
     pub options: Map<String, Value>,
     pub limits: LimitSettings,
 }
@@ -39,11 +40,11 @@ pub struct ModelSpec {
     pub target: String,
     pub description: String,
     pub aliases: Vec<String>,
-    pub match_re: Option<fancy_regex::Regex>,
+    pub match_re: Option<Regex>,
     pub match_pattern: Option<String>,
-    pub max_prompt_chars: Option<Value>,
-    pub tail_reminder: Option<Value>,
-    pub tool_desc_max: Option<Value>,
+    pub max_prompt_chars: Option<i64>,
+    pub tail_reminder: Option<bool>,
+    pub tool_desc_max: Option<i64>,
 }
 
 impl ModelSpec {
@@ -65,7 +66,7 @@ impl ModelSpec {
 
 #[derive(Debug, Clone)]
 pub struct ServerSettings {
-    pub port: i64,
+    pub port: u16,
     pub max_prompt_chars: i64,
     pub tail_reminder: bool,
     pub tool_desc_max: i64,
@@ -86,12 +87,18 @@ pub struct TelemetrySettings {
 #[derive(Debug, Clone)]
 pub struct ConfigError(pub String);
 
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 type R<T> = Result<T, ConfigError>;
 
 pub struct Config {
     pub env: IndexMap<String, String>,
-    pub root: PathBuf,
     pub config_file: PathBuf,
+    /// the file the configuration came from, or "env"
     pub source: String,
     pub server: ServerSettings,
     pub telemetry: TelemetrySettings,
@@ -100,39 +107,141 @@ pub struct Config {
     pub default: Arc<ModelSpec>,
 }
 
-/// The process environment, in its own order (like `dict(os.environ)`).
+/// The process environment.
 pub fn environment() -> IndexMap<String, String> {
     std::env::vars_os().map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned())).collect()
 }
 
-pub fn toml_to_json(v: toml::Value) -> Value {
-    match v {
-        toml::Value::String(s) => Value::String(s),
-        toml::Value::Integer(i) => json!(i),
-        toml::Value::Float(f) => crate::py::json::float(f),
-        toml::Value::Boolean(b) => Value::Bool(b),
-        toml::Value::Datetime(d) => Value::String(d.to_string()),
-        toml::Value::Array(a) => Value::Array(a.into_iter().map(toml_to_json).collect()),
-        toml::Value::Table(t) => Value::Object(t.into_iter().map(|(k, v)| (k, toml_to_json(v))).collect()),
+// ---------------------------------------------------------------------------------------------------------------------
+// the file, as written (numbers and booleans may also be strings, so `${NAME}` works everywhere)
+// ---------------------------------------------------------------------------------------------------------------------
+
+/// A number, or a string holding one (after `${NAME}` expansion).
+fn num<'de, D: Deserializer<'de>, T: FromStr + Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error>
+where
+    T::Err: std::fmt::Display,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr<T> {
+        Num(T),
+        Str(String),
     }
-}
-
-fn int_cfg(v: &Value) -> R<i64> {
-    text::int_of(v).ok_or_else(|| ConfigError(format!("invalid literal for int() with base 10: {}", text::repr(v))))
-}
-
-fn float_cfg(v: &Value) -> R<f64> {
-    text::float_of(v).ok_or_else(|| ConfigError(format!("could not convert string to float: {}", text::repr(v))))
-}
-
-fn section(v: Option<&Value>) -> R<Option<&Map<String, Value>>> {
-    match v {
+    match Option::<NumOrStr<T>>::deserialize(d)? {
         None => Ok(None),
-        Some(x) if !truthy(x) => Ok(None),
-        Some(Value::Object(m)) => Ok(Some(m)),
-        Some(other) => Err(ConfigError(format!("AttributeError: '{}' object has no attribute 'get'", text::type_name(other)))),
+        Some(NumOrStr::Num(n)) => Ok(Some(n)),
+        Some(NumOrStr::Str(s)) if s.trim().is_empty() => Ok(None),
+        Some(NumOrStr::Str(s)) => s.trim().parse().map(Some).map_err(|e| de::Error::custom(format!("{s:?} is not a number ({e})"))),
     }
 }
+
+/// A boolean, or a string holding one (true/false, 1/0, yes/no, on/off).
+fn flag<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrStr {
+        Bool(bool),
+        Str(String),
+    }
+    match Option::<BoolOrStr>::deserialize(d)? {
+        None => Ok(None),
+        Some(BoolOrStr::Bool(b)) => Ok(Some(b)),
+        Some(BoolOrStr::Str(s)) if s.trim().is_empty() => Ok(None),
+        Some(BoolOrStr::Str(s)) => parse_flag(&s).map(Some).ok_or_else(|| de::Error::custom(format!("{s:?} is not a boolean"))),
+    }
+}
+
+fn parse_flag(s: &str) -> Option<bool> {
+    match s.trim().to_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct FileConfig {
+    default_model: Option<String>,
+    server: ServerFile,
+    telemetry: TelemetryFile,
+    backends: IndexMap<String, BackendFile>,
+    models: Vec<ModelFile>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ServerFile {
+    #[serde(deserialize_with = "num")]
+    port: Option<u16>,
+    #[serde(deserialize_with = "num")]
+    max_prompt_chars: Option<i64>,
+    #[serde(deserialize_with = "flag")]
+    tail_reminder: Option<bool>,
+    #[serde(deserialize_with = "num")]
+    tool_desc_max: Option<i64>,
+    responses_dir: Option<String>,
+    #[serde(deserialize_with = "num")]
+    responses_retention_days: Option<f64>,
+    #[serde(deserialize_with = "num")]
+    responses_max_mb: Option<f64>,
+    #[serde(deserialize_with = "num")]
+    keepalive_s: Option<f64>,
+    #[serde(deserialize_with = "num")]
+    retry_backoff_s: Option<f64>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct TelemetryFile {
+    otlp_endpoint: Option<String>,
+    service_name: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct LimitsFile {
+    #[serde(deserialize_with = "num")]
+    max_concurrent: Option<i64>,
+    #[serde(deserialize_with = "num")]
+    requests_per_minute: Option<i64>,
+    #[serde(deserialize_with = "num")]
+    queue_timeout_s: Option<f64>,
+    #[serde(deserialize_with = "num")]
+    cooldown_on_429_s: Option<f64>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct BackendFile {
+    #[serde(rename = "type")]
+    type_: Option<String>,
+    limits: LimitsFile,
+    #[serde(flatten)]
+    options: Map<String, Value>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ModelFile {
+    name: String,
+    backend: Option<String>,
+    target: String,
+    description: String,
+    aliases: Vec<String>,
+    #[serde(rename = "match")]
+    match_: Option<String>,
+    #[serde(deserialize_with = "num")]
+    max_prompt_chars: Option<i64>,
+    #[serde(deserialize_with = "flag")]
+    tail_reminder: Option<bool>,
+    #[serde(deserialize_with = "num")]
+    tool_desc_max: Option<i64>,
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// loading
+// ---------------------------------------------------------------------------------------------------------------------
 
 impl Config {
     pub fn load(env: IndexMap<String, String>, root: PathBuf) -> R<Config> {
@@ -144,289 +253,163 @@ impl Config {
     }
 
     pub fn load_file(env: IndexMap<String, String>, config_file: PathBuf, root: PathBuf) -> R<Config> {
+        let file_name = config_file.display().to_string();
         let is_file = config_file.is_file();
-        let source = if is_file { config_file.display().to_string() } else { "env".into() };
-        let mut data = Map::new();
-        if is_file {
-            let raw =
-                std::fs::read_to_string(&config_file).map_err(|e| ConfigError(format!("{}: cannot read: {e}", config_file.display())))?;
-            let parsed: toml::Table = raw
-                .parse()
-                .map_err(|e: toml::de::Error| ConfigError(format!("{}: cannot read: {}", config_file.display(), e.message())))?;
-            data = match toml_to_json(toml::Value::Table(parsed)) {
-                Value::Object(m) => m,
-                _ => Map::new(),
-            };
-            data = upgrade_legacy(&config_file, data);
-        }
+        let raw = if is_file {
+            let text = std::fs::read_to_string(&config_file).map_err(|e| ConfigError(format!("{file_name}: cannot read: {e}")))?;
+            let table: toml::Table =
+                text.parse().map_err(|e: toml::de::Error| ConfigError(format!("{file_name}: cannot read: {}", e.message())))?;
+            let value = serde_json::to_value(table).map_err(|e| ConfigError(format!("{file_name}: cannot read: {e}")))?;
+            expand(&upgrade_legacy(&config_file, value), &env)
+        } else {
+            json!({})
+        };
+        let file: FileConfig = serde_path_to_error::deserialize(raw).map_err(|e| {
+            let path = e.path().to_string();
+            ConfigError(format!("{file_name}: {}{}", if path == "." { String::new() } else { format!("{path}: ") }, e.inner()))
+        })?;
+        let lookup = EnvLookup(&env);
+        let server = server_settings(&file.server, &lookup, &root)?;
+        let telemetry = TelemetrySettings {
+            otlp_endpoint: lookup
+                .str("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .or(file.telemetry.otlp_endpoint)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            service_name: lookup
+                .str("OTEL_SERVICE_NAME")
+                .or(file.telemetry.service_name)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "midir".into()),
+        };
+        let backends = backend_settings(file.backends, &lookup)?;
         let mut cfg = Config {
-            env,
-            root,
+            env: env.clone(),
             config_file,
-            source,
-            server: ServerSettings {
-                port: 18880,
-                max_prompt_chars: 1_000_000,
-                tail_reminder: true,
-                tool_desc_max: 0,
-                responses_dir: None,
-                responses_retention_days: 30.0,
-                responses_max_mb: 500.0,
-                keepalive_s: 15.0,
-                retry_backoff_s: 1.0,
-            },
-            telemetry: TelemetrySettings { otlp_endpoint: String::new(), service_name: "midir".into() },
-            backends: IndexMap::new(),
+            source: if is_file { file_name } else { "env".into() },
+            server,
+            telemetry,
+            backends,
             models: vec![],
             default: Arc::new(ModelSpec::simple("", "", "", "")),
         };
-        cfg.server = cfg.server_settings(section(data.get("server"))?)?;
-        let tel = section(data.get("telemetry"))?;
-        let endpoint = cfg.get(tel, "otlp_endpoint", "OTEL_EXPORTER_OTLP_ENDPOINT", json!(""));
-        let endpoint = if truthy(&endpoint) { str_of(&endpoint) } else { String::new() };
-        cfg.telemetry = TelemetrySettings {
-            otlp_endpoint: text::strip(&endpoint).to_string(),
-            service_name: str_of(&cfg.get(tel, "service_name", "OTEL_SERVICE_NAME", json!("midir"))),
-        };
-        let raw_backends = match data.get("backends") {
-            Some(v) if truthy(v) => match v {
-                Value::Object(m) => m.clone(),
-                other => return Err(ConfigError(format!("AttributeError: '{}' object has no attribute 'items'", text::type_name(other)))),
-            },
-            _ => Map::new(),
-        };
-        cfg.backends = cfg.backend_settings(raw_backends)?;
-        if truthy_opt(data.get("models")) {
-            cfg.models_from_file(&data)?;
-        } else {
+        if file.models.is_empty() {
             cfg.models_from_env()?;
+        } else {
+            cfg.models_from_file(file.models, file.default_model)?;
         }
         Ok(cfg)
     }
 
-    /// `${NAME}` references replaced by the environment (empty when unset).
-    pub fn expand(&self, v: &Value) -> Value {
-        match v {
-            Value::String(s) => Value::String(expand_str(s, &self.env)),
-            Value::Object(m) => Value::Object(m.iter().map(|(k, x)| (k.clone(), self.expand(x))).collect()),
-            Value::Array(a) => Value::Array(a.iter().map(|x| self.expand(x)).collect()),
-            other => other.clone(),
-        }
-    }
-
-    fn get(&self, section: Option<&Map<String, Value>>, key: &str, env_name: &str, default: Value) -> Value {
-        if let Some(v) = self.env.get(env_name).filter(|v| !v.is_empty()) {
-            return Value::String(v.clone());
-        }
-        match section.and_then(|s| s.get(key)) {
-            None | Some(Value::Null) => default,
-            Some(v) => self.expand(v),
-        }
-    }
-
-    fn server_settings(&self, s: Option<&Map<String, Value>>) -> R<ServerSettings> {
-        let rdir = self.get(s, "responses_dir", "MIDIR_RESPONSES_DIR", json!("data/gateway/responses"));
-        let rdir = if truthy(&rdir) { str_of(&rdir) } else { String::new() };
-        let rdir = text::strip(&rdir).to_string();
-        let responses_dir = if rdir.is_empty() {
-            None
-        } else if Path::new(&rdir).is_absolute() {
-            Some(PathBuf::from(&rdir))
-        } else {
-            Some(self.root.join(&rdir))
-        };
-        Ok(ServerSettings {
-            port: int_cfg(&self.get(s, "port", "MIDIR_PORT", json!(18880)))?,
-            max_prompt_chars: int_cfg(&self.get(s, "max_prompt_chars", "MIDIR_MAX_PROMPT_CHARS", json!(1_000_000)))?,
-            tail_reminder: !FALSE
-                .contains(&str_of(&self.get(s, "tail_reminder", "MIDIR_TAIL_REMINDER", json!(true))).to_lowercase().as_str()),
-            tool_desc_max: int_cfg(&self.get(s, "tool_desc_max", "MIDIR_TOOL_DESC_MAX", json!(0)))?,
-            responses_dir,
-            responses_retention_days: float_cfg(&self.get(s, "responses_retention_days", "MIDIR_RESPONSES_RETENTION_DAYS", json!(30)))?,
-            responses_max_mb: float_cfg(&self.get(s, "responses_max_mb", "MIDIR_RESPONSES_MAX_MB", json!(500)))?,
-            keepalive_s: float_cfg(&self.get(s, "keepalive_s", "MIDIR_KEEPALIVE_S", json!(15)))?,
-            retry_backoff_s: float_cfg(&self.get(s, "retry_backoff_s", "MIDIR_RETRY_BACKOFF_S", json!(1)))?,
-        })
-    }
-
-    fn backend_settings(&self, raw: Map<String, Value>) -> R<IndexMap<String, BackendSettings>> {
-        let raw = if raw.is_empty() {
-            let mut m = Map::new();
-            m.insert("stackspot".into(), json!({"type": "stackspot"}));
-            m
-        } else {
-            raw
-        };
-        let mut out = IndexMap::new();
-        for (name, b) in raw {
-            let Value::Object(b) = b else {
-                return Err(ConfigError(format!("{}: [backends.{name}] must be a table", self.config_file.display())));
-            };
-            let lim = section(b.get("limits"))?;
-            let limits = LimitSettings {
-                max_concurrent: int_cfg(&self.get(lim, "max_concurrent", "MIDIR_MAX_CONCURRENT", json!(8)))?,
-                requests_per_minute: int_cfg(&self.get(lim, "requests_per_minute", "MIDIR_REQUESTS_PER_MINUTE", json!(90)))?,
-                queue_timeout_s: float_cfg(&self.get(lim, "queue_timeout_s", "MIDIR_QUEUE_TIMEOUT", json!(600)))?,
-                cooldown_on_429_s: float_cfg(&self.get(lim, "cooldown_on_429_s", "MIDIR_COOLDOWN_ON_429", json!(15)))?,
-            };
-            let options: Map<String, Value> = b
-                .iter()
-                .filter(|(k, _)| k.as_str() != "type" && k.as_str() != "limits")
-                .map(|(k, v)| (k.clone(), self.expand(v)))
-                .collect();
-            let type_ = match b.get("type") {
-                Some(t) if truthy(t) => str_of(t),
-                _ => name.clone(),
-            };
-            out.insert(name.clone(), BackendSettings { name, type_, options, limits });
-        }
-        Ok(out)
-    }
-
-    fn models_from_file(&mut self, data: &Map<String, Value>) -> R<()> {
+    fn models_from_file(&mut self, models: Vec<ModelFile>, default_model: Option<String>) -> R<()> {
         let file = self.config_file.display().to_string();
-        let items = obj::iter(&data["models"]).map_err(|e| ConfigError(format!("{}: {}", e.kind, e.msg)))?;
-        let mut names: Vec<String> = vec![];
-        for (i, m) in items.iter().enumerate() {
-            let Value::Object(m) = m else {
-                return Err(ConfigError(format!("AttributeError: '{}' object has no attribute 'get'", text::type_name(m))));
-            };
-            let name = text::strip(&str_of(m.get("name").unwrap_or(&json!("")))).to_lowercase();
-            let where_ = format!("{file}: models[{i}] ({})", if name.is_empty() { "?" } else { &name });
-            if name.is_empty() || names.contains(&name) {
-                return Err(ConfigError(format!("{where_}: needs a unique 'name'")));
+        for (i, m) in models.into_iter().enumerate() {
+            let name = m.name.trim().to_lowercase();
+            let at = format!("{file}: models[{i}] ({})", if name.is_empty() { "?" } else { &name });
+            if name.is_empty() || self.models.iter().any(|x| x.name == name) {
+                return Err(ConfigError(format!("{at}: needs a unique 'name'")));
             }
-            names.push(name.clone());
-            let backend = match m.get("backend") {
-                Some(b) if truthy(b) => str_of(b),
-                _ if self.backends.len() == 1 => self.backends.keys().next().cloned().unwrap_or_default(),
-                _ => String::new(),
+            let backend = match m.backend.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+                Some(b) => b.to_string(),
+                None if self.backends.len() == 1 => self.backends.keys().next().cloned().unwrap_or_default(),
+                None => String::new(),
             };
-            let backend = text::strip(&backend).to_string();
             if !self.backends.contains_key(&backend) {
-                let mut sorted: Vec<String> = self.backends.keys().cloned().collect();
-                sorted.sort();
-                return Err(ConfigError(format!(
-                    "{where_}: 'backend' must be one of {} (got {})",
-                    text::repr_list(&sorted),
-                    text::repr_str(&backend)
-                )));
+                let mut names: Vec<&str> = self.backends.keys().map(String::as_str).collect();
+                names.sort_unstable();
+                return Err(ConfigError(format!("{at}: 'backend' must be one of {} (got {backend:?})", names.join(", "))));
             }
-            let target = text::strip(&str_of(&self.expand(m.get("target").unwrap_or(&json!(""))))).to_string();
+            let target = m.target.trim().to_string();
             if target.is_empty() {
-                return Err(ConfigError(format!("{where_}: 'target' is empty (unset environment variable?)")));
+                return Err(ConfigError(format!("{at}: 'target' is empty (unset environment variable?)")));
             }
-            let (match_re, match_pattern) = match m.get("match") {
-                Some(p) if truthy(p) => {
-                    let pat = str_of(p);
-                    let re = fancy_regex::Regex::new(&format!("(?i){pat}"))
-                        .map_err(|e| ConfigError(format!("{where_}: invalid 'match' regex: {e}")))?;
-                    (Some(re), Some(pat))
-                }
-                _ => (None, None),
-            };
-            let aliases = match m.get("aliases") {
-                Some(a) => obj::iter(a)
-                    .map_err(|e| ConfigError(format!("{}: {}", e.kind, e.msg)))?
-                    .iter()
-                    .map(|x| str_of(x).to_lowercase())
-                    .collect(),
-                None => vec![],
+            let pattern = m.match_.filter(|p| !p.is_empty());
+            let match_re = match &pattern {
+                Some(p) => Some(Regex::new(&format!("(?i){p}")).map_err(|e| ConfigError(format!("{at}: invalid 'match' regex: {e}")))?),
+                None => None,
             };
             self.models.push(Arc::new(ModelSpec {
                 name,
                 backend,
                 target,
-                description: m.get("description").map(str_of).unwrap_or_default(),
-                aliases,
+                description: m.description,
+                aliases: m.aliases.iter().map(|a| a.trim().to_lowercase()).collect(),
                 match_re,
-                match_pattern,
-                max_prompt_chars: m.get("max_prompt_chars").cloned(),
-                tail_reminder: m.get("tail_reminder").cloned(),
-                tool_desc_max: m.get("tool_desc_max").cloned(),
+                match_pattern: pattern,
+                max_prompt_chars: m.max_prompt_chars,
+                tail_reminder: m.tail_reminder,
+                tool_desc_max: m.tool_desc_max,
             }));
         }
-        let default_name = text::strip(&str_of(data.get("default_model").unwrap_or(&json!("")))).to_lowercase();
-        if !default_name.is_empty() {
-            match self.models.iter().find(|x| x.name == default_name) {
-                Some(spec) => self.default = spec.clone(),
-                None => {
-                    return Err(ConfigError(format!(
-                        "{file}: default_model = {} is not one of the configured models",
-                        text::repr_str(&default_name)
-                    )))
-                }
-            }
+        let default_name = default_model.unwrap_or_default().trim().to_lowercase();
+        self.default = if default_name.is_empty() {
+            self.models[0].clone()
         } else {
-            self.default = self.models[0].clone();
-        }
+            self.models
+                .iter()
+                .find(|x| x.name == default_name)
+                .cloned()
+                .ok_or_else(|| ConfigError(format!("{file}: default_model = {default_name:?} is not one of the configured models")))?
+        };
         Ok(())
     }
 
+    /// Without [[models]]: STACKSPOT_<MODEL>_AGENT_ID variables define the models and STACKSPOT_DEFAULT_AGENT_ID the
+    /// default (unknown model names go there).
     fn models_from_env(&mut self) -> R<()> {
         let backend = if self.backends.contains_key("stackspot") {
             "stackspot".to_string()
         } else {
             self.backends.keys().next().cloned().unwrap_or_default()
         };
-        let mut models = vec![];
-        for (k, v) in &self.env {
-            if let Some(mid) = k.strip_prefix("STACKSPOT_").and_then(|r| r.strip_suffix("_AGENT_ID")) {
-                if !mid.is_empty() && !mid.contains('\n') && mid != "DEFAULT" && !text::is_blank(v) {
-                    models.push(Arc::new(ModelSpec::simple(&model_name(mid), &backend, text::strip(v), "")));
-                }
-            }
-        }
-        self.models = models;
-        let default_id = text::strip(self.env.get("STACKSPOT_DEFAULT_AGENT_ID").map(String::as_str).unwrap_or("")).to_string();
-        if !default_id.is_empty() {
-            self.default =
-                Arc::new(ModelSpec::simple(DEFAULT_MODEL_NAME, &backend, &default_id, "default agent (STACKSPOT_DEFAULT_AGENT_ID)"));
+        self.models = self
+            .env
+            .iter()
+            .filter_map(|(k, v)| {
+                let part = k.strip_prefix("STACKSPOT_")?.strip_suffix("_AGENT_ID")?;
+                (!part.is_empty() && part != "DEFAULT" && !v.trim().is_empty())
+                    .then(|| Arc::new(ModelSpec::simple(&model_name(part), &backend, v.trim(), "")))
+            })
+            .collect();
+        let default_id = self.env.get("STACKSPOT_DEFAULT_AGENT_ID").map(|s| s.trim()).unwrap_or("");
+        self.default = if !default_id.is_empty() {
+            Arc::new(ModelSpec::simple(DEFAULT_MODEL_NAME, &backend, default_id, "default agent (STACKSPOT_DEFAULT_AGENT_ID)"))
         } else if let Some(first) = self.models.first() {
-            self.default = first.clone();
+            first.clone()
         } else {
             return Err(ConfigError(format!(
                 "no models configured: create {} (see config/midir.example.toml) or set STACKSPOT_DEFAULT_AGENT_ID",
                 self.config_file.display()
             )));
-        }
+        };
         Ok(())
     }
 
     /// The model spec for a requested model name: exact name or alias > `match` regex in file order > exact after
     /// stripping a provider prefix > longest configured name contained in the requested one > default.
     pub fn resolve(&self, model: &str) -> Arc<ModelSpec> {
-        let m = text::strip(model).to_lowercase();
-        for s in &self.models {
-            if m == s.name || s.aliases.contains(&m) {
-                return s.clone();
-            }
+        let m = model.trim().to_lowercase();
+        let exact = |name: &str| self.models.iter().find(|s| s.name == name || s.aliases.iter().any(|a| a == name)).cloned();
+        if let Some(s) = exact(&m) {
+            return s;
         }
-        for s in &self.models {
-            if let Some(re) = &s.match_re {
-                if re.is_match(&m).unwrap_or(false) {
-                    return s.clone();
-                }
-            }
+        if let Some(s) = self.models.iter().find(|s| s.match_re.as_ref().is_some_and(|re| re.is_match(&m))) {
+            return s.clone();
         }
-        let prefixes: Vec<String> =
-            self.backends.keys().map(|b| regex::escape(&format!("{b}-"))).chain([regex::escape("midir-")]).collect();
-        let bare = match Regex::new(&format!(r"^(?:[\w.-]+/)?(?:{})?", prefixes.join("|"))) {
-            Ok(re) => re.replace(&m, "").into_owned(),
-            Err(_) => m.clone(),
-        };
-        for s in &self.models {
-            if bare == s.name || s.aliases.contains(&bare) {
-                return s.clone();
-            }
+        let prefixes: Vec<String> = self.backends.keys().map(|b| format!("{b}-")).chain(["midir-".to_string()]).collect();
+        let without_provider = m.split_once('/').filter(|(p, _)| !p.is_empty()).map_or(m.as_str(), |(_, rest)| rest);
+        let bare = prefixes.iter().find_map(|p| without_provider.strip_prefix(p.as_str())).unwrap_or(without_provider);
+        if let Some(s) = exact(bare) {
+            return s;
         }
-        let mut best: Option<&Arc<ModelSpec>> = None;
-        for s in &self.models {
-            if m.contains(s.name.as_str()) && best.map_or(true, |b| text::len(&s.name) > text::len(&b.name)) {
-                best = Some(s);
-            }
-        }
-        best.cloned().unwrap_or_else(|| self.default.clone())
+        self.models
+            .iter()
+            .filter(|s| m.contains(s.name.as_str()))
+            .rev() // among equally long names, the first in the file wins
+            .max_by_key(|s| char_len(&s.name))
+            .cloned()
+            .unwrap_or_else(|| self.default.clone())
     }
 
     pub fn exposed_models(&self) -> Vec<Arc<ModelSpec>> {
@@ -441,21 +424,87 @@ impl Config {
     pub fn knobs(&self, spec: Option<&ModelSpec>) -> (i64, bool, i64) {
         let s = &self.server;
         let Some(spec) = spec else { return (s.max_prompt_chars, s.tail_reminder, s.tool_desc_max) };
-        let max_chars = match &spec.max_prompt_chars {
-            Some(v) if truthy(v) => text::int_of(v).unwrap_or(s.max_prompt_chars),
-            _ => s.max_prompt_chars,
-        };
-        let tail = spec.tail_reminder.as_ref().map_or(s.tail_reminder, truthy);
-        let desc = spec.tool_desc_max.as_ref().map_or(s.tool_desc_max, |v| text::int_of(v).unwrap_or(0));
-        (max_chars, tail, desc)
+        (
+            spec.max_prompt_chars.filter(|n| *n > 0).unwrap_or(s.max_prompt_chars),
+            spec.tail_reminder.unwrap_or(s.tail_reminder),
+            spec.tool_desc_max.unwrap_or(s.tool_desc_max),
+        )
     }
 }
 
-fn truthy_opt(v: Option<&Value>) -> bool {
-    v.map_or(false, truthy)
+/// Environment overrides: a set, non-empty variable wins over the file.
+struct EnvLookup<'a>(&'a IndexMap<String, String>);
+
+impl EnvLookup<'_> {
+    fn str(&self, name: &str) -> Option<String> {
+        self.0.get(name).filter(|v| !v.is_empty()).cloned()
+    }
+
+    fn parse<T: FromStr>(&self, name: &str) -> R<Option<T>>
+    where
+        T::Err: std::fmt::Display,
+    {
+        match self.str(name) {
+            None => Ok(None),
+            Some(v) => v.trim().parse().map(Some).map_err(|e| ConfigError(format!("{name}={v:?}: not a valid value ({e})"))),
+        }
+    }
+
+    fn flag(&self, name: &str) -> R<Option<bool>> {
+        match self.str(name) {
+            None => Ok(None),
+            Some(v) => parse_flag(&v).map(Some).ok_or_else(|| ConfigError(format!("{name}={v:?}: not a boolean (true/false)"))),
+        }
+    }
 }
 
-/// `${NAME}` (NAME = [A-Z0-9_]+) replaced by the environment.
+fn server_settings(f: &ServerFile, env: &EnvLookup, root: &Path) -> R<ServerSettings> {
+    let rdir = env.str("MIDIR_RESPONSES_DIR").or_else(|| f.responses_dir.clone()).unwrap_or_else(|| "data/gateway/responses".into());
+    let rdir = rdir.trim();
+    let responses_dir = match rdir {
+        "" => None,
+        d if Path::new(d).is_absolute() => Some(PathBuf::from(d)),
+        d => Some(root.join(d)),
+    };
+    Ok(ServerSettings {
+        port: env.parse("MIDIR_PORT")?.or(f.port).unwrap_or(18880),
+        max_prompt_chars: env.parse("MIDIR_MAX_PROMPT_CHARS")?.or(f.max_prompt_chars).unwrap_or(1_000_000),
+        tail_reminder: env.flag("MIDIR_TAIL_REMINDER")?.or(f.tail_reminder).unwrap_or(true),
+        tool_desc_max: env.parse("MIDIR_TOOL_DESC_MAX")?.or(f.tool_desc_max).unwrap_or(0),
+        responses_dir,
+        responses_retention_days: env.parse("MIDIR_RESPONSES_RETENTION_DAYS")?.or(f.responses_retention_days).unwrap_or(30.0),
+        responses_max_mb: env.parse("MIDIR_RESPONSES_MAX_MB")?.or(f.responses_max_mb).unwrap_or(500.0),
+        keepalive_s: env.parse("MIDIR_KEEPALIVE_S")?.or(f.keepalive_s).unwrap_or(15.0),
+        retry_backoff_s: env.parse("MIDIR_RETRY_BACKOFF_S")?.or(f.retry_backoff_s).unwrap_or(1.0),
+    })
+}
+
+fn backend_settings(raw: IndexMap<String, BackendFile>, env: &EnvLookup) -> R<IndexMap<String, BackendSettings>> {
+    let raw = if raw.is_empty() { IndexMap::from([("stackspot".to_string(), BackendFile::default())]) } else { raw };
+    let mut out = IndexMap::new();
+    for (name, b) in raw {
+        let limits = LimitSettings {
+            max_concurrent: env.parse("MIDIR_MAX_CONCURRENT")?.or(b.limits.max_concurrent).unwrap_or(8),
+            requests_per_minute: env.parse("MIDIR_REQUESTS_PER_MINUTE")?.or(b.limits.requests_per_minute).unwrap_or(90),
+            queue_timeout_s: env.parse("MIDIR_QUEUE_TIMEOUT")?.or(b.limits.queue_timeout_s).unwrap_or(600.0),
+            cooldown_on_429_s: env.parse("MIDIR_COOLDOWN_ON_429")?.or(b.limits.cooldown_on_429_s).unwrap_or(15.0),
+        };
+        let type_ = b.type_.filter(|t| !t.is_empty()).unwrap_or_else(|| name.clone());
+        out.insert(name.clone(), BackendSettings { name, type_, options: b.options, limits });
+    }
+    Ok(out)
+}
+
+/// Every string with `${NAME}` (NAME = [A-Z0-9_]+) replaced by the environment (empty when unset).
+fn expand(v: &Value, env: &IndexMap<String, String>) -> Value {
+    match v {
+        Value::String(s) => Value::String(expand_str(s, env)),
+        Value::Object(m) => Value::Object(m.iter().map(|(k, x)| (k.clone(), expand(x, env))).collect()),
+        Value::Array(a) => Value::Array(a.iter().map(|x| expand(x, env)).collect()),
+        other => other.clone(),
+    }
+}
+
 pub fn expand_str(s: &str, env: &IndexMap<String, String>) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -475,34 +524,28 @@ pub fn expand_str(s: &str, env: &IndexMap<String, String>) -> String {
     out
 }
 
-/// GPT_5_1 -> gpt-5.1, GPT_4_1_MINI -> gpt-4.1-mini, O3_MINI -> o3-mini (digit_digit becomes a dot).
+/// GPT_5_1 -> gpt-5.1, GPT_4_1_MINI -> gpt-4.1-mini, O3_MINI -> o3-mini (an underscore between digits becomes a dot).
 pub fn model_name(env_part: &str) -> String {
     let low: Vec<char> = env_part.to_lowercase().chars().collect();
-    let mut out = String::with_capacity(low.len());
-    for (i, &c) in low.iter().enumerate() {
-        if c == '_' {
-            let prev_digit = i > 0 && is_unicode_digit(low[i - 1]);
-            let next_digit = i + 1 < low.len() && is_unicode_digit(low[i + 1]);
-            out.push(if prev_digit && next_digit { '.' } else { '-' });
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-fn is_unicode_digit(c: char) -> bool {
-    c.is_ascii_digit() || (!c.is_ascii() && c.is_numeric())
+    low.iter()
+        .enumerate()
+        .map(|(i, &c)| match c {
+            '_' if i > 0 && low[i - 1].is_ascii_digit() && low.get(i + 1).is_some_and(char::is_ascii_digit) => '.',
+            '_' => '-',
+            c => c,
+        })
+        .collect()
 }
 
 /// The pre-0.0.1 layout, translated: `default` -> default_model, [stackspot] + [limits] -> [backends.stackspot],
 /// [[agents]] (agent_id) -> [[models]] (target).
-fn upgrade_legacy(file: &Path, data: Map<String, Value>) -> Map<String, Value> {
-    if !(truthy_opt(data.get("agents")) || truthy_opt(data.get("stackspot")) || data.contains_key("default")) {
-        return data;
+fn upgrade_legacy(file: &Path, data: Value) -> Value {
+    let Value::Object(data) = data else { return data };
+    let present = |k: &str| data.get(k).is_some_and(|v| !v.is_null() && v != &json!({}) && v != &json!([]));
+    if !(present("agents") || present("stackspot") || data.contains_key("default")) {
+        return Value::Object(data);
     }
-    crate::warn!(
-        LOG,
+    tracing::warn!(
         "{} uses the pre-0.0.1 layout ([stackspot], [[agents]], default); it still works, see config/midir.example.toml",
         file.display()
     );
@@ -514,40 +557,31 @@ fn upgrade_legacy(file: &Path, data: Map<String, Value>) -> Map<String, Value> {
     if let Some(d) = data.get("default") {
         out.entry("default_model").or_insert_with(|| d.clone());
     }
-    let mut backend = Map::new();
-    backend.insert("type".into(), json!("stackspot"));
+    let mut backend = Map::from_iter([("type".to_string(), json!("stackspot"))]);
     if let Some(Value::Object(s)) = data.get("stackspot") {
-        for (k, v) in s {
-            backend.insert(k.clone(), v.clone());
-        }
+        backend.extend(s.clone());
     }
-    if let Some(l) = data.get("limits").filter(|l| truthy(l)) {
+    if let Some(l @ Value::Object(_)) = data.get("limits") {
         backend.insert("limits".into(), l.clone());
     }
-    let backends = out.entry("backends").or_insert_with(|| json!({}));
-    if let Value::Object(b) = backends {
+    if let Value::Object(b) = out.entry("backends").or_insert_with(|| json!({})) {
         b.entry("stackspot").or_insert(Value::Object(backend));
     }
-    if let Some(Value::Array(agents)) = data.get("agents").filter(|a| truthy(a)) {
-        let models: Vec<Value> = agents
+    if let Some(Value::Array(agents)) = data.get("agents") {
+        let models = agents
             .iter()
+            .filter_map(Value::as_object)
             .map(|a| {
-                let mut m = Map::new();
-                if let Value::Object(a) = a {
-                    for (k, v) in a {
-                        if k != "agent_id" {
-                            m.insert(k.clone(), v.clone());
-                        }
-                    }
-                    m.insert("backend".into(), json!("stackspot"));
-                    m.insert("target".into(), a.get("agent_id").cloned().unwrap_or(json!("")));
-                }
+                let mut m: Map<String, Value> =
+                    a.iter().filter(|(k, _)| k.as_str() != "agent_id").map(|(k, v)| (k.clone(), v.clone())).collect();
+                m.insert("backend".into(), json!("stackspot"));
+                m.insert("target".into(), a.get("agent_id").cloned().unwrap_or(json!("")));
                 Value::Object(m)
             })
             .collect();
         out.insert("models".into(), Value::Array(models));
     }
-    out
+    Value::Object(out)
 }
 
 #[cfg(test)]
@@ -559,5 +593,11 @@ mod tests {
         assert_eq!(model_name("GPT_5_1"), "gpt-5.1");
         assert_eq!(model_name("GPT_4_1_MINI"), "gpt-4.1-mini");
         assert_eq!(model_name("O3_MINI"), "o3-mini");
+    }
+
+    #[test]
+    fn expansion() {
+        let env = IndexMap::from([("A".to_string(), "x".to_string())]);
+        assert_eq!(expand_str("${A}-${B}-${lower}-$A", &env), "x--${lower}-$A");
     }
 }

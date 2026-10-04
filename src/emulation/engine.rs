@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use serde_json::{json, Value};
+use serde_json::json;
 
 use super::followups;
 use super::jsonmode::check_json;
@@ -16,13 +16,10 @@ use super::output::OutputLimiter;
 use super::parser::{Parsed, ToolCallParser};
 use super::prompt::render_prompt;
 use crate::backends::{Completion, Item, StackSpotBackend};
-use crate::canonical::{estimate_tokens, CanonicalRequest, CanonicalResponse, Event, ToolCall, ToolChoice, Usage, CHARS_PER_TOKEN};
+use crate::canonical::{estimate_tokens, CanonicalRequest, CanonicalResponse, Event, Finish, ToolCall, ToolChoice, Usage, CHARS_PER_TOKEN};
 use crate::config::Config;
 use crate::errors::Error;
-use crate::py::json as pyjson;
-use crate::py::text;
-
-const LOG: &str = "midir.emulation.engine";
+use crate::text::{char_len, prefix};
 
 pub type EventStream = BoxStream<'static, Result<Event, Error>>;
 
@@ -50,16 +47,12 @@ impl EmulationEngine {
         let key = (req.meta().client.clone(), sorted);
         let mut seen = self.ignored_seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.contains(&key) {
-            crate::debug!(LOG, "{rid} accepted parameters without effect: {}", req.ignored.join(", "));
+            tracing::debug!("{rid} accepted parameters without effect: {}", req.ignored.join(", "));
             return;
         }
         let client = if key.0.is_empty() { "unknown".to_string() } else { key.0.clone() };
         seen.insert(key);
-        crate::info!(
-            LOG,
-            "{rid} accepted parameters without effect: {} (client {client}; reported once per client)",
-            req.ignored.join(", ")
-        );
+        tracing::info!("{rid} accepted parameters without effect: {} (client {client}; reported once per client)", req.ignored.join(", "));
     }
 
     /// Event stream. JSON mode is fully buffered (CAVEAT: no incremental streaming) so it can be validated and repaired.
@@ -101,11 +94,11 @@ impl EmulationEngine {
                 }
             }
             let mut resp = final_.unwrap_or_default();
-            if !resp.rejected_calls.is_empty() && !req.tools.is_empty() && req.tool_choice != ToolChoice::None && (resp.finish == "stop" || resp.finish == "tool_calls") {
+            if !resp.rejected_calls.is_empty() && req.tools_on() && matches!(resp.finish, Finish::Stop | Finish::ToolCalls) {
                 // CAVEAT: a <tool_call> had JSON that could not be decoded; one follow-up asks for only the broken call(s)
-                crate::warn!(LOG, "{rid} {} tool call(s) with invalid JSON; asking for corrected calls (1 follow-up)", resp.rejected_calls.len());
+                tracing::warn!("{rid} {} tool call(s) with invalid JSON; asking for corrected calls (1 follow-up)", resp.rejected_calls.len());
                 req.meta().followups += 1;
-                let mut follow = req.derive(None, None, None, None);
+                let mut follow = req.derive();
                 follow.add("assistant", &text_, calls.clone(), vec![]);
                 let bad: Vec<String> = resp.rejected_calls.iter().map(|b| format!("<tool_call>\n{b}\n</tool_call>")).collect();
                 let done: Vec<String> = calls.iter().map(|c| format!("{} {}", c.name, followups::call_target(c))).collect();
@@ -116,25 +109,26 @@ impl EmulationEngine {
                     bad.join("\n")
                 );
                 if !calls.is_empty() {
-                    ask.push_str(&format!(" Do not repeat the calls that already went through ({}).", text::head(&done, 500)));
+                    ask.push_str(&format!(" Do not repeat the calls that already went through ({}).", prefix(&done, 500)));
                 }
-                follow.add("user", &ask, vec![], vec![]);
+                follow.add_text("user", &ask);
                 let mut extra: Vec<ToolCall> = vec![];
                 let mut extra_usage: Option<Usage> = None;
                 let mut seen: HashSet<(String, String)> = calls.iter().map(followups::call_key).collect();
-                let sorted = pyjson::Style { ensure_ascii: true, compact: false, sort_keys: true };
-                let exact: HashSet<(String, String)> = calls.iter().map(|c| (c.name.clone(), pyjson::dumps(&c.arguments, sorted))).collect();
+                let exact: HashSet<(String, String)> = calls.iter().map(|c| (c.name.clone(), followups::sorted_json(&c.arguments))).collect();
                 let rejected_text = resp.rejected_calls.join("\n");
                 let mut dropped = 0;
                 let mut s = this.stream_once(Arc::new(follow), format!("{rid}/repair"));
                 while let Some(ev) = s.next().await {
                     match ev? {
                         Event::ToolCall(c) => {
+                            // a re-emission of a call that already went through is a duplicate, unless the broken block
+                            // targeted the same thing (a second edit of the same file)
                             let key = followups::call_key(&c);
-                            let target = key.1.split_once('=').map_or(key.1.as_str(), |(_, t)| t).to_string();
-                            let quoted = pyjson::dumps_str(&target, true);
-                            let inner = &quoted[1..quoted.len() - 1];
-                            let dup = exact.contains(&(c.name.clone(), pyjson::dumps(&c.arguments, sorted))) || (seen.contains(&key) && !rejected_text.contains(inner));
+                            let target = key.1.split_once('=').map_or(key.1.as_str(), |(_, t)| t);
+                            let quoted = json!(target).to_string();
+                            let as_in_json = &quoted[1..quoted.len() - 1];
+                            let dup = exact.contains(&(c.name.clone(), followups::sorted_json(&c.arguments))) || (seen.contains(&key) && !rejected_text.contains(as_in_json));
                             if dup || extra.len() >= resp.rejected_calls.len() {
                                 dropped += 1;
                                 continue;
@@ -148,12 +142,12 @@ impl EmulationEngine {
                     }
                 }
                 drop(s);
-                crate::info!(LOG, "{rid}/repair kept {} call(s), dropped {dropped} (duplicates of streamed calls or beyond the {} requested)", extra.len(), resp.rejected_calls.len());
+                tracing::info!("{rid}/repair kept {} call(s), dropped {dropped} (duplicates of streamed calls or beyond the {} requested)", extra.len(), resp.rejected_calls.len());
                 if !extra.is_empty() {
                     let mut all = calls.clone();
                     all.extend(extra);
                     resp.tool_calls = all;
-                    resp.finish = "tool_calls".into();
+                    resp.finish = Finish::ToolCalls;
                 }
                 resp.usage = add_usage(&resp.usage, extra_usage);
                 if !resp.tool_calls.is_empty() {
@@ -163,8 +157,8 @@ impl EmulationEngine {
             let ask = if followups::false_incapacity(&req, &resp, &text_, &calls) {
                 // CAVEAT: the model denied having web/file/shell access although a listed tool provides it
                 let names: Vec<&str> = req.tools.iter().filter(|t| followups::TOOL_ABILITY_RE.is_match(&format!("{} {}", t.name, t.description))).map(|t| t.name.as_str()).collect();
-                let names = text::head(&names.join(", "), 300).to_string();
-                crate::warn!(LOG, "{rid} response denies an ability that a tool provides ({}); requesting the call (1 follow-up)", text::head(&names, 80));
+                let names = prefix(&names.join(", "), 300).to_string();
+                tracing::warn!("{rid} response denies an ability that a tool provides ({}); requesting the call (1 follow-up)", prefix(&names, 80));
                 Some((format!("{rid}/ability"), format!(
                     "You do have that ability through your tools ({names}). Use the appropriate tool now: reply with the <tool_call> block(s) only, inferring the URL or path if the user did not give one."
                 )))
@@ -172,7 +166,7 @@ impl EmulationEngine {
                 // CAVEAT: the model announced an action and stopped without a <tool_call>; one follow-up asks for the calls
                 let confirm = followups::redundant_confirmation(&req, &text_);
                 let note = confirm.map_or(String::new(), |c| format!(" [asked to confirm '{c}', already requested]"));
-                crate::warn!(LOG, "{rid} response only announces an action without a tool call; requesting the calls (1 follow-up){note}");
+                tracing::warn!("{rid} response only announces an action without a tool call; requesting the calls (1 follow-up){note}");
                 let prompt = match confirm {
                     Some(c) => format!("The request already asks for this ({c}); do not ask for confirmation. Do it now: reply with the <tool_call> block(s) only."),
                     None => "You announced an action but emitted no <tool_call>. Do it now: reply with the <tool_call> block(s) for what you just announced, and nothing else.".to_string(),
@@ -183,9 +177,9 @@ impl EmulationEngine {
             };
             if let Some((frid, prompt)) = ask {
                 req.meta().followups += 1;
-                let mut follow = req.derive(None, None, None, None);
-                follow.add("assistant", &text_, vec![], vec![]);
-                follow.add("user", &prompt, vec![], vec![]);
+                let mut follow = req.derive();
+                follow.add_text("assistant", &text_);
+                follow.add_text("user", &prompt);
                 let mut extra: Vec<ToolCall> = vec![];
                 let mut extra_usage: Option<Usage> = None;
                 let mut s = this.stream_once(Arc::new(follow), frid);
@@ -204,7 +198,7 @@ impl EmulationEngine {
                     let mut all = calls.clone();
                     all.extend(extra);
                     resp.tool_calls = all;
-                    resp.finish = "tool_calls".into();
+                    resp.finish = Finish::ToolCalls;
                 }
                 resp.usage = add_usage(&resp.usage, extra_usage);
             }
@@ -215,13 +209,12 @@ impl EmulationEngine {
     /// Non-streaming: collect everything; retry once when tool_choice is required/named and nothing was called (CAVEAT).
     pub async fn complete(self: &Arc<Self>, req: Arc<CanonicalRequest>, rid: &str) -> Result<CanonicalResponse, Error> {
         let resp = collect(self.run(req.clone(), rid.to_string())).await?;
-        let forced = matches!(req.tool_choice, ToolChoice::Required | ToolChoice::Named(_));
-        if !req.tools.is_empty() && forced && req.json_schema.is_none() && resp.tool_calls.is_empty() {
-            crate::warn!(LOG, "{rid} tool_choice={} but no tool call; retrying once", req.tool_choice.display());
+        if !req.tools.is_empty() && req.tool_choice.forced() && req.json_schema.is_none() && resp.tool_calls.is_empty() {
+            tracing::warn!("{rid} tool_choice={} but no tool call; retrying once", req.tool_choice);
             req.meta().followups += 1;
-            let mut follow = req.derive(None, None, None, req.max_tokens);
-            follow.add("assistant", &resp.text, vec![], vec![]);
-            follow.add("user", "You did not call a tool. You MUST respond with a <tool_call> block now, and nothing else.", vec![], vec![]);
+            let mut follow = CanonicalRequest { max_tokens: req.max_tokens, ..req.derive() };
+            follow.add_text("assistant", &resp.text);
+            follow.add_text("user", "You did not call a tool. You MUST respond with a <tool_call> block now, and nothing else.");
             let mut retry = collect(self.stream_once(Arc::new(follow), format!("{rid}/retry"))).await?;
             if !retry.tool_calls.is_empty() {
                 retry.usage = resp.usage.add(&retry.usage);
@@ -233,35 +226,36 @@ impl EmulationEngine {
 
     async fn json_mode(self: &Arc<Self>, req: &Arc<CanonicalRequest>, rid: &str) -> Result<CanonicalResponse, Error> {
         let mut resp = collect(self.stream_once(req.clone(), rid.to_string())).await?;
-        let schema = req.json_schema.clone().filter(text::truthy).unwrap_or(json!({}));
-        if !schema.is_object() && text::truthy(&schema) {
-            return Err(Error::Internal(format!("AttributeError(\"'{}' object has no attribute 'get'\")", text::type_name(&schema))));
-        }
+        let schema = req.json_schema.clone().unwrap_or_else(|| json!({}));
         let (normalized, errs) = check_json(&resp.text, &schema);
         if let Some(n) = normalized {
             resp.text = n;
             return Ok(resp);
         }
         let joined = errs.join("; ");
-        crate::warn!(LOG, "{rid} invalid JSON ({}); one repair attempt", text::head(&joined, 200));
+        tracing::warn!("{rid} invalid JSON ({}); one repair attempt", prefix(&joined, 200));
         req.meta().repairs += 1;
-        let mut repair = req.derive(Some(vec![]), Some(ToolChoice::None), req.json_schema.clone(), req.max_tokens);
-        repair.add("assistant", &resp.text, vec![], vec![]);
-        repair.add(
+        let mut repair = CanonicalRequest {
+            tools: vec![],
+            tool_choice: ToolChoice::None,
+            json_schema: req.json_schema.clone(),
+            max_tokens: req.max_tokens,
+            ..req.derive()
+        };
+        repair.add_text("assistant", &resp.text);
+        repair.add_text(
             "user",
             &format!(
                 "Your previous response was not valid: {}. Respond again with only the JSON value, no fences, no prose.",
-                text::head(&joined, 500)
+                prefix(&joined, 500)
             ),
-            vec![],
-            vec![],
         );
         let mut repaired = collect(self.stream_once(Arc::new(repair), format!("{rid}/repair"))).await?;
         let (normalized, errs) = check_json(&repaired.text, &schema);
         repaired.usage = resp.usage.add(&repaired.usage);
         match normalized {
             Some(n) => repaired.text = n,
-            None => crate::error!(LOG, "{rid} JSON still invalid after repair: {}", text::head(&errs.join("; "), 200)),
+            None => tracing::error!("{rid} JSON still invalid after repair: {}", prefix(&errs.join("; "), 200)),
         }
         Ok(repaired)
     }
@@ -287,7 +281,7 @@ impl EmulationEngine {
                 let (p, info) = render_prompt(&req, max_chars, tail_reminder, tool_desc_max);
                 prompt = p;
                 let dropped = if info.dropped_turns > 0 { format!(", -{} dropped", info.dropped_turns) } else { String::new() };
-                crate::info!(LOG, "{rid} prompt={} chars (system={}, history={} turns, tools={}{dropped})", info.chars, info.system_chars, info.history_turns, info.tools);
+                tracing::info!("{rid} prompt={} chars (system={}, history={} turns, tools={}{dropped})", info.chars, info.system_chars, info.history_turns, info.tools);
                 {
                     let mut m = req.meta();
                     m.prompt_chars += info.chars as i64;
@@ -298,7 +292,7 @@ impl EmulationEngine {
                     let m = req.meta().clone();
                     this.backend.telemetry.truncated(&m, info.dropped_turns as i64);
                 }
-                crate::debug!(LOG, "{rid} PROMPT >>>\n{prompt}\n<<< PROMPT");
+                tracing::debug!("{rid} PROMPT >>>\n{prompt}\n<<< PROMPT");
                 let result = match this.backend.stream(&prompt, &target, Some(req.meta.clone())).await {
                     Ok(mut s) => match s.next().await {
                         Some(Ok(item)) => Ok((Some(item), Some(s))),
@@ -317,7 +311,7 @@ impl EmulationEngine {
                         match limits {
                             Some((limit, actual)) if actual > limit => {
                                 let cap = (info.chars as f64 * limit as f64 / actual.max(1) as f64 * 0.9) as i64;
-                                crate::warn!(LOG, "{rid} input above the model's token limit at {} chars; retrying once capped at {cap} chars (kept for this target)", info.chars);
+                                tracing::warn!("{rid} input above the model's token limit at {} chars; retrying once capped at {cap} chars (kept for this target)", info.chars);
                                 this.learned_max_chars.lock().unwrap_or_else(|e| e.into_inner()).insert(target.clone(), cap);
                                 max_chars = cap;
                             }
@@ -329,7 +323,7 @@ impl EmulationEngine {
             }
             let (head, stream) = opened.unwrap_or((None, None));
             let mut parser = ToolCallParser::new(req.tools.clone());
-            let mut limiter = OutputLimiter::new(req.stop.clone(), req.max_tokens.map(|m| (m as f64 * CHARS_PER_TOKEN) as i64));
+            let mut limiter = OutputLimiter::new(req.stop.clone(), req.max_tokens.map(|m| (m as f64 * CHARS_PER_TOKEN) as usize));
             let mut calls: Vec<ToolCall> = vec![];
             let mut final_ = Completion::default();
             let mut emitted = 0usize;
@@ -343,9 +337,9 @@ impl EmulationEngine {
                     match item {
                         Item::Completion(c) => final_ = c,
                         Item::Text(t) => {
-                            received += text::len(&t);
+                            received += char_len(&t);
                             if first {
-                                crate::info!(LOG, "{rid} ttfb {:.2}s", t0.elapsed().as_secs_f64());
+                                tracing::info!("{rid} ttfb {:.2}s", t0.elapsed().as_secs_f64());
                                 first = false;
                             }
                             for p in parser.feed(&t) {
@@ -354,7 +348,7 @@ impl EmulationEngine {
                                         let (out, stop) = limiter.apply(&v, false);
                                         stopped = stop;
                                         if !out.is_empty() {
-                                            emitted += text::len(&out);
+                                            emitted += char_len(&out);
                                             yield Event::Text(out);
                                         }
                                         if stopped {
@@ -397,15 +391,15 @@ impl EmulationEngine {
                 }
                 let (out, _) = limiter.apply(&tail_text, true);
                 if !out.is_empty() {
-                    emitted += text::len(&out);
+                    emitted += char_len(&out);
                     yield Event::Text(out);
                 }
             }
             if !parser.errors.is_empty() {
-                crate::warn!(LOG, "{rid} parser: {}", parser.errors.join("; "));
+                tracing::warn!("{rid} parser: {}", parser.errors.join("; "));
                 req.meta().parse_errors += parser.errors.len() as i64;
             }
-            let finish = if !calls.is_empty() && limiter.finish == "stop" { "tool_calls".to_string() } else { limiter.finish.clone() };
+            let finish = if !calls.is_empty() && limiter.finish == Finish::Stop { Finish::ToolCalls } else { limiter.finish };
             let usage = match final_.usage {
                 Some(u) => u,
                 None => {
@@ -413,20 +407,19 @@ impl EmulationEngine {
                     let p = estimate_tokens(&prompt);
                     let c = ((received as f64 / CHARS_PER_TOKEN) as i64).max(1);
                     req.meta().usage_estimated = true;
-                    Usage { prompt_tokens: p, completion_tokens: c, total_tokens: p + c }
+                    Usage::new(p, c)
                 }
             };
             let resp = CanonicalResponse {
                 text: String::new(),
                 tool_calls: calls.clone(),
-                finish: finish.clone(),
+                finish,
                 stop_sequence: limiter.stop_sequence.clone(),
                 usage,
                 message_id: final_.message_id.clone(),
                 rejected_calls: parser.rejected.clone(),
             };
-            crate::info!(LOG, "{rid} ok in {:.1}s, {emitted} chars, {} tool calls, finish={finish}, usage={}", t0.elapsed().as_secs_f64(), calls.len(), resp.usage.repr());
-            let _ = Value::Null;
+            tracing::info!("{rid} ok in {:.1}s, {emitted} chars, {} tool calls, finish={finish}, usage={}", t0.elapsed().as_secs_f64(), calls.len(), resp.usage);
             yield Event::Done(resp);
         })
     }
@@ -445,7 +438,7 @@ pub async fn collect(mut events: EventStream) -> Result<CanonicalResponse, Error
         }
     }
     let mut resp = final_.unwrap_or_default();
-    resp.text = if calls.is_empty() { text_ } else { text::strip(&text_).to_string() };
+    resp.text = if calls.is_empty() { text_ } else { text_.trim().to_string() };
     resp.tool_calls = calls;
     Ok(resp)
 }

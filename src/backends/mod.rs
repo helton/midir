@@ -6,7 +6,6 @@ pub mod stackspot;
 use std::sync::Arc;
 
 use futures::stream::BoxStream;
-use serde_json::Value;
 
 use crate::canonical::Usage;
 use crate::config::{BackendSettings, ConfigError};
@@ -19,9 +18,7 @@ pub use stackspot::StackSpotBackend;
 #[derive(Debug, Clone, Default)]
 pub struct Completion {
     pub usage: Option<Usage>,
-    pub message_id: Value,
-    #[allow(dead_code)] // kept for diagnostics (Completion.stop_reason)
-    pub stop_reason: Value,
+    pub message_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,13 +38,11 @@ pub fn create_backend(
     backoff_s: f64,
 ) -> Result<Arc<StackSpotBackend>, ConfigError> {
     if settings.type_ != "stackspot" {
-        let mut types = BACKEND_TYPES.to_vec();
-        types.sort();
         return Err(ConfigError(format!(
-            "backend {}: unknown type {} (available: {})",
-            crate::py::text::repr_str(&settings.name),
-            crate::py::text::repr_str(&settings.type_),
-            types.join(", ")
+            "backend {:?}: unknown type {:?} (available: {})",
+            settings.name,
+            settings.type_,
+            BACKEND_TYPES.join(", ")
         )));
     }
     Ok(Arc::new(StackSpotBackend::new(settings, env, telemetry, backoff_s)))
