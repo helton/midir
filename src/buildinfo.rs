@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! release   0.1.0
-//! dev       0.1.0+dev.a817822              image built from develop
+//! dev       0.1.0+dev.a817822              image built from main
 //! local     0.1.0+local.a817822.dirty      image built on this machine (".dirty": uncommitted changes)
 //! source    0.1.0+src.a817822              `cargo build` in a git checkout
 //! unknown   0.1.0+unknown                  anything else

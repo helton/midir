@@ -29,7 +29,8 @@ COPY --from=build /midir /usr/local/bin/midir
 COPY LICENSE /app/LICENSE
 ENV PATH=/usr/local/bin SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 WORKDIR /app
-# which build this is (midir --version, banner, /health): release (main), dev (develop), local (cargo xtask deploy).
+# which build this is (midir --version, banner, /health): release (a version build of main), dev (any other build
+# of main), local (cargo xtask deploy).
 # Last on purpose: commit and date change on every build, and nothing after them needs rebuilding.
 ARG MIDIR_BUILD_CHANNEL=local
 ARG MIDIR_BUILD_COMMIT=

@@ -1,29 +1,81 @@
+# Trunk-based: everything lands on main (directly, or through a pull request from a feature branch).
+#
+# Every push to main: the tests, then the image ghcr.io/<owner>/<repo>:dev (the latest main build) and :sha-<commit>,
+# for amd64 and arm64. A push whose Cargo.toml version has no vX.Y.Z tag yet is also a release: that same build is
+# tagged X.Y.Z, X.Y and latest, then vX.Y.Z is created with a GitHub release whose notes are that version's section
+# of docs/CHANGELOG.md. Tags are never created by hand. Pull requests: the tests and an amd64 image build, nothing
+# published.
 name: ci
 
-# develop: tests + snapshot image. Pull requests: tests + image build (not pushed). main is handled by release.yml.
 on:
   push:
-    branches: [develop]
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}   # a release on main always runs to the end
+
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # the tags
+      - id: v
+        env:
+          ON_MAIN: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"   # [package] comes first
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          elif ! grep -q "^## $version " docs/CHANGELOG.md; then
+            echo "::error::version $version is not released and docs/CHANGELOG.md has no '## $version (date)' section"
+            exit 1
+          else
+            echo "release=$ON_MAIN" >> "$GITHUB_OUTPUT"
+            echo "::notice::v$version is not released yet: a push to main publishes it"
+          fi
+
   test:
     uses: ./.github/workflows/test.yml
 
-  # Snapshots: every push to develop publishes ghcr.io/<owner>/<repo>:dev (the latest develop build; may break) and
-  # :sha-<commit> (fixed), for amd64 and arm64, once the tests pass. Pull requests only build the image.
   image:
-    needs: test
+    needs: [version, test]
     uses: ./.github/workflows/image.yml
     permissions:
       contents: read
       packages: write
     with:
-      channel: dev
-      push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' }}
+      channel: ${{ needs.version.outputs.release == 'true' && 'release' || 'dev' }}
+      push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       tags: |
         type=raw,value=dev
         type=sha,prefix=sha-,format=short
+        type=semver,pattern={{version}},value=v${{ needs.version.outputs.version }},enable=${{ needs.version.outputs.release == 'true' }}
+        type=semver,pattern={{major}}.{{minor}},value=v${{ needs.version.outputs.version }},enable=${{ needs.version.outputs.release == 'true' }}
+        type=raw,value=latest,enable=${{ needs.version.outputs.release == 'true' }}
+
+  github-release:
+    needs: [version, image]
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tag vX.Y.Z and publish the release notes from docs/CHANGELOG.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          awk -v v="$VERSION" '$0 ~ "^## "v" " {f=1; next} /^## / && f {exit} f' docs/CHANGELOG.md > notes.md
+          gh release create "v$VERSION" --target "$GITHUB_SHA" --title "v$VERSION" --notes-file notes.md --latest

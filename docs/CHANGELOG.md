@@ -113,6 +113,10 @@ release may change configuration or behavior.
   Repository tasks moved to `cargo xtask` (version, bump, check-leaks, smoke, deploy). CI runs fmt, clippy, the suite
   and cargo-deny (advisories, licenses, sources); Dependabot proposes updates; images carry an SBOM and provenance.
   The codebase no longer needs Python.
+- **Trunk-based releases**: everything lands on `main` (the `develop` branch is retired). Every push publishes
+  `ghcr.io/helton/midir:dev` and `:sha-<commit>`; a push whose version has no tag yet publishes that same build as
+  `X.Y.Z`, `X.Y` and `latest` and creates `vX.Y.Z` with its GitHub release. Run a version or `sha-<commit>`, not `dev`
+  or `latest`: a registry mirror can keep serving an old build under a tag that moves.
 - **Streaming through the observability stack fixed**: mitmproxy buffered whole responses, so on port 18880 tokens
   and keepalives reached clients only when generation was over, and StackSpot's stream reached Midir the same way.
   An addon (`docker/mitm/sse_stream.py`) streams `text/event-stream` responses through in both directions and keeps a

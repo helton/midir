@@ -1,4 +1,4 @@
-# The checks every change must pass, called by ci.yml and release.yml: formatting, lints, the library docs, the unit
+# The checks every change must pass, called by ci.yml: formatting, lints, the library docs, the unit
 # and property tests and the black-box regression suite (tests/: the binary as a process against a scripted StackSpot),
 # the leak check, and the dependency policy (advisories, licenses, sources: deny.toml).
 name: test

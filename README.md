@@ -227,32 +227,36 @@ addons).
 | `examples/clients/` | client configurations |
 | `docs/` | architecture, backend notes, agent brief, changelog |
 | `xtask/` | repository tasks (`cargo xtask`): version, bump, check-leaks, smoke, deploy |
-| `.github/workflows/` | CI with snapshots (`develop`) and releases (`main`) to ghcr.io |
+| `.github/workflows/` | CI: tests, images and releases to ghcr.io from `main` |
 
-**Branches and images**: work happens on `develop`; `main` only receives releases. Tags `vX.Y.Z` are created by the
-release workflow, never by hand.
+**Branches and images** (trunk-based): everything lands on `main`, directly or through a pull request from a
+feature branch. [ci.yml](.github/workflows/ci.yml) runs the tests on every pull request and push; then:
 
-| Push to | Workflow | Image on `ghcr.io/helton/midir` (amd64 + arm64) |
-|---|---|---|
-| `develop` | [ci.yml](.github/workflows/ci.yml): tests, then a snapshot | `dev` (the latest develop build, may break) and `sha-<commit>` |
-| `main` | [release.yml](.github/workflows/release.yml): tests, image, tag `vX.Y.Z`, GitHub release from the CHANGELOG | `X.Y.Z`, `X.Y`, `latest` (the latest release) |
+| Push to `main` | Image on `ghcr.io/helton/midir` (amd64 + arm64) |
+|---|---|
+| any | `dev` (the latest `main` build) and `sha-<commit>` |
+| whose `Cargo.toml` version has no `vX.Y.Z` tag yet | the same build also as `X.Y.Z`, `X.Y` and `latest`, then the tag `vX.Y.Z` and a GitHub release with that version's section of the CHANGELOG |
 
-A push to `main` whose version was already released publishes nothing. To release, on `develop`:
+Tags are never created by hand. Changes go under `## Unreleased` in [docs/CHANGELOG.md](docs/CHANGELOG.md); to
+release:
 
 ```bash
 cargo xtask bump [patch|minor|major|X.Y.Z]  # Cargo.toml, Cargo.lock and the default image tag in docker/compose.yml
-# rename the "## Unreleased" section of docs/CHANGELOG.md to "## X.Y.Z (date)", then commit
-git push                                     # snapshot of the release candidate
-git checkout main && git merge --ff-only develop && git push && git checkout develop
+# rename "## Unreleased" in docs/CHANGELOG.md to "## X.Y.Z (date)", then commit
+git push                                     # CI tests, publishes X.Y.Z and latest, tags vX.Y.Z
 ```
 
+A version that is not released and has no CHANGELOG section fails CI, on `main` and in pull requests.
+
 Every build says what it is (`midir --version`, the startup banner, `GET /health`): a release reports the bare version
-(`0.1.0`); anything else carries the commit as semver build metadata, `0.1.0+dev.a817822` for a `develop` snapshot,
+(`0.1.0`); anything else carries the commit as semver build metadata, `0.1.0+dev.a817822` for any other `main` build,
 `0.1.0+local.a817822` for an image built here (`.dirty` with uncommitted changes) and `0.1.0+src.a817822` for a
 binary built from a git checkout.
 
-`docker/compose.yml` runs the release it was bumped to; a snapshot runs with
-`MIDIR_IMAGE=ghcr.io/helton/midir:dev docker compose -f docker/compose.yml up -d`. The version lives only in
+`docker/compose.yml` runs the release it was bumped to; another build runs with `MIDIR_IMAGE`, e.g.
+`MIDIR_IMAGE=ghcr.io/helton/midir:sha-a817822 docker compose -f docker/compose.yml up -d`. Prefer a version or
+`sha-<commit>` to `dev` and `latest`: those move, and a registry mirror (a corporate Artifactory, for one) can keep
+serving an old build under them for hours. The version lives only in
 `Cargo.toml` (`midir --version`, `GET /health`, first log line); changes are listed in
 [docs/CHANGELOG.md](docs/CHANGELOG.md).
 
