@@ -47,7 +47,8 @@ release may change configuration or behavior.
   whose last two runs in the turn returned the same result. `followups = false` in `[server]` or a model
   (`MIDIR_FOLLOWUPS=0`) turns these heuristic follow-ups off; a forced `tool_choice` is still asked for again.
 - **Tool calls**: JSON with raw newlines or tabs inside strings, or with trailing commas, is read as the model meant
-  it instead of costing a repair round trip; JSON mode with tools returns the model's tool calls (they were dropped);
+  it instead of costing a repair round trip; a call whose arguments hold the text `</tool_call>` (writing a file that
+  documents the protocol) is no longer cut there: a block ends at the first close tag outside a JSON string; JSON mode with tools returns the model's tool calls (they were dropped);
   a forced `tool_choice` is retried when streaming too; text held back for a stop sequence comes out before a tool
   call, not after it; `parallel_tool_calls: false` and Anthropic's `disable_parallel_tool_use` are honored (the model
   is told, extra calls are dropped); a named `tool_choice` that names no declared tool is a 400; `max_tokens` holds

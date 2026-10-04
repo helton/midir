@@ -28,9 +28,10 @@ StackSpot has no native tools, so the gateway puts your tool list in the prompt 
 `<tool_call id="call_1">{"name": ..., "arguments": {...}}</tool_call>` blocks, which it parses back into real
 `tool_calls` / `tool_use` / `function_call` items. Consequences:
 - Parallel calls work (several blocks in one reply, or several JSON objects in one block), unless the request sets
-  `parallel_tool_calls: false`. Raw newlines or tabs inside JSON strings and trailing commas are accepted; a call
-  whose JSON is still invalid (e.g. unescaped quotes) is never passed on broken: the gateway asks you once to re-emit
-  it; a block missing the tool name is accepted when exactly one tool fits its arguments.
+  `parallel_tool_calls: false`. Raw newlines or tabs inside JSON strings, trailing commas and `</tool_call>` inside a
+  JSON string (a file that documents this protocol) are accepted; a call whose JSON is still invalid (e.g. unescaped
+  quotes) is never passed on broken: the gateway asks you once to re-emit it; a block missing the tool name is
+  accepted when exactly one tool fits its arguments.
 - If a reply only announces or plans an action ("I'll read the files", "O plano é: 1. 2. 3.") or asks permission for
   something the user already requested (e.g. "Deseja que eu faça o commit?"), the gateway makes a hidden follow-up
   (two at most) and appends the missing tool calls to the same reply. It only answers for a commit or a test run the

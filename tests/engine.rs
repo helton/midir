@@ -411,6 +411,25 @@ fn a_second_announcement_gets_a_second_follow_up() {
 // ---------------------------------------------------------------- tool calls
 
 #[test]
+fn a_call_whose_arguments_hold_the_close_tag_arrives_whole() {
+    // writing a file that documents the protocol: the tag inside the JSON string does not end the block
+    let rig = Rig::new();
+    let content = "Reply with <tool_call>{...}</tool_call> blocks.";
+    rig.upstream
+        .add(Reply::text(&tool_call_text("run_command", json!({"command": format!("printf '%s' '{content}' > brief.md")}))).chunk(7));
+    let objs = chat(&rig, json!({"tools": chat_tools(), "stream": true}));
+    let args: String = objs
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|o| o["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str())
+        .collect();
+    let args: Value = serde_json::from_str(&args).unwrap();
+    assert!(s(&args["command"]).contains(content), "{args}");
+    assert_eq!(rig.upstream.calls().len(), 1); // no repair round trip
+}
+
+#[test]
 fn raw_newlines_in_tool_call_json_need_no_repair() {
     let rig = Rig::new();
     let raw = "<tool_call id=\"call_1\">\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"a\nb.py\",}}\n</tool_call>";

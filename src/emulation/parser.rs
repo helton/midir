@@ -43,11 +43,34 @@ pub struct ToolCallParser {
     pub repaired: usize,
     tools: Arc<[ToolSpec]>,
     saw_call: bool,
+    /// inside a block: how far the search for its end got, and the JSON string state there
+    scan: Scan,
+    /// at the end of the stream: a block ends at its first `</tool_call>`, inside a string or not
+    lenient: bool,
+}
+
+/// The search for the `</tool_call>` that ends a block, kept between deltas so a long call is scanned once.
+#[derive(Default)]
+struct Scan {
+    /// byte offset in `buf` scanned so far (None until the open tag is complete)
+    pos: Option<usize>,
+    in_string: bool,
+    escaped: bool,
 }
 
 impl ToolCallParser {
     pub fn new(tools: Arc<[ToolSpec]>) -> Self {
-        ToolCallParser { buf: String::new(), in_call: false, errors: vec![], rejected: vec![], repaired: 0, tools, saw_call: false }
+        ToolCallParser {
+            buf: String::new(),
+            in_call: false,
+            errors: vec![],
+            rejected: vec![],
+            repaired: 0,
+            tools,
+            saw_call: false,
+            scan: Scan::default(),
+            lenient: false,
+        }
     }
 
     pub fn feed(&mut self, delta: &str) -> Vec<Parsed> {
@@ -78,11 +101,11 @@ impl ToolCallParser {
                 }
                 return out;
             }
-            let Some(j) = self.buf.find(CLOSE_TAG) else { return out };
-            let end = j + CLOSE_TAG.len();
+            let Some(end) = self.block_end() else { return out };
             let block = self.buf[..end].to_string();
             self.buf = self.buf[end..].to_string();
             self.in_call = false;
+            self.scan = Scan::default();
             self.saw_call = true;
             for call in self.parse_block(&block) {
                 out.push(Parsed::Call(call));
@@ -90,8 +113,58 @@ impl ToolCallParser {
         }
     }
 
+    /// Where the block at the start of `buf` ends: after the first `</tool_call>` outside a JSON string, so a call
+    /// whose arguments hold the tag (writing a file that documents the protocol) is not cut short. When the stream
+    /// ends without one, the first `</tool_call>` anywhere (the JSON is broken then anyway).
+    fn block_end(&mut self) -> Option<usize> {
+        if self.lenient {
+            return self.buf.find(CLOSE_TAG).map(|j| j + CLOSE_TAG.len());
+        }
+        let mut i = match self.scan.pos {
+            Some(i) => i,
+            None => {
+                // the arguments start after the open tag (whose id="..." holds quotes of its own)
+                let body = OPEN_RE.find(&self.buf).map(|m| m.end()).or_else(|| self.buf.find('>').map(|k| k + 1))?;
+                self.scan.pos = Some(body);
+                body
+            }
+        };
+        let bytes = self.buf.as_bytes();
+        while i < bytes.len() {
+            let c = bytes[i];
+            if self.scan.in_string {
+                if self.scan.escaped {
+                    self.scan.escaped = false;
+                } else if c == b'\\' {
+                    self.scan.escaped = true;
+                } else if c == b'"' {
+                    self.scan.in_string = false;
+                }
+            } else if c == b'"' {
+                self.scan.in_string = true;
+            } else if c == b'<' {
+                let rest = &self.buf[i..];
+                if rest.starts_with(CLOSE_TAG) {
+                    return Some(i + CLOSE_TAG.len());
+                }
+                if CLOSE_TAG.starts_with(rest) {
+                    break; // maybe the tag, cut by the delta: look again with more text
+                }
+            }
+            i += 1;
+        }
+        self.scan.pos = Some(i);
+        None
+    }
+
     pub fn finish(&mut self) -> Vec<Parsed> {
         let mut out = vec![];
+        if self.in_call && self.buf.contains(CLOSE_TAG) {
+            // CAVEAT: no `</tool_call>` outside a string (an unescaped quote in the JSON): the first one ends the block
+            self.lenient = true;
+            out.extend(self.feed(""));
+            self.lenient = false;
+        }
         if self.in_call && !self.buf.trim().is_empty() {
             let block = format!("{}{CLOSE_TAG}", self.buf);
             let calls = self.parse_block(&block); // CAVEAT: block without </tool_call>; parsed anyway
@@ -343,6 +416,10 @@ mod tests {
             )),
             Just("<tool_cal".to_string()),
             Just("<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"a\nb\"}}\n</tool_call>".to_string()),
+            Just(
+                "<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"doc </tool_call> \\\"q\\\" end\"}}\n</tool_call>"
+                    .to_string()
+            ),
         ]
     }
 
@@ -352,6 +429,44 @@ mod tests {
             let text: String = pieces.concat();
             prop_assert_eq!(meaning(&text, &cuts), meaning(&text, &[]));
         }
+    }
+
+    #[test]
+    fn the_close_tag_inside_a_json_string_does_not_end_the_call() {
+        // an agent writing a file that documents the protocol (Midir's own prompt.rs, agent-brief.md)
+        let content = "Emit <tool_call id=\\\"call_1\\\">{...}</tool_call> blocks.";
+        let reply = format!(
+            "Writing it.\n<tool_call id=\"call_1\">\n{{\"name\": \"write_file\", \"arguments\": {{\"path\": \"brief.md\", \"content\": \"{content}\"}}}}\n</tool_call>\nDone."
+        );
+        let tools: Arc<[ToolSpec]> = vec![ToolSpec::new("write_file", "", None, false)].into();
+        for step in [1, 3, reply.len()] {
+            let mut p = ToolCallParser::new(tools.clone());
+            let mut events = vec![];
+            let chars: Vec<char> = reply.chars().collect();
+            for piece in chars.chunks(step) {
+                events.extend(p.feed(&piece.iter().collect::<String>()));
+            }
+            events.extend(p.finish());
+            let calls: Vec<&ToolCall> = events.iter().filter_map(|e| if let Parsed::Call(c) = e { Some(c) } else { None }).collect();
+            assert_eq!(calls.len(), 1, "step {step}: {events:?}");
+            assert_eq!(calls[0].arguments["content"], "Emit <tool_call id=\"call_1\">{...}</tool_call> blocks.");
+            let text: String = events.iter().filter_map(|e| if let Parsed::Text(t) = e { Some(t.as_str()) } else { None }).collect();
+            assert!(text.contains("Writing it.") && text.contains("Done."), "step {step}: {text:?}");
+            assert!(p.rejected.is_empty());
+        }
+    }
+
+    #[test]
+    fn an_unbalanced_quote_still_ends_the_call_at_its_close_tag() {
+        // no </tool_call> outside a string: at the end of the stream the first one ends the block, as before
+        let mut p = ToolCallParser::new(vec![ToolSpec::new("read_file", "", None, false)].into());
+        let mut events =
+            p.feed("<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"a\"b.py\"}}\n</tool_call>\nThen more text.");
+        assert!(events.is_empty()); // held: the tag looked like part of a string
+        events.extend(p.finish());
+        let text: String = events.iter().filter_map(|e| if let Parsed::Text(t) = e { Some(t.as_str()) } else { None }).collect();
+        assert!(text.contains("Then more text."), "{events:?}");
+        assert!(!text.contains("</tool_call>"), "{events:?}");
     }
 
     #[test]
