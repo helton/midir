@@ -3,6 +3,13 @@
 All notable changes are listed here. Versions follow [Semantic Versioning](https://semver.org/); before 1.0.0 a minor
 release may change configuration or behavior.
 
+## Unreleased
+
+- **No more patches written as text**: the tool protocol now tells every model that text changes nothing: to create
+  or edit a file it calls a tool that writes it, never a patch or diff in the reply (`*** Begin Patch`, `diff --git`).
+  GPT-4.1 sometimes wrote the change as an apply_patch block, ran the old tests and reported the work done (hermes,
+  battery 2026-10-04); three reruns of that task wrote no patch as text.
+
 ## 0.1.0 (2026-10-04)
 
 - **Rewritten in Rust**: Midir is now one static binary (tokio, axum, reqwest with rustls) instead of a Python
