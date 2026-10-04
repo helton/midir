@@ -1,13 +1,14 @@
 //! Model text -> text and tool-call events, incrementally.
 
 use std::collections::HashSet;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use regex::Regex;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
-use crate::canonical::{new_call_id, ToolCall, ToolSpec};
-use crate::text::prefix;
+use crate::canonical::{ToolCall, ToolSpec, new_call_id};
+use crate::json;
+use crate::text::{char_len, prefix};
 
 pub const OPEN_TAG: &str = "<tool_call";
 pub const CLOSE_TAG: &str = "</tool_call>";
@@ -30,19 +31,23 @@ pub enum Parsed {
 }
 
 /// Feed text deltas; get text and tool-call events. Holds back any suffix that could be the start of "<tool_call".
+/// `errors` describe problems by their shape only (sizes, positions): they are logged at WARN, and model output may
+/// hold secrets; the content itself goes to DEBUG.
 pub struct ToolCallParser {
     buf: String,
     in_call: bool,
     pub errors: Vec<String>,
     /// raw content of calls dropped because their JSON could not be decoded
     pub rejected: Vec<String>,
-    tools: Vec<ToolSpec>,
+    /// blocks whose JSON was decodable only after escaping raw control characters or dropping trailing commas
+    pub repaired: usize,
+    tools: Arc<[ToolSpec]>,
     saw_call: bool,
 }
 
 impl ToolCallParser {
-    pub fn new(tools: Vec<ToolSpec>) -> Self {
-        ToolCallParser { buf: String::new(), in_call: false, errors: vec![], rejected: vec![], tools, saw_call: false }
+    pub fn new(tools: Arc<[ToolSpec]>) -> Self {
+        ToolCallParser { buf: String::new(), in_call: false, errors: vec![], rejected: vec![], repaired: 0, tools, saw_call: false }
     }
 
     pub fn feed(&mut self, delta: &str) -> Vec<Parsed> {
@@ -110,11 +115,30 @@ impl ToolCallParser {
         let end = block.len().saturating_sub(CLOSE_TAG.len());
         let inner_raw = if start <= end { &block[start..end] } else { "" };
         let inner = strip_fences(inner_raw.trim());
-        let objs: Vec<Value> = match serde_json::from_str(&inner) {
-            Ok(Value::Array(a)) => a,
-            Ok(v) => vec![v],
-            Err(e) => {
-                let (mut objs, rest) = decode_sequence(&inner);
+        let strict = serde_json::from_str(&inner).map_err(|e| {
+            // what a model means more often than not: a literal newline or TAB inside a string, a trailing comma
+            match json::decode_lenient(&inner) {
+                Ok((v, true)) => {
+                    self.repaired += 1;
+                    tracing::debug!("tool_call JSON decoded after escaping raw control characters / dropping trailing commas");
+                    Ok(v)
+                }
+                _ => Err(e),
+            }
+        });
+        let objs: Vec<Value> = match strict {
+            Ok(Value::Array(a)) | Err(Ok(Value::Array(a))) => a,
+            Ok(v) | Err(Ok(v)) => vec![v],
+            Err(Err(e)) => {
+                // several objects in one block, one of them with a raw newline: repair, then read them in a row
+                let repaired = json::repair_model_json(&inner);
+                let (mut objs, rest) = match decode_sequence(&repaired) {
+                    (objs, rest) if rest.trim().is_empty() && !objs.is_empty() => {
+                        self.repaired += 1;
+                        (objs, rest)
+                    }
+                    _ => decode_sequence(&inner),
+                };
                 if !rest.trim().is_empty() {
                     if let Some(salvaged) = salvage(&rest) {
                         objs.push(salvaged);
@@ -124,9 +148,9 @@ impl ToolCallParser {
                         self.rejected.push(prefix(rest.trim(), 4000).to_string());
                     }
                     self.errors.push(format!(
-                        "invalid JSON in tool_call ({e}); kept {} call(s); raw block: {:?}",
-                        objs.len(),
-                        prefix(&inner, 300)
+                        "invalid JSON in a tool_call block of {} chars ({e}); kept {} call(s)",
+                        char_len(&inner),
+                        objs.len()
                     ));
                     tracing::debug!("tool_call raw block: {:?}", prefix(&inner, 4000));
                 } else if objs.len() > 1 {
@@ -153,10 +177,14 @@ impl ToolCallParser {
         };
         let mut args = map.get("arguments").or_else(|| map.get("parameters")).or_else(|| map.get("input")).cloned().unwrap_or(json!({}));
         if let Value::String(s) = &args {
-            match serde_json::from_str(s) {
-                Ok(v) => args = v,
-                Err(_) => {
-                    self.errors.push(format!("tool_call {name:?} dropped: arguments are not valid JSON: {:?}", prefix(s, 300)));
+            match json::decode_lenient(s) {
+                Ok((v, repaired)) => {
+                    self.repaired += usize::from(repaired);
+                    args = v;
+                }
+                Err(e) => {
+                    self.errors.push(format!("tool_call {name:?} dropped: arguments are not valid JSON ({} chars: {e})", char_len(s)));
+                    tracing::debug!("tool_call {name:?} arguments: {:?}", prefix(s, 4000));
                     self.rejected.push(prefix(&obj.to_string(), 4000).to_string());
                     return None;
                 }
@@ -172,10 +200,10 @@ impl ToolCallParser {
     /// Smaller models sometimes drop the envelope: accept {"function": {...}}, {"tool"|"tool_name"|"function_name": ...}
     /// and bare arguments when exactly one declared tool matches them (CAVEAT: inference).
     fn infer_name(&mut self, obj: Map<String, Value>) -> Value {
-        if let Some(Value::Object(f)) = obj.get("function") {
-            if let Some(name) = f.get("name") {
-                return json!({"name": name, "arguments": f.get("arguments").cloned().unwrap_or(json!({}))});
-            }
+        if let Some(Value::Object(f)) = obj.get("function")
+            && let Some(name) = f.get("name")
+        {
+            return json!({"name": name, "arguments": f.get("arguments").cloned().unwrap_or(json!({}))});
         }
         for key in ["tool", "tool_name", "function_name"] {
             if let Some(Value::String(name)) = obj.get(key) {
@@ -265,5 +293,73 @@ fn salvage(s: &str) -> Option<Value> {
     match decode_prefix(&s[args.end()..]) {
         Some((v @ Value::Object(_), _)) => Some(json!({"name": name, "arguments": v})),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// What a reply means, whatever the chunking: its texts (merged, trimmed) and calls (name and arguments) in order.
+    fn meaning(text: &str, cuts: &[usize]) -> Vec<String> {
+        let mut p = ToolCallParser::new(vec![ToolSpec::new("read_file", "", None, false)].into());
+        let chars: Vec<char> = text.chars().collect();
+        let mut bounds: Vec<usize> = cuts.iter().map(|c| c % (chars.len() + 1)).collect();
+        bounds.extend([0, chars.len()]);
+        bounds.sort_unstable();
+        bounds.dedup();
+        let mut events = vec![];
+        for w in bounds.windows(2) {
+            events.extend(p.feed(&chars[w[0]..w[1]].iter().collect::<String>()));
+        }
+        events.extend(p.finish());
+        let mut out: Vec<String> = vec![];
+        let mut text_run = String::new();
+        let flush = |run: &mut String, out: &mut Vec<String>| {
+            if !run.trim().is_empty() {
+                out.push(format!("text:{}", run.trim()));
+            }
+            run.clear();
+        };
+        for e in events {
+            match e {
+                Parsed::Text(t) => text_run.push_str(&t),
+                Parsed::Call(c) => {
+                    flush(&mut text_run, &mut out);
+                    out.push(format!("call:{}:{}", c.name, c.arguments));
+                }
+            }
+        }
+        flush(&mut text_run, &mut out);
+        out
+    }
+
+    fn piece() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "[a-zç🎉 <>/\\n.]{0,12}",
+            "[a-z]{1,6}".prop_map(|v| format!(
+                "<tool_call id=\"call_1\">\n{{\"name\": \"read_file\", \"arguments\": {{\"path\": \"{v}\"}}}}\n</tool_call>"
+            )),
+            Just("<tool_cal".to_string()),
+            Just("<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"a\nb\"}}\n</tool_call>".to_string()),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn chunking_never_changes_the_meaning(pieces in prop::collection::vec(piece(), 0..8), cuts in prop::collection::vec(0usize..400, 0..12)) {
+            let text: String = pieces.concat();
+            prop_assert_eq!(meaning(&text, &cuts), meaning(&text, &[]));
+        }
+    }
+
+    #[test]
+    fn broken_calls_are_described_without_their_content() {
+        let mut p = ToolCallParser::new(Arc::new([]));
+        p.feed("<tool_call>\n{\"name\": \"write\", \"arguments\": {\"content\": \"TOKEN=abc123\" \"x\"}}\n</tool_call>");
+        p.finish();
+        assert!(!p.errors.is_empty() && !p.errors.join(" ").contains("abc123"), "{:?}", p.errors);
+        assert_eq!(p.rejected.len(), 1); // the repair follow-up still gets it
     }
 }

@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const TASK: &str =
     "Qual a temperatura em Curitiba agora, em Fahrenheit? Use as ferramentas: primeiro get_weather, depois convert. Responda em uma frase.";
@@ -406,9 +406,5 @@ pub fn run(args: &[String]) -> Result<(), String> {
         t.results.len(),
         t0.elapsed().as_secs_f64()
     );
-    if fails == 0 {
-        Ok(())
-    } else {
-        Err(format!("{fails} check(s) failed"))
-    }
+    if fails == 0 { Ok(()) } else { Err(format!("{fails} check(s) failed")) }
 }

@@ -4,7 +4,7 @@
 mod common;
 
 use common::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const ASSISTANT_PREFILL_NUDGE: &str = "(continue your previous message exactly from where it stopped, without repeating it)";
 
@@ -20,11 +20,7 @@ fn chat(rig: &Rig, extra: Value) -> Value {
     }
     let r = rig.http.post("/v1/chat/completions", &body);
     assert_eq!(r.status, 200, "{}", r.text);
-    if body["stream"] == true {
-        Value::Array(r.objects())
-    } else {
-        r.json()
-    }
+    if body["stream"] == true { Value::Array(r.objects()) } else { r.json() }
 }
 
 fn content(r: &Value) -> &str {
@@ -298,4 +294,203 @@ fn ignored_parameters_are_accepted() {
     assert_eq!(r.status, 200);
     let log = rig.server.logs();
     assert!(log.contains("accepted parameters without effect") && log.contains("temperature"), "{log}");
+}
+
+// ---------------------------------------------------------------- follow-ups never act against the user
+
+#[test]
+fn a_forbidden_action_is_never_confirmed_for_the_user() {
+    let rig = Rig::new();
+    rig.upstream
+        .add("Corrigi o bug e os testes passaram. Quer que eu faça o push?")
+        .add(tool_call_text("run_command", json!({"command": "git push"})));
+    let r = chat(&rig, json!({"tools": chat_tools(), "messages": user("Corrija o bug e rode os testes, mas NÃO faça push.")}));
+    assert_eq!(rig.upstream.calls().len(), 1);
+    assert_eq!(r["choices"][0]["finish_reason"], "stop");
+}
+
+#[test]
+fn a_retracted_request_is_not_confirmed_for_the_user() {
+    let rig = Rig::new();
+    rig.upstream.add("Pronto. Deseja que eu faça o commit?").add(tool_call_text("run_command", json!({"command": "git commit -am x"})));
+    let msgs = json!([
+        {"role": "user", "content": "Corrija o bug e faça commit ao final."},
+        {"role": "assistant", "content": "Ok."},
+        {"role": "user", "content": "Mudei de ideia: não commite nada, só me mostre o diff."}
+    ]);
+    chat(&rig, json!({"tools": chat_tools(), "messages": msgs}));
+    assert_eq!(rig.upstream.calls().len(), 1);
+}
+
+#[test]
+fn ready_for_an_ordered_commit_gets_a_follow_up_even_after_nothing_pending() {
+    // Hermes on flex (battery 2026-10-03): '... Todos os testes passaram. Nada pendente. Pronto para commit.'
+    let rig = Rig::new();
+    rig.upstream
+        .add("Implementado median em calc/stats.py. Todos os testes passaram. Nada pendente. Pronto para commit.")
+        .add(tool_call_text("run_command", json!({"command": "git commit -am median"})));
+    let r = chat(&rig, json!({"tools": chat_tools(), "messages": user("Adicione median, rode os testes e faça um commit ao final.")}));
+    assert_eq!(r["choices"][0]["finish_reason"], "tool_calls");
+}
+
+#[test]
+fn a_correct_refusal_gets_no_ability_follow_up() {
+    let rig = Rig::new();
+    rig.upstream.add("Não tenho acesso à sua conta do banco, então não consigo ver o saldo.");
+    chat(&rig, json!({"tools": chat_tools(), "messages": user("qual o saldo da minha conta?")}));
+    assert_eq!(rig.upstream.calls().len(), 1);
+}
+
+#[test]
+fn a_second_announcement_gets_a_second_follow_up() {
+    let rig = Rig::new();
+    rig.upstream
+        .add("Vou ler o arquivo a.py agora.")
+        .add("Certo, vou ler o arquivo a.py.")
+        .add(tool_call_text("read_file", json!({"path": "a.py"})));
+    let r = chat(&rig, json!({"tools": chat_tools()}));
+    assert_eq!(r["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(rig.upstream.calls().len(), 3);
+    let last = rig.upstream.prompt(2);
+    assert!(last.contains("Certo, vou ler") && last.matches("You announced an action").count() == 2, "{last}");
+}
+
+// ---------------------------------------------------------------- tool calls
+
+#[test]
+fn raw_newlines_in_tool_call_json_need_no_repair() {
+    let rig = Rig::new();
+    let raw = "<tool_call id=\"call_1\">\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"a\nb.py\",}}\n</tool_call>";
+    rig.upstream.add(raw);
+    let r = chat(&rig, json!({"tools": chat_tools()}));
+    assert_eq!(rig.upstream.calls().len(), 1);
+    let args: Value = serde_json::from_str(s(&r["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])).unwrap();
+    assert_eq!(args, json!({"path": "a\nb.py"}));
+}
+
+#[test]
+fn json_mode_with_tools_returns_the_tool_call() {
+    let rig = Rig::new();
+    let call = tool_call_text("read_file", json!({"path": "a.py"}));
+    rig.upstream.add(call.as_str()).add(call.as_str());
+    let r = chat(&rig, json!({"tools": chat_tools(), "response_format": {"type": "json_object"}}));
+    assert_eq!(rig.upstream.calls().len(), 1);
+    assert_eq!(r["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(r["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "read_file");
+    let objs = chat(&rig, json!({"tools": chat_tools(), "response_format": {"type": "json_object"}, "stream": true}));
+    assert_eq!(chat_stream_tool_calls(objs.as_array().unwrap()).len(), 1);
+}
+
+#[test]
+fn a_forced_tool_choice_is_retried_when_streaming_too() {
+    let rig = Rig::new();
+    rig.upstream.add("Just text.").add(tool_call_text("read_file", json!({"path": "a.py"})));
+    let objs = chat(&rig, json!({"tools": chat_tools(), "tool_choice": "required", "stream": true}));
+    let objs = objs.as_array().unwrap();
+    assert_eq!(rig.upstream.calls().len(), 2);
+    assert_eq!(chat_stream_text(objs), "Just text.");
+    assert_eq!(chat_stream_finish(objs), vec!["tool_calls"]);
+}
+
+#[test]
+fn text_held_back_for_a_stop_sequence_comes_before_the_tool_call() {
+    let rig = Rig::new();
+    rig.upstream.add(format!("Reading the file now.\n{}", tool_call_text("read_file", json!({"path": "a.py"}))));
+    let objs = chat(&rig, json!({"tools": chat_tools(), "stop": ["END"], "stream": true}));
+    let order: Vec<&str> = objs
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| {
+            let delta = &d["choices"][0]["delta"];
+            if delta["content"].as_str().is_some_and(|t| !t.is_empty()) {
+                Some("text")
+            } else {
+                delta["tool_calls"].as_array().map(|_| "call")
+            }
+        })
+        .collect();
+    assert_eq!(order.last(), Some(&"call"), "{order:?}");
+    assert_eq!(chat_stream_text(objs.as_array().unwrap()), "Reading the file now.");
+}
+
+#[test]
+fn parallel_tool_calls_off_keeps_one_call() {
+    let rig = Rig::new();
+    let both = format!(
+        "{}\n{}",
+        tool_call_text("read_file", json!({"path": "a.py"})),
+        tool_call_text_id("read_file", json!({"path": "b.py"}), "call_2")
+    );
+    rig.upstream.add(both.as_str()).add(both.as_str());
+    let r = chat(&rig, json!({"tools": chat_tools(), "parallel_tool_calls": false}));
+    assert_eq!(r["choices"][0]["message"]["tool_calls"].as_array().unwrap().len(), 1);
+    assert!(rig.upstream.prompt(0).contains("at most one tool"));
+    let m = rig
+        .http
+        .post("/v1/messages", &json!({"model": "gpt-5.1", "max_tokens": 50, "messages": task(), "tools": anth_tools(), "tool_choice": {"type": "auto", "disable_parallel_tool_use": true}}))
+        .json();
+    assert_eq!(m["content"].as_array().unwrap().iter().filter(|b| b["type"] == "tool_use").count(), 1);
+}
+
+// ---------------------------------------------------------------- size cap, logs
+
+#[test]
+fn an_oversized_tool_result_is_cut_to_the_cap() {
+    let rig = Rig::with(&toml_with_server("max_prompt_chars = 50000"), &[]);
+    rig.upstream.add("ok");
+    let big = format!("FIRST{}LAST", "y".repeat(200_000));
+    let msgs = json!([
+        {"role": "user", "content": "read it"},
+        {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"big.log\"}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": big}
+    ]);
+    chat(&rig, json!({"tools": chat_tools(), "messages": msgs}));
+    let p = rig.upstream.prompt(0);
+    assert!(p.chars().count() <= 50_000, "{} chars", p.chars().count());
+    assert!(p.contains("FIRST") && p.contains("LAST") && p.contains("characters omitted by the gateway"));
+    assert!(p.contains("# Tools")); // the system part is never cut
+}
+
+#[test]
+fn model_output_stays_out_of_the_default_log() {
+    let rig = Rig::new();
+    let secret = "<tool_call id=\"call_1\">\n{\"name\": \"write_file\", \"arguments\": {\"path\": \".env\", \"content\": \"DB_PASSPHRASE=supersecret123\nX=\"y\"\"}}\n</tool_call>";
+    rig.upstream.add(secret).add("ok");
+    chat(&rig, json!({"tools": chat_tools()}));
+    let log = rig.server.logs();
+    assert!(log.contains("parser:") && !log.contains("supersecret123"), "{log}");
+}
+
+#[test]
+fn time_to_first_byte_is_logged() {
+    let rig = Rig::new();
+    rig.upstream.add("hello");
+    chat(&rig, json!({}));
+    assert!(rig.server.logs().contains(" ttfb "), "{}", rig.server.logs());
+}
+
+#[test]
+fn a_final_report_that_forgets_the_ordered_commit_gets_a_follow_up() {
+    // Claude Code on flex (battery 2026-10-04): tests run, a report that everything is done, no commit
+    let rig = Rig::new();
+    rig.upstream
+        .add("Tudo pronto! median e pstdev implementados e toda a suíte passou: 14 passed.")
+        .add(tool_call_text("run_command", json!({"command": "git add -A && git commit -m 'feat: median e pstdev'"})));
+    let msgs = json!([
+        {"role": "user", "content": "Adicione median e pstdev, rode os testes até passar e faça um commit ao final."},
+        {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "run_command", "arguments": "{\"command\": \"uv run pytest -q\"}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "14 passed"},
+    ]);
+    let r = chat(&rig, json!({"tools": chat_tools(), "messages": msgs}));
+    assert_eq!(r["choices"][0]["finish_reason"], "tool_calls");
+    assert!(rig.upstream.prompt(1).contains("none was made"), "{}", rig.upstream.prompt(1));
+    // the same report after a commit was made: nothing to ask
+    rig.upstream.clear();
+    rig.upstream.add("Tudo pronto! Toda a suíte passou.");
+    let mut done = msgs.as_array().unwrap().clone();
+    done.push(json!({"role": "assistant", "tool_calls": [{"id": "c2", "type": "function", "function": {"name": "run_command", "arguments": "{\"command\": \"git commit -am x\"}"}}]}));
+    done.push(json!({"role": "tool", "tool_call_id": "c2", "content": "1 file changed"}));
+    chat(&rig, json!({"tools": chat_tools(), "messages": done}));
+    assert_eq!(rig.upstream.calls().len(), 1);
 }

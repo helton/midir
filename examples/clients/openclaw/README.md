@@ -10,7 +10,7 @@ the `openclaw/openclaw` image on the three models (file edits, shell, tests, com
 What each setting is for
 - `agents.defaults.model.primary`: `stackspot/gpt-5.1`, `stackspot/flex` or `stackspot/gpt-4.1` (provider id / model id).
 - `agents.defaults.subagents.maxConcurrent: 2`: the StackSpot account allows 100 requests per minute in total.
-- `models.providers.stackspot.apiKey`: any value; the gateway has no authentication.
+- `models.providers.stackspot.apiKey`: any value, unless the gateway sets `MIDIR_API_KEY` (then that key).
 - `models[].input: ["text"]` and `reasoning: false`: the gateway has no image input and never returns reasoning blocks.
 - `memory.search.provider: "none"`: there is no embeddings endpoint.
 - `tools.toolSearch.mode: "tools"`: tool schemas are deferred, so prompts are smaller and steps faster.

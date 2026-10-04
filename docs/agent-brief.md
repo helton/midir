@@ -6,7 +6,7 @@ Everything below is what that means for you.
 
 ## How you are connected
 - Endpoint: `http://127.0.0.1:18880/v1` (from a container on Midir's compose network: `http://mitm:18880/v1`, or `http://midir:18880/v1` bypassing the proxy).
-  Any API key works; there is no authentication (local use only).
+  Any API key works unless the user set `MIDIR_API_KEY` (then use that key).
 - OpenClaw provider config used (`~/.openclaw/openclaw.json`, provider `stackspot`):
   `api: "openai-responses"` (or `"openai-completions"`), `baseUrl` as above, models declared with
   `input: ["text"]`, `reasoning: false`, `contextWindow: 272000`; `memory.search.provider: "none"` (no embeddings);
@@ -27,19 +27,23 @@ Unknown model names go to `gpt-5.1`.
 StackSpot has no native tools, so the gateway puts your tool list in the prompt and asks the model to write
 `<tool_call id="call_1">{"name": ..., "arguments": {...}}</tool_call>` blocks, which it parses back into real
 `tool_calls` / `tool_use` / `function_call` items. Consequences:
-- Parallel calls work (several blocks in one reply, or several JSON objects in one block). A call whose JSON is
-  invalid (e.g. unescaped quotes) is never passed on broken: the gateway asks you once to re-emit it; a block missing the tool name
-  is accepted when exactly one tool fits its arguments.
+- Parallel calls work (several blocks in one reply, or several JSON objects in one block), unless the request sets
+  `parallel_tool_calls: false`. Raw newlines or tabs inside JSON strings and trailing commas are accepted; a call
+  whose JSON is still invalid (e.g. unescaped quotes) is never passed on broken: the gateway asks you once to re-emit
+  it; a block missing the tool name is accepted when exactly one tool fits its arguments.
 - If a reply only announces or plans an action ("I'll read the files", "O plano é: 1. 2. 3.") or asks permission for
-  something the user already requested (e.g. "Deseja que eu faça o commit?"), the gateway makes one hidden follow-up
-  and appends the missing tool calls to the same reply. Best behavior: emit the tool call in the same reply you
-  announce it; do not ask to confirm actions the user already asked for.
+  something the user already requested (e.g. "Deseja que eu faça o commit?"), the gateway makes a hidden follow-up
+  (two at most) and appends the missing tool calls to the same reply. It only answers for a commit or a test run the
+  user explicitly ordered; push, merge, deploy and install are never confirmed for the user.
+  Best behavior: emit the tool call in the same reply you announce it; do not ask to confirm actions the user already
+  asked for.
 - Every tool schema is resent on every turn and the prompt has no cache: keep the active tool list small.
 - `tool_choice` auto/none/required/named works (required/named: one retry if the model does not comply).
 
 ## Limits and differences from native providers
 - Text only: images, audio and files become a placeholder. No embeddings endpoint. No reasoning/thinking blocks.
-- Input limit about 272k tokens; the oldest history turns are dropped above 1M characters (the last 4 are kept).
+- Input limit about 272k tokens; above 1M characters the oldest history turns are dropped (the last 4 are kept), and
+  if that is not enough the largest tool results are cut in the middle (head and tail kept, with a marker).
 - **Rate limit: 100 requests/minute for the whole StackSpot account**, shared by every agent and client. The gateway
   queues requests (max 8 concurrent, 90/min) instead of failing; a request that would wait more than 10 minutes gets a
   429. Many parallel subagents mostly wait in that queue.

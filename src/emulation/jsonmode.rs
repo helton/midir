@@ -63,10 +63,10 @@ pub fn validate_json_schema(value: &Value, schema: &Value, path: &str) -> Vec<St
         return vec![format!("{path}: expected {}, got {}", types.join(" or "), type_name(value))];
     }
     let mut errs = vec![];
-    if let Some(Value::Array(options)) = schema.get("enum") {
-        if !options.iter().any(|o| json_eq(o, value)) {
-            errs.push(format!("{path}: value not in enum"));
-        }
+    if let Some(Value::Array(options)) = schema.get("enum")
+        && !options.iter().any(|o| json_eq(o, value))
+    {
+        errs.push(format!("{path}: value not in enum"));
     }
     if let Value::Object(obj) = value {
         if let Some(Value::Array(required)) = schema.get("required") {
@@ -83,7 +83,7 @@ pub fn validate_json_schema(value: &Value, schema: &Value, path: &str) -> Vec<St
             }
         }
         if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
-            let mut extra: Vec<&str> = obj.keys().map(String::as_str).filter(|k| props.map_or(true, |p| !p.contains_key(*k))).collect();
+            let mut extra: Vec<&str> = obj.keys().map(String::as_str).filter(|k| props.is_none_or(|p| !p.contains_key(*k))).collect();
             extra.sort_unstable();
             if !extra.is_empty() {
                 errs.push(format!("{path}: additional properties not allowed ({})", extra.join(", ")));
@@ -105,11 +105,7 @@ pub fn check_json(text: &str, schema: &Value) -> (Option<String>, Vec<String>) {
         Err(e) => return (None, vec![format!("not JSON: {e}")]),
     };
     let errs = validate_json_schema(&value, schema, "$");
-    if errs.is_empty() {
-        (Some(value.to_string()), errs)
-    } else {
-        (None, errs)
-    }
+    if errs.is_empty() { (Some(value.to_string()), errs) } else { (None, errs) }
 }
 
 #[cfg(test)]

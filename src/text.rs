@@ -1,42 +1,5 @@
-//! Text helpers. Prompt sizes, description limits and the chars-per-token estimates count Unicode scalar values (what
-//! a user calls characters), never bytes, so a Portuguese prompt is not cut short. Also the one-line JSON style used
-//! in prompts.
-
-use std::io;
-
-use serde::Serialize;
-use serde_json::ser::{Formatter, Serializer};
-
-/// One-line JSON with a space after `:` and `,` (`{"name": "x", "arguments": {"a": 1}}`): the form the tool protocol
-/// shows the model, used for every JSON value written into a prompt (tool calls in the history, schemas).
-pub fn readable_json<T: Serialize + ?Sized>(value: &T) -> String {
-    struct Spaced;
-    impl Formatter for Spaced {
-        fn begin_array_value<W: ?Sized + io::Write>(&mut self, w: &mut W, first: bool) -> io::Result<()> {
-            if first {
-                Ok(())
-            } else {
-                w.write_all(b", ")
-            }
-        }
-        fn begin_object_key<W: ?Sized + io::Write>(&mut self, w: &mut W, first: bool) -> io::Result<()> {
-            if first {
-                Ok(())
-            } else {
-                w.write_all(b", ")
-            }
-        }
-        fn begin_object_value<W: ?Sized + io::Write>(&mut self, w: &mut W) -> io::Result<()> {
-            w.write_all(b": ")
-        }
-    }
-    let mut out = Vec::new();
-    let mut ser = Serializer::with_formatter(&mut out, Spaced);
-    match value.serialize(&mut ser) {
-        Ok(()) => String::from_utf8(out).unwrap_or_default(),
-        Err(_) => String::new(),
-    }
-}
+//! Character-based string helpers. Prompt sizes, description limits and the chars-per-token estimates count Unicode
+//! scalar values (what a user calls characters), never bytes, so a Portuguese prompt is not cut short.
 
 /// Number of characters.
 pub fn char_len(s: &str) -> usize {
@@ -61,11 +24,7 @@ pub fn skip_chars(s: &str, n: usize) -> &str {
 
 /// At most `n` characters, with an ellipsis when something was cut (descriptions in prompts).
 pub fn ellipsize(s: &str, n: usize) -> String {
-    if char_len(s) <= n {
-        s.to_string()
-    } else {
-        format!("{}…", prefix(s, n).trim_end())
-    }
+    if char_len(s) <= n { s.to_string() } else { format!("{}…", prefix(s, n).trim_end()) }
 }
 
 /// Byte offset of the character `n` characters before the end of `s` (for holding back a stop-sequence tail).
@@ -97,12 +56,5 @@ mod tests {
         assert_eq!(byte_offset_from_end("ab", 0), 2);
         assert_eq!(byte_offset_from_end("ab", 5), 0);
         assert_eq!(round1(2.25000001), 2.3);
-    }
-
-    #[test]
-    fn readable_json_spacing() {
-        let v = serde_json::json!({"name": "write", "arguments": {"path": "a b", "n": [1, 2.5, null], "s": "x, y: z"}});
-        assert_eq!(readable_json(&v), r#"{"name": "write", "arguments": {"path": "a b", "n": [1, 2.5, null], "s": "x, y: z"}}"#);
-        assert_eq!(readable_json(&serde_json::json!({})), "{}");
     }
 }

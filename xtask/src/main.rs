@@ -72,11 +72,7 @@ fn run_inherit(cmd: &str, args: &[&str], env: &[(&str, String)]) -> Result<(), S
         .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
         .status()
         .map_err(|e| format!("{cmd}: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("{cmd} {} failed ({status})", args.join(" ")))
-    }
+    if status.success() { Ok(()) } else { Err(format!("{cmd} {} failed ({status})", args.join(" "))) }
 }
 
 /// Recreate the stack from this checkout: the image is built locally (docker/compose.build.yml) and tagged with the

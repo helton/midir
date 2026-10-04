@@ -1,6 +1,6 @@
 //! A minimal OTLP/HTTP protobuf encoder: ExportTraceServiceRequest and ExportMetricsServiceRequest, exactly the
 //! messages and fields Midir exports (opentelemetry-proto v1). Hand-written wire format instead of the
-//! opentelemetry crates: a few hundred bytes of code, no code generation, and it builds on rustc 1.81.
+//! opentelemetry crates: a few hundred lines, no code generation, no runtime of its own.
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AttrValue {
@@ -95,9 +95,19 @@ pub fn key_values(b: &mut Buf, field: u32, attrs: &Attrs) {
     }
 }
 
+/// SpanKind values (opentelemetry-proto trace.proto).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanKind {
+    Internal = 1,
+    Server = 2,
+    Client = 3,
+}
+
 pub struct SpanData {
     pub trace_id: [u8; 16],
     pub span_id: [u8; 8],
+    pub parent_span_id: Option<[u8; 8]>,
+    pub kind: SpanKind,
     pub name: String,
     pub start_ns: u64,
     pub end_ns: u64,
@@ -119,8 +129,11 @@ pub fn encode_traces(resource: &Attrs, spans: &[SpanData]) -> Vec<u8> {
                 ss.message(2, |sp| {
                     sp.bytes(1, &s.trace_id);
                     sp.bytes(2, &s.span_id);
+                    if let Some(parent) = &s.parent_span_id {
+                        sp.bytes(4, parent);
+                    }
                     sp.string(5, &s.name);
-                    sp.uint(6, 1); // SPAN_KIND_INTERNAL
+                    sp.uint(6, s.kind as u64);
                     sp.fixed64(7, s.start_ns);
                     sp.fixed64(8, s.end_ns);
                     key_values(sp, 9, &s.attrs);
@@ -137,11 +150,28 @@ pub fn encode_traces(resource: &Attrs, spans: &[SpanData]) -> Vec<u8> {
     b.0
 }
 
+/// One cumulative data point of a sum: its attributes, since when it counts, and the value.
+pub struct SumPoint {
+    pub attrs: Attrs,
+    pub start_ns: u64,
+    pub value: i64,
+}
+
+/// One cumulative data point of a histogram.
+pub struct HistogramPoint {
+    pub attrs: Attrs,
+    pub start_ns: u64,
+    pub count: u64,
+    pub sum: f64,
+    /// one count per bucket, plus the overflow bucket
+    pub buckets: Vec<u64>,
+    pub min: f64,
+    pub max: f64,
+}
+
 pub enum Points {
-    /// Sum: (attrs, value) data points, monotonic or not, cumulative
-    Sum { monotonic: bool, points: Vec<(Attrs, i64)> },
-    /// Histogram: (attrs, count, sum, bucket counts, min, max), cumulative
-    Histogram { bounds: Vec<f64>, points: Vec<(Attrs, u64, f64, Vec<u64>, f64, f64)> },
+    Sum { monotonic: bool, points: Vec<SumPoint> },
+    Histogram { bounds: &'static [f64], points: Vec<HistogramPoint> },
 }
 
 pub struct MetricData {
@@ -151,7 +181,7 @@ pub struct MetricData {
     pub points: Points,
 }
 
-pub fn encode_metrics(resource: &Attrs, metrics: &[MetricData], start_ns: u64, now_ns: u64) -> Vec<u8> {
+pub fn encode_metrics(resource: &Attrs, metrics: &[MetricData], now_ns: u64) -> Vec<u8> {
     let mut b = Buf::default();
     b.message(1, |rm| {
         rm.message(1, |r| key_values(r, 1, resource));
@@ -164,29 +194,29 @@ pub fn encode_metrics(resource: &Attrs, metrics: &[MetricData], start_ns: u64, n
                     mb.string(3, m.unit);
                     match &m.points {
                         Points::Sum { monotonic, points } => mb.message(7, |sum| {
-                            for (attrs, v) in points {
+                            for p in points {
                                 sum.message(1, |dp| {
-                                    dp.fixed64(2, start_ns);
+                                    dp.fixed64(2, p.start_ns);
                                     dp.fixed64(3, now_ns);
-                                    dp.fixed64(6, *v as u64); // as_int (sfixed64)
-                                    key_values(dp, 7, attrs);
+                                    dp.fixed64(6, p.value as u64); // as_int (sfixed64)
+                                    key_values(dp, 7, &p.attrs);
                                 });
                             }
                             sum.uint(2, 2); // AGGREGATION_TEMPORALITY_CUMULATIVE
                             sum.bool(3, *monotonic);
                         }),
                         Points::Histogram { bounds, points } => mb.message(9, |h| {
-                            for (attrs, count, total, buckets, min, max) in points {
+                            for p in points {
                                 h.message(1, |dp| {
-                                    dp.fixed64(2, start_ns);
+                                    dp.fixed64(2, p.start_ns);
                                     dp.fixed64(3, now_ns);
-                                    dp.fixed64(4, *count);
-                                    dp.double(5, *total);
-                                    dp.packed_fixed64(6, buckets);
+                                    dp.fixed64(4, p.count);
+                                    dp.double(5, p.sum);
+                                    dp.packed_fixed64(6, &p.buckets);
                                     dp.packed_double(7, bounds);
-                                    key_values(dp, 9, attrs);
-                                    dp.double(11, *min);
-                                    dp.double(12, *max);
+                                    key_values(dp, 9, &p.attrs);
+                                    dp.double(11, p.min);
+                                    dp.double(12, p.max);
                                 });
                             }
                             h.uint(2, 2);

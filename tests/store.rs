@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, SystemTime};
 
 use common::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn create(rig: &Rig, body: Value) -> Resp {
     rig.http.post("/v1/responses", &body)
@@ -74,7 +74,7 @@ fn files_are_owner_only_and_blobs_shared() {
     let files = json_files(&d, "resp_");
     let blobs = json_files(&d.join("blobs"), "");
     assert_eq!(files.len(), 3);
-    assert_eq!(blobs.len(), 2); // one system blob, one tools blob for the whole chain
+    assert_eq!(blobs.len(), 3); // for the whole chain: the system prompt, the tools, and the tools as the client sent them
     assert_eq!(mode(&d), 0o700);
     for f in files.iter().chain(blobs.iter()) {
         assert_eq!(mode(f), 0o600, "{}", f.display());
@@ -178,4 +178,62 @@ fn memory_only_mode() {
     assert_eq!(r2.status, 200);
     assert!(rig.upstream.prompt(1).contains("q1"));
     assert!(!rig.server.workdir.join("data").exists() && !rig.server.store_dir().exists());
+}
+
+#[test]
+fn memory_grows_with_what_each_response_adds_not_with_the_conversation() {
+    // a response shares its history with the one it continues: along a chain the cache grows linearly
+    let rig = Rig::with(&MIDIR_TOML.replace("responses_dir = \"{responses_dir}\"", "responses_dir = \"\""), &[]);
+    let chunk = "x".repeat(10_000);
+    let mut prev: Option<String> = None;
+    let mut sizes = vec![];
+    for i in 0..60 {
+        rig.upstream.add("ok");
+        let mut body = json!({"model": "gpt-5.1", "input": format!("{i} {chunk}")});
+        if let Some(p) = &prev {
+            body["previous_response_id"] = json!(p);
+        }
+        prev = Some(s(&create(&rig, body).json()["id"]).to_string());
+        if i % 20 == 19 {
+            sizes.push(rig.http.get("/health").json()["responses_cache"]["bytes"].as_u64().unwrap());
+        }
+    }
+    let (a, b, c) = (sizes[0] as f64, sizes[1] as f64, sizes[2] as f64);
+    assert!((b - a) / a < 1.2 && (c - b) / a < 1.2, "{sizes:?}"); // each 20 steps add about the same
+    assert!(c < 60.0 * 10_000.0 * 1.5, "{sizes:?}"); // not 60 copies of a growing conversation
+}
+
+#[test]
+fn leftovers_and_unused_blobs_are_collected() {
+    let mut rig = Rig::with(&toml_with_server("responses_max_mb = 0.05"), &[]);
+    let ids = chain(&rig, 2);
+    let d = rig.server.store_dir();
+    let old = SystemTime::now() - Duration::from_secs(3600);
+    let tmp = d.join(format!("{}.tmp", ids[0]));
+    std::fs::write(&tmp, "{half").unwrap();
+    std::fs::File::options().write(true).open(&tmp).unwrap().set_modified(old).unwrap();
+    let unused = d.join("blobs").join(format!("{}.json", "f".repeat(32)));
+    std::fs::write(&unused, "z".repeat(60_000)).unwrap(); // above the cap on its own
+    std::fs::File::options().write(true).open(&unused).unwrap().set_modified(old).unwrap();
+    rig.restart(); // startup purges
+    assert!(!tmp.exists() && !unused.exists());
+    for id in &ids {
+        assert!(d.join(format!("{id}.json")).exists(), "{id}: the responses fit once the unused blob is gone");
+    }
+    rig.upstream.add("next");
+    assert_eq!(create(&rig, json!({"model": "gpt-5.1", "previous_response_id": ids[1], "input": "q"})).status, 200);
+}
+
+#[test]
+fn stored_text_is_the_same_streaming_or_not() {
+    let rig = Rig::new();
+    let text = format!("Before.\n{}", tool_call_text("read_file", json!({"path": "a.py"})));
+    rig.upstream.add(text.as_str()).add(text.as_str());
+    let plain = create(&rig, json!({"model": "gpt-5.1", "input": "x", "tools": resp_tools()})).json();
+    let streamed =
+        rig.http.post("/v1/responses", &json!({"model": "gpt-5.1", "input": "x", "tools": resp_tools(), "stream": true})).events();
+    let streamed_id = s(&streamed.last().unwrap().1["response"]["id"]).to_string();
+    let get = |id: &str| rig.http.get(&format!("/v1/responses/{id}")).json()["output"][0]["content"][0]["text"].clone();
+    assert_eq!(get(s(&plain["id"])), json!("Before."));
+    assert_eq!(get(&streamed_id), json!("Before."));
 }

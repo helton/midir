@@ -6,17 +6,21 @@ default_model = "gpt-5.1"   # model used when the requested one matches nothing 
 
 [server]
 port = 18880
-max_prompt_chars = 1000000   # oldest history turns are dropped above this (StackSpot rejects inputs above 272k tokens)
+max_prompt_chars = 1000000   # above this, oldest turns are dropped, then the largest tool results cut (StackSpot: 272k tokens max)
 tail_reminder = true         # one-line tool-protocol reminder after the last turn (fewer "announce and stop" replies)
 tool_desc_max = 0            # truncate tool descriptions to N chars (0 = off): ~12% fewer input tokens, alters what clients send
-keepalive_s = 15             # streams waiting for the backend's first content get an SSE keepalive this often (0 = off)
+keepalive_s = 15             # an idle stream gets an SSE keepalive this often (0 = off)
 responses_dir = "data/gateway/responses"   # previous_response_id store (one small file per response, owner-only); "" = memory only
 responses_retention_days = 30   # fixed from creation; purged hourly; a later previous_response_id to a purged response gets a 404
-responses_max_mb = 500          # above this, the oldest responses are removed first
+responses_max_mb = 500          # above this, blobs no response uses go first, then the oldest responses
+responses_memory_mb = 64        # memory cache of stored responses (least recently used out first; misses are read from disk)
+shutdown_grace_s = 25           # on SIGTERM, how long in-flight requests (streams) get to finish
+# api_key = "${MIDIR_API_KEY}"  # when set, clients must send it (Authorization: Bearer <key> or x-api-key); /health and /ready stay open
 
 [telemetry]
 # otlp_endpoint = "http://127.0.0.1:18884"   # unset = nothing exported, no cost; the compose overlay sets it by env
 service_name = "midir"
+prometheus = false                           # GET /metrics in Prometheus format, for setups without an OTLP collector
 
 # ---- backends: what serves the models (one today: StackSpot AI agents, docs/backends/stackspot.md) ----
 
@@ -25,13 +29,15 @@ type = "stackspot"
 realm = "${STACKSPOT_REALM}"
 client_id = "${STACKSPOT_CLIENT_ID}"
 client_secret = "${STACKSPOT_CLIENT_SECRET}"
-# ca_bundle = "/etc/ssl/certs/corporate-ca.pem"                      # corporate TLS interception
+# ca_bundle = "/etc/ssl/certs/corporate-ca.pem"                      # a CA the system store lacks (corporate TLS)
 # idm_base_url = "https://idm.stackspot.com"                        # only for local mocks and tests
 # agent_base_url = "https://genai-inference-app.stackspot.com/v1/agent"
 
 [backends.stackspot.limits]
 # In-memory queue in front of the backend (StackSpot allows 100 requests/minute per account, shared by every agent and
 # client). Requests wait here instead of failing with 429; every backend call counts (follow-ups and retries included).
+# The MIDIR_MAX_CONCURRENT / MIDIR_REQUESTS_PER_MINUTE / MIDIR_QUEUE_TIMEOUT / MIDIR_COOLDOWN_ON_429 variables override
+# these for every backend.
 max_concurrent = 8          # open backend calls at once
 requests_per_minute = 90    # request starts in any 60 s window; keep a margin below 100 (halved after a 429, recovers 1/min)
 queue_timeout_s = 600       # longest wait for a slot before answering 429 (background agents tolerate long waits)

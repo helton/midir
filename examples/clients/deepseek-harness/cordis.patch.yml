@@ -1,5 +1,5 @@
 # DeepSeek Harness (dsh) -> midir. Copy to $DSH_HOME/cordis.patch.yml (home-level patch, applies to every
-# profile) and export GATEWAY_API_KEY=gateway (any value). Pick the model with DSH_MODEL=gpt-5.1|gpt-4.1|flex.
+# profile) and export GATEWAY_API_KEY=gateway (any value, or Midir's MIDIR_API_KEY when it sets one). Pick the model with DSH_MODEL=gpt-5.1|gpt-4.1|flex.
 - id: llm-pi-ai
   config:
     providers:

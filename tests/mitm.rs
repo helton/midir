@@ -47,7 +47,7 @@ impl Mitm {
         let port_arg = port.to_string();
         let runner = match local_mitmdump() {
             Some(bin) => {
-                let confdir = tempfile::tempdir().unwrap().into_path();
+                let confdir = tempfile::tempdir().unwrap().keep();
                 // its own process group: the standalone build forks, and the whole group must go at the end
                 let child = Command::new(bin)
                     .args([

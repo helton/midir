@@ -1,5 +1,5 @@
-//! SSE keepalive while a stream waits for the backend's first content: comments (OpenAI) or pings (Anthropic) every
-//! keepalive_s, none once content flows, and streams that stay valid.
+//! SSE keepalive whenever a stream is idle for keepalive_s: comments (OpenAI) or pings (Anthropic) while the backend
+//! thinks and while a follow-up runs, none while content flows, and streams that stay valid.
 
 mod common;
 
@@ -18,7 +18,7 @@ fn split_at<'a>(text: &'a str, marker: &str) -> (&'a str, &'a str) {
 }
 
 #[test]
-fn chat_keepalive_before_content_only() {
+fn chat_keepalive_while_waiting_none_while_content_flows() {
     let rig = fast();
     rig.upstream.add(Reply::text("Hello there, this is the answer.").delay(SLOW));
     let r = rig.http.post("/v1/chat/completions", &json!({"model": "gpt-5.1", "messages": user("hi"), "stream": true}));
@@ -30,7 +30,7 @@ fn chat_keepalive_before_content_only() {
 }
 
 #[test]
-fn responses_keepalive_before_content_only() {
+fn responses_keepalive_while_waiting_none_while_content_flows() {
     let rig = fast();
     rig.upstream.add(Reply::text("Hello there.").delay(SLOW));
     let r = rig.http.post("/v1/responses", &json!({"model": "gpt-5.1", "input": "hi", "stream": true}));
@@ -40,7 +40,7 @@ fn responses_keepalive_before_content_only() {
 }
 
 #[test]
-fn messages_ping_before_content_only() {
+fn messages_ping_while_waiting_none_while_content_flows() {
     let rig = fast();
     rig.upstream.add(Reply::text("Hello there.").delay(SLOW));
     let r = rig.http.post("/v1/messages", &json!({"model": "gpt-5.1", "max_tokens": 50, "messages": user("hi"), "stream": true}));
@@ -91,11 +91,27 @@ fn keepalive_can_be_turned_off() {
 
 #[test]
 fn keepalives_arrive_while_waiting_not_at_the_end() {
-    // the first keepalive must reach the client long before the content (no buffering anywhere)
+    // the first keepalive must reach the client long before the content (no buffering anywhere); the margins are wide
+    // because test runners can be slow
     let rig = Rig::with(&toml_with_server("keepalive_s = 0.1"), &[]);
-    rig.upstream.add(Reply::text("Hello.").delay(1.0));
+    rig.upstream.add(Reply::text("Hello.").delay(2.0));
     let lines = rig.http.post_lines("/v1/chat/completions", &json!({"model": "gpt-5.1", "messages": user("hi"), "stream": true}));
     let first_keepalive = lines.iter().find(|(_, l)| l.starts_with(": keepalive")).map(|(t, _)| *t).unwrap();
     let first_content = lines.iter().find(|(_, l)| l.contains("Hello")).map(|(t, _)| *t).unwrap();
-    assert!(first_keepalive < 0.6 && first_content > 0.9, "keepalive at {first_keepalive}, content at {first_content}");
+    assert!(first_keepalive < 1.2 && first_content > 1.9, "keepalive at {first_keepalive}, content at {first_content}");
+}
+
+#[test]
+fn keepalives_continue_while_a_follow_up_runs() {
+    // the model announces an action and stops; the follow-up that asks for the call takes a while: the stream must
+    // stay alive after the first text too
+    let rig = fast();
+    rig.upstream.add("Vou ler o arquivo a.py agora.").add(Reply::text(&tool_call_text("read_file", json!({"path": "a.py"}))).delay(SLOW));
+    let r = rig
+        .http
+        .post("/v1/chat/completions", &json!({"model": "gpt-5.1", "messages": user("leia a.py"), "tools": chat_tools(), "stream": true}));
+    let (_, after) = split_at(&r.text, "Vou ler");
+    let (between, _) = split_at(after, "read_file");
+    assert!(between.matches(": keepalive").count() >= 2, "{between}");
+    assert_eq!(chat_stream_finish(&r.objects()), vec!["tool_calls"]);
 }

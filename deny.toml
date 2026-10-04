@@ -1,0 +1,30 @@
+# Dependency policy, checked in CI (cargo deny check): known vulnerabilities, accepted licenses, duplicate versions,
+# and where crates may come from.
+[graph]
+all-features = false
+
+[advisories]
+# every advisory (vulnerability, unmaintained, unsound, yanked) fails the check unless listed here with a reason
+ignore = []
+
+[licenses]
+# permissive licenses only (Midir is MIT)
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

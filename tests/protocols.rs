@@ -4,7 +4,7 @@
 mod common;
 
 use common::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn two_calls() -> String {
     format!(
@@ -75,10 +75,30 @@ fn chat_stream_usage_has_the_same_shape_as_non_stream() {
     let plain = rig.http.post("/v1/chat/completions", &body).json()["usage"].clone();
     let mut streamed = body.clone();
     streamed["stream"] = json!(true);
+    streamed["stream_options"] = json!({"include_usage": true});
     let objs = rig.http.post("/v1/chat/completions", &streamed).objects();
     let last = objs.iter().rev().find(|d| d["usage"].is_object()).unwrap();
     let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<std::collections::BTreeSet<_>>();
     assert_eq!(keys(&last["usage"]), keys(&plain));
+}
+
+#[test]
+fn chat_stream_usage_is_a_last_chunk_without_choices() {
+    // as OpenAI streams it: only with include_usage, every other chunk says "usage": null
+    let rig = Rig::new();
+    rig.upstream.add("hi");
+    let objs = rig
+        .http
+        .post(
+            "/v1/chat/completions",
+            &json!({"model": "gpt-5.1", "messages": messages(), "stream": true, "stream_options": {"include_usage": true}}),
+        )
+        .objects();
+    let (last, rest) = objs.split_last().unwrap();
+    assert_eq!(last["choices"], json!([]));
+    assert!(n(&last["usage"]["total_tokens"]) > 0);
+    assert!(rest.iter().all(|d| d["usage"].is_null() && d.as_object().unwrap().contains_key("usage")));
+    assert_eq!(chat_stream_finish(rest), vec!["stop"]);
 }
 
 #[test]
@@ -319,4 +339,99 @@ fn body_not_json_is_400() {
         let r = rig.http.post_raw(path, b"{not json", "application/json");
         assert_eq!(r.status, 400, "{path}");
     }
+}
+
+// ---------------------------------------------------------------- what the official APIs do that clients rely on
+
+#[test]
+fn a_stored_response_answers_the_same_later() {
+    // GET /v1/responses/{id}: the model asked for, the echoed settings and the same item ids
+    let rig = Rig::new();
+    rig.upstream.add(two_calls());
+    let r = rig
+        .http
+        .post(
+            "/v1/responses",
+            &json!({"model": "gpt-4.1", "input": "x", "instructions": "be brief", "tools": resp_tools(), "temperature": 0.2}),
+        )
+        .json();
+    let got = rig.http.get(&format!("/v1/responses/{}", s(&r["id"]))).json();
+    for key in ["model", "instructions", "temperature", "tools", "output", "usage", "status"] {
+        assert_eq!(got[key], r[key], "{key}");
+    }
+    assert_eq!(got["model"], "gpt-4.1");
+    assert_eq!(got["instructions"], "be brief");
+}
+
+#[test]
+fn responses_stream_cut_by_max_output_tokens_ends_incomplete() {
+    let rig = Rig::new();
+    rig.upstream.add("word ".repeat(100).as_str());
+    let evs = rig.http.post("/v1/responses", &json!({"model": "gpt-5.1", "input": "x", "max_output_tokens": 5, "stream": true})).events();
+    let (name, last) = evs.last().unwrap();
+    assert_eq!(name.as_deref(), Some("response.incomplete"));
+    assert_eq!(last["response"]["status"], "incomplete");
+    assert_eq!(last["response"]["incomplete_details"]["reason"], "max_output_tokens");
+}
+
+#[test]
+fn messages_stream_reports_input_tokens_from_the_start() {
+    // clients track context use from message_start (the real count follows in message_delta)
+    let rig = Rig::new();
+    rig.upstream.add("hi");
+    let r = rig.http.post("/v1/messages", &json!({"model": "gpt-5.1", "max_tokens": 9, "messages": messages(), "stream": true}));
+    assert!(r.header("request-id").is_some_and(|id| id.starts_with("msg_")));
+    let evs = r.events();
+    assert_eq!(evs[0].0.as_deref(), Some("message_start"));
+    assert!(n(&evs[0].1["message"]["usage"]["input_tokens"]) > 0, "{}", evs[0].1);
+}
+
+#[test]
+fn models_in_the_anthropic_format_for_anthropic_clients() {
+    let rig = Rig::new();
+    let headers = [("anthropic-version", "2023-06-01")];
+    let r = rig.http.get_with_headers("/v1/models", &headers).json();
+    assert_eq!(r["has_more"], false);
+    assert_eq!((r["first_id"].clone(), r["last_id"].clone()), (json!("gpt-5.1"), json!("flex")));
+    let first = &r["data"][0];
+    assert_eq!((first["type"].clone(), first["id"].clone()), (json!("model"), json!("gpt-5.1")));
+    assert!(s(&first["created_at"]).ends_with('Z') && first["display_name"].is_string());
+    let one = rig.http.get_with_headers("/v1/models/claude-opus-4-5", &headers).json();
+    assert_eq!((one["type"].clone(), one["id"].clone()), (json!("model"), json!("claude-opus-4-5")));
+    assert_eq!(rig.http.get("/v1/models").json()["object"], "list"); // OpenAI clients get the OpenAI format
+}
+
+#[test]
+fn item_references_resolve_to_stored_output_items() {
+    let rig = Rig::new();
+    rig.upstream.add(tool_call_text("read_file", json!({"path": "a.py"}))).add("It prints 1.");
+    let r1 = rig.http.post("/v1/responses", &json!({"model": "gpt-5.1", "input": "what does a.py print?", "tools": resp_tools()})).json();
+    let call = r1["output"].as_array().unwrap().last().unwrap().clone();
+    let input = json!([
+        {"role": "user", "content": "what does a.py print?"},
+        {"type": "item_reference", "id": call["id"]},
+        {"type": "function_call_output", "call_id": call["call_id"], "output": "print(1)"},
+    ]);
+    let r2 = rig.http.post("/v1/responses", &json!({"model": "gpt-5.1", "input": input, "tools": resp_tools()}));
+    assert_eq!(r2.status, 200, "{}", r2.text);
+    let p = rig.upstream.prompt(1);
+    assert!(p.contains(&format!("<tool_call id=\"{}\">", s(&call["call_id"]))) && p.contains("print(1)"), "{p}");
+    let bad = rig.http.post("/v1/responses", &json!({"model": "gpt-5.1", "input": [{"type": "item_reference", "id": "msg_nope"}]}));
+    assert_eq!(bad.status, 400);
+    assert!(bad.text.contains("item_reference"), "{}", bad.text);
+}
+
+#[test]
+fn a_call_keeps_its_id_whatever_text_comes_around_it() {
+    // text, call, text: the call is the response's call 0 when streamed, stored and referenced
+    let rig = Rig::new();
+    rig.upstream.add(format!("Before.\n{}\nAfter the call.", tool_call_text("read_file", json!({"path": "a.py"})))).add("ok");
+    let evs = rig.http.post("/v1/responses", &json!({"model": "gpt-5.1", "input": "x", "tools": resp_tools(), "stream": true})).events();
+    let done = evs.last().unwrap().1["response"].clone();
+    let streamed_call = done["output"].as_array().unwrap().iter().find(|o| o["type"] == "function_call").unwrap().clone();
+    let got = rig.http.get(&format!("/v1/responses/{}", s(&done["id"]))).json();
+    let stored_call = got["output"].as_array().unwrap().iter().find(|o| o["type"] == "function_call").unwrap().clone();
+    assert_eq!(streamed_call["id"], stored_call["id"]);
+    let input = json!([{"type": "item_reference", "id": streamed_call["id"]}, {"type": "function_call_output", "call_id": streamed_call["call_id"], "output": "print(1)"}]);
+    assert_eq!(rig.http.post("/v1/responses", &json!({"model": "gpt-5.1", "input": input, "tools": resp_tools()})).status, 200);
 }

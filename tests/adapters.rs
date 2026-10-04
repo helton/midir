@@ -4,7 +4,7 @@
 mod common;
 
 use common::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn chat_prompt(rig: &Rig, body: Value) -> String {
     rig.upstream.clear();
@@ -252,4 +252,100 @@ fn anthropic_text_block_after_tool_result_stays_after() {
     );
     let (b, r, a) = (p.find("BEFORE").unwrap(), p.find("RESULT").unwrap(), p.find("AFTER").unwrap());
     assert!(b < r && r < a, "{p}");
+}
+
+// ---------------------------------------------------------------- what JSON encoders write
+
+/// `\uXXXX` escape text, built at run time.
+fn esc(hex: &str) -> String {
+    format!("{}u{hex}", char::from(92u8))
+}
+
+#[test]
+fn lone_utf16_surrogates_do_not_break_the_conversation() {
+    // Node's JSON.stringify writes half an emoji (a string cut in the middle of one) as a lone surrogate escape; once
+    // such a tool result is in the history, every later request of the session carries it
+    let rig = Rig::new();
+    let cases = [
+        format!("tests passed {}", esc("d83c")),         // lone high surrogate
+        format!("{} after", esc("df89")),                // lone low surrogate
+        format!("party {}{}", esc("d83c"), esc("df89")), // a valid pair
+    ];
+    for text in &cases {
+        let chat = format!(r#"{{"model":"m","messages":[{{"role":"user","content":"{text}"}}]}}"#);
+        let responses = format!(r#"{{"model":"m","input":"{text}","store":false}}"#);
+        let messages =
+            format!(r#"{{"model":"m","max_tokens":9,"messages":[{{"role":"user","content":[{{"type":"text","text":"{text}"}}]}}]}}"#);
+        for (path, body) in [("/v1/chat/completions", chat), ("/v1/responses", responses), ("/v1/messages", messages)] {
+            rig.upstream.clear();
+            rig.upstream.add("ok");
+            let r = rig.http.post_raw(path, body.as_bytes(), "application/json");
+            assert_eq!(r.status, 200, "{path} {text}: {}", r.text);
+            let p = rig.upstream.prompt(0);
+            if text.contains(&esc("df89")) && text.contains(&esc("d83c")) {
+                assert!(p.contains('🎉'), "{p}");
+            } else {
+                assert!(p.contains(char::REPLACEMENT_CHARACTER), "{path}: {p}");
+            }
+        }
+    }
+    // an escaped backslash followed by "ud83c" is text, not an escape
+    let text = format!("{0}{0}ud83c", char::from(92u8));
+    rig.upstream.clear();
+    rig.upstream.add("ok");
+    let body = format!(r#"{{"model":"m","messages":[{{"role":"user","content":"{text}"}}]}}"#);
+    assert_eq!(rig.http.post_raw("/v1/chat/completions", body.as_bytes(), "application/json").status, 200);
+    assert!(rig.upstream.prompt(0).contains(r"\ud83c"));
+}
+
+#[test]
+fn non_standard_number_literals_are_null() {
+    // Python's json.dumps writes NaN and Infinity unless told not to
+    let rig = Rig::new();
+    rig.upstream.add("ok");
+    let body = br#"{"model":"m","temperature":NaN,"messages":[{"role":"user","content":"x"}],"top_p":Infinity}"#;
+    assert_eq!(rig.http.post_raw("/v1/chat/completions", body, "application/json").status, 200);
+}
+
+#[test]
+fn big_numbers_keep_their_digits() {
+    let rig = Rig::new();
+    rig.upstream.add("ok");
+    let body = r#"{"model":"m","messages":[{"role":"user","content":"x"},{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{\"id\": 123456789012345678901234567890, \"ratio\": 0.10}"}}]},{"role":"tool","tool_call_id":"c1","content":"r"}]}"#;
+    assert_eq!(rig.http.post_raw("/v1/chat/completions", body.as_bytes(), "application/json").status, 200);
+    let p = rig.upstream.prompt(0);
+    assert!(p.contains(r#""arguments": {"id": 123456789012345678901234567890, "ratio": 0.10}"#), "{p}");
+}
+
+#[test]
+fn a_named_tool_choice_must_name_a_declared_tool() {
+    let rig = Rig::new();
+    let cases = [
+        (
+            "/v1/chat/completions",
+            json!({"model": "m", "messages": user("x"), "tools": chat_tools(), "tool_choice": {"type": "function", "function": {"name": "nope"}}}),
+        ),
+        ("/v1/responses", json!({"model": "m", "input": "x", "tools": resp_tools(), "tool_choice": {"type": "function", "name": "nope"}})),
+        (
+            "/v1/messages",
+            json!({"model": "m", "max_tokens": 9, "messages": user("x"), "tools": anth_tools(), "tool_choice": {"type": "tool", "name": "nope"}}),
+        ),
+    ];
+    for (path, body) in cases {
+        let r = rig.http.post(path, &body);
+        assert_eq!(r.status, 400, "{path}: {}", r.text);
+        assert!(r.text.contains("nope"), "{}", r.text);
+    }
+    assert!(rig.upstream.calls().is_empty());
+}
+
+#[test]
+fn null_lists_are_absent_lists() {
+    // some clients send "tools": null or "tool_calls": null instead of leaving the field out
+    let rig = Rig::new();
+    let p = chat_prompt(
+        &rig,
+        json!({"model": "m", "tools": null, "functions": null, "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "a", "tool_calls": null}, {"role": "user", "content": "b"}]}),
+    );
+    assert!(p.contains("[assistant]: a"), "{p}");
 }

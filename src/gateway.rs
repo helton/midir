@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use indexmap::IndexMap;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
-use crate::backends::{create_backend, StackSpotBackend};
+use crate::backends::{TextBackend, create_backend};
 use crate::config::{Config, ConfigError, ModelSpec};
 use crate::emulation::engine::EmulationEngine;
 use crate::errors::Error;
@@ -16,7 +16,7 @@ use crate::text::prefix;
 pub struct Gateway {
     pub config: Arc<Config>,
     pub telemetry: Arc<Telemetry>,
-    pub backends: IndexMap<String, Arc<StackSpotBackend>>,
+    pub backends: IndexMap<String, Arc<dyn TextBackend>>,
     pub runners: IndexMap<String, Arc<EmulationEngine>>,
     pub store: Arc<ResponseStore>,
 }
@@ -27,9 +27,13 @@ impl Gateway {
         for (name, s) in &config.backends {
             backends.insert(name.clone(), create_backend(s, &config.env, telemetry.clone(), config.server.retry_backoff_s)?);
         }
-        let runners = backends.iter().map(|(n, b)| (n.clone(), Arc::new(EmulationEngine::new(b.clone(), config.clone())))).collect();
+        let runners = backends
+            .iter()
+            .map(|(n, b)| (n.clone(), Arc::new(EmulationEngine::new(b.clone(), telemetry.clone(), config.clone()))))
+            .collect();
         let s = &config.server;
-        let store = Arc::new(ResponseStore::new(s.responses_dir.clone(), s.responses_retention_days, s.responses_max_mb));
+        let store =
+            Arc::new(ResponseStore::new(s.responses_dir.clone(), s.responses_retention_days, s.responses_max_mb, s.responses_memory_mb));
         Ok(Gateway { config, telemetry, backends, runners, store })
     }
 
@@ -55,7 +59,7 @@ impl Gateway {
         (spec, runner)
     }
 
-    pub fn backend_of(&self, name: &str) -> Option<&Arc<StackSpotBackend>> {
+    pub fn backend_of(&self, name: &str) -> Option<&Arc<dyn TextBackend>> {
         self.backends.get(name)
     }
 

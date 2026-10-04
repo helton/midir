@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 use regex::Regex;
-use serde::de::{self, Deserializer};
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde::de::{self, Deserializer, MapAccess, Visitor};
+use serde_json::{Map, Value, json};
 
 use crate::text::char_len;
 
@@ -75,12 +75,20 @@ pub struct ServerSettings {
     pub responses_max_mb: f64,
     pub keepalive_s: f64,
     pub retry_backoff_s: f64,
+    /// memory budget of the Responses cache (misses are rebuilt from disk)
+    pub responses_memory_mb: f64,
+    /// how long a stop waits for in-flight requests (streams) to finish
+    pub shutdown_grace_s: f64,
+    /// when set, every endpoint but /health and /ready requires it
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct TelemetrySettings {
     pub otlp_endpoint: String,
     pub service_name: String,
+    /// serve the metrics at /metrics (Prometheus text)
+    pub prometheus: bool,
 }
 
 /// Invalid configuration: the process stops with this message.
@@ -116,38 +124,30 @@ pub fn environment() -> IndexMap<String, String> {
 // the file, as written (numbers and booleans may also be strings, so `${NAME}` works everywhere)
 // ---------------------------------------------------------------------------------------------------------------------
 
-/// A number, or a string holding one (after `${NAME}` expansion).
-fn num<'de, D: Deserializer<'de>, T: FromStr + Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error>
+/// A number, or a string holding one (after `${NAME}` expansion). Read as a JSON value first: the number's own
+/// digits are parsed, whatever its JSON type.
+fn num<'de, D: Deserializer<'de>, T: FromStr>(d: D) -> Result<Option<T>, D::Error>
 where
     T::Err: std::fmt::Display,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum NumOrStr<T> {
-        Num(T),
-        Str(String),
-    }
-    match Option::<NumOrStr<T>>::deserialize(d)? {
-        None => Ok(None),
-        Some(NumOrStr::Num(n)) => Ok(Some(n)),
-        Some(NumOrStr::Str(s)) if s.trim().is_empty() => Ok(None),
-        Some(NumOrStr::Str(s)) => s.trim().parse().map(Some).map_err(|e| de::Error::custom(format!("{s:?} is not a number ({e})"))),
-    }
+    let text = match Option::<Value>::deserialize(d)? {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::String(s)) if s.trim().is_empty() => return Ok(None),
+        Some(Value::String(s)) => s.trim().to_string(),
+        Some(other) => return Err(de::Error::custom(format!("expected a number, got {other}"))),
+    };
+    text.parse().map(Some).map_err(|e| de::Error::custom(format!("{text:?} is not a valid number here ({e})")))
 }
 
 /// A boolean, or a string holding one (true/false, 1/0, yes/no, on/off).
 fn flag<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum BoolOrStr {
-        Bool(bool),
-        Str(String),
-    }
-    match Option::<BoolOrStr>::deserialize(d)? {
-        None => Ok(None),
-        Some(BoolOrStr::Bool(b)) => Ok(Some(b)),
-        Some(BoolOrStr::Str(s)) if s.trim().is_empty() => Ok(None),
-        Some(BoolOrStr::Str(s)) => parse_flag(&s).map(Some).ok_or_else(|| de::Error::custom(format!("{s:?} is not a boolean"))),
+    match Option::<Value>::deserialize(d)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(b)),
+        Some(Value::String(s)) if s.trim().is_empty() => Ok(None),
+        Some(Value::String(s)) => parse_flag(&s).map(Some).ok_or_else(|| de::Error::custom(format!("{s:?} is not a boolean"))),
+        Some(other) => Err(de::Error::custom(format!("expected a boolean, got {other}"))),
     }
 }
 
@@ -189,6 +189,11 @@ struct ServerFile {
     keepalive_s: Option<f64>,
     #[serde(deserialize_with = "num")]
     retry_backoff_s: Option<f64>,
+    #[serde(deserialize_with = "num")]
+    responses_memory_mb: Option<f64>,
+    #[serde(deserialize_with = "num")]
+    shutdown_grace_s: Option<f64>,
+    api_key: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -196,6 +201,8 @@ struct ServerFile {
 struct TelemetryFile {
     otlp_endpoint: Option<String>,
     service_name: Option<String>,
+    #[serde(deserialize_with = "flag")]
+    prometheus: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -211,14 +218,39 @@ struct LimitsFile {
     cooldown_on_429_s: Option<f64>,
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
+/// `type`, `limits`, and the backend's own options (whatever other keys the table has).
+#[derive(Default)]
 struct BackendFile {
-    #[serde(rename = "type")]
     type_: Option<String>,
     limits: LimitsFile,
-    #[serde(flatten)]
     options: Map<String, Value>,
+}
+
+impl<'de> Deserialize<'de> for BackendFile {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = BackendFile;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a backend table")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<BackendFile, A::Error> {
+                let mut b = BackendFile::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "type" => b.type_ = map.next_value()?,
+                        "limits" => b.limits = map.next_value()?,
+                        _ => {
+                            let v: Value = map.next_value()?;
+                            b.options.insert(key, v);
+                        }
+                    }
+                }
+                Ok(b)
+            }
+        }
+        d.deserialize_map(V)
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -264,10 +296,17 @@ impl Config {
         } else {
             json!({})
         };
-        let file: FileConfig = serde_path_to_error::deserialize(raw).map_err(|e| {
+        let mut unknown: Vec<String> = vec![];
+        let file: FileConfig = serde_path_to_error::deserialize(serde_ignored::Deserializer::new(raw, &mut |path: serde_ignored::Path| {
+            unknown.push(path.to_string())
+        }))
+        .map_err(|e| {
             let path = e.path().to_string();
             ConfigError(format!("{file_name}: {}{}", if path == "." { String::new() } else { format!("{path}: ") }, e.inner()))
         })?;
+        for key in unknown {
+            tracing::warn!("{file_name}: unknown setting {key:?} ignored (a typo? see config/midir.example.toml)");
+        }
         let lookup = EnvLookup(&env);
         let server = server_settings(&file.server, &lookup, &root)?;
         let telemetry = TelemetrySettings {
@@ -282,6 +321,7 @@ impl Config {
                 .or(file.telemetry.service_name)
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "midir".into()),
+            prometheus: lookup.flag("MIDIR_PROMETHEUS")?.or(file.telemetry.prometheus).unwrap_or(false),
         };
         let backends = backend_settings(file.backends, &lookup)?;
         let mut cfg = Config {
@@ -413,14 +453,10 @@ impl Config {
     }
 
     pub fn exposed_models(&self) -> Vec<Arc<ModelSpec>> {
-        if self.models.is_empty() {
-            vec![self.default.clone()]
-        } else {
-            self.models.clone()
-        }
+        if self.models.is_empty() { vec![self.default.clone()] } else { self.models.clone() }
     }
 
-    /// (max_prompt_chars, tail_reminder, tool_desc_max) for a model: its own values, else [server]'s.
+    /// (max_prompt_chars, tail_reminder, tool_desc_max) for a model: its own values, else `[server]`'s.
     pub fn knobs(&self, spec: Option<&ModelSpec>) -> (i64, bool, i64) {
         let s = &self.server;
         let Some(spec) = spec else { return (s.max_prompt_chars, s.tail_reminder, s.tool_desc_max) };
@@ -476,9 +512,14 @@ fn server_settings(f: &ServerFile, env: &EnvLookup, root: &Path) -> R<ServerSett
         responses_max_mb: env.parse("MIDIR_RESPONSES_MAX_MB")?.or(f.responses_max_mb).unwrap_or(500.0),
         keepalive_s: env.parse("MIDIR_KEEPALIVE_S")?.or(f.keepalive_s).unwrap_or(15.0),
         retry_backoff_s: env.parse("MIDIR_RETRY_BACKOFF_S")?.or(f.retry_backoff_s).unwrap_or(1.0),
+        responses_memory_mb: env.parse("MIDIR_RESPONSES_MEMORY_MB")?.or(f.responses_memory_mb).unwrap_or(64.0),
+        shutdown_grace_s: env.parse("MIDIR_SHUTDOWN_GRACE_S")?.or(f.shutdown_grace_s).unwrap_or(25.0),
+        api_key: env.str("MIDIR_API_KEY").or_else(|| f.api_key.clone()).map(|k| k.trim().to_string()).filter(|k| !k.is_empty()),
     })
 }
 
+/// The backends. CAVEAT: the MIDIR_MAX_CONCURRENT / MIDIR_REQUESTS_PER_MINUTE / MIDIR_QUEUE_TIMEOUT /
+/// MIDIR_COOLDOWN_ON_429 overrides apply to every backend.
 fn backend_settings(raw: IndexMap<String, BackendFile>, env: &EnvLookup) -> R<IndexMap<String, BackendSettings>> {
     let raw = if raw.is_empty() { IndexMap::from([("stackspot".to_string(), BackendFile::default())]) } else { raw };
     let mut out = IndexMap::new();
@@ -593,6 +634,34 @@ mod tests {
         assert_eq!(model_name("GPT_5_1"), "gpt-5.1");
         assert_eq!(model_name("GPT_4_1_MINI"), "gpt-4.1-mini");
         assert_eq!(model_name("O3_MINI"), "o3-mini");
+    }
+
+    #[test]
+    fn numbers_flags_and_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("midir.toml");
+        let toml = "[server]\nkeepalive_s = 0.05\nresponses_max_mb = \"12\"\ntail_reminder = \"off\"\nrespones_dir = \"x\"\n\n[backends.stackspot]\nrealm = \"r\"\n[backends.stackspot.limits]\nrequests_per_minut = 5\nmax_concurrent = 3\n\n[[models]]\nname = \"m\"\ntarget = \"T\"\nmax_prompt_chars = 1000.0\n";
+        std::fs::write(&file, toml).unwrap();
+        let err = Config::load_file(IndexMap::new(), file.clone(), dir.path().into()).err().unwrap();
+        assert!(err.0.contains("models[0].max_prompt_chars") || err.0.contains("max_prompt_chars"), "{}", err.0);
+        std::fs::write(&file, toml.replace("1000.0", "1000")).unwrap();
+        let cfg = Config::load_file(IndexMap::new(), file, dir.path().into()).unwrap();
+        assert_eq!((cfg.server.keepalive_s, cfg.server.responses_max_mb, cfg.server.tail_reminder), (0.05, 12.0, false));
+        assert_eq!(cfg.backends["stackspot"].limits.max_concurrent, 3);
+        assert_eq!(cfg.backends["stackspot"].options["realm"], "r");
+        assert_eq!(cfg.models[0].max_prompt_chars, Some(1000));
+    }
+
+    #[test]
+    fn per_model_knobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("midir.toml");
+        let toml = "[server]\nmax_prompt_chars = 5000\ntool_desc_max = 80\n[backends.stackspot]\n[[models]]\nname = \"a\"\ntarget = \"A\"\nmax_prompt_chars = 100\ntail_reminder = false\n[[models]]\nname = \"b\"\ntarget = \"B\"\nmax_prompt_chars = 0\n";
+        std::fs::write(&file, toml).unwrap();
+        let cfg = Config::load_file(IndexMap::new(), file, dir.path().into()).unwrap();
+        assert_eq!(cfg.knobs(Some(&cfg.resolve("a"))), (100, false, 80));
+        assert_eq!(cfg.knobs(Some(&cfg.resolve("b"))), (5000, true, 80)); // 0 means the server's cap
+        assert_eq!(cfg.knobs(None), (5000, true, 80));
     }
 
     #[test]

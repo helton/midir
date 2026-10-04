@@ -238,3 +238,78 @@ fn unwritable_store_directory_falls_back_to_memory() {
     assert_eq!(second.status, 200);
     assert!(rig.server.logs().contains("kept in memory only"));
 }
+
+// ---------------------------------------------------------------- operation
+
+#[test]
+fn unknown_settings_are_reported() {
+    let toml = MIDIR_TOML
+        .replace("[server]", "[server]\nrequests_per_minut = 5")
+        .replace("max_concurrent = 4", "max_concurrent = 4\ncooldown = 1");
+    let toml = toml.replace("client_secret = \"secret\"", "client_secret = \"secret\"\nclient_secert = \"typo\"");
+    let rig = Rig::with(&toml, &[]);
+    let log = rig.server.logs();
+    for key in ["server.requests_per_minut", "backends.stackspot.limits.cooldown", "\"client_secert\""] {
+        assert!(log.contains(key), "{key}: {log}");
+    }
+}
+
+#[test]
+fn an_api_key_guards_everything_but_health() {
+    let rig = Rig::with(MIDIR_TOML, &[("MIDIR_API_KEY", "s3cret")]);
+    rig.upstream.add("ok").add("ok");
+    let body = json!({"model": "gpt-5.1", "messages": user("hi")});
+    let none = rig.http.post("/v1/chat/completions", &body);
+    assert_eq!(none.status, 401);
+    assert_eq!(none.json()["error"]["code"], "invalid_api_key");
+    assert_eq!(rig.http.post_with_headers("/v1/chat/completions", &body, &[("authorization", "Bearer nope")]).status, 401);
+    assert_eq!(rig.http.post_with_headers("/v1/chat/completions", &body, &[("authorization", "Bearer s3cret")]).status, 200);
+    let anthropic = json!({"model": "gpt-5.1", "max_tokens": 9, "messages": user("hi")});
+    let r = rig.http.post("/v1/messages", &anthropic);
+    assert_eq!((r.status, r.json()["error"]["type"].clone()), (401, json!("authentication_error")));
+    assert_eq!(rig.http.post_with_headers("/v1/messages", &anthropic, &[("x-api-key", "s3cret")]).status, 200);
+    assert_eq!(rig.http.get("/health").status, 200);
+    assert_eq!(rig.http.get("/v1/models").status, 401);
+    assert!(rig.upstream.calls().len() == 2 && !rig.server.logs().contains("s3cret"));
+}
+
+#[test]
+fn a_stop_lets_running_streams_finish() {
+    let mut rig = Rig::new();
+    rig.upstream.add(Reply::text("slow but complete").delay(1.5));
+    let http = Http::new(&rig.server.url);
+    let request =
+        std::thread::spawn(move || http.post("/v1/chat/completions", &json!({"model": "gpt-5.1", "messages": user("hi"), "stream": true})));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    rig.server.stop(); // SIGTERM while the backend is still thinking
+    let r = request.join().unwrap();
+    assert_eq!(chat_stream_text(&r.objects()), "slow but complete");
+    assert!(r.text.trim_end().ends_with("data: [DONE]"));
+}
+
+#[test]
+fn json_logs_on_request() {
+    let rig = Rig::with(MIDIR_TOML, &[("MIDIR_LOG_FORMAT", "json")]);
+    rig.upstream.add("ok");
+    rig.http.post("/v1/chat/completions", &json!({"model": "gpt-5.1", "messages": user("hi")}));
+    let log = rig.server.logs();
+    let lines: Vec<&str> = log.lines().filter(|l| l.starts_with('{')).collect();
+    assert!(lines.len() >= 3, "{log}");
+    for l in lines {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        assert!(v["fields"]["message"].is_string() && v["level"].is_string(), "{l}");
+    }
+}
+
+#[test]
+fn the_key_may_come_in_either_header_and_healthcheck_reads_string_ports() {
+    let rig = Rig::with(MIDIR_TOML, &[("MIDIR_API_KEY", "s3cret")]);
+    rig.upstream.add("ok");
+    let body = json!({"model": "gpt-5.1", "max_tokens": 9, "messages": user("hi")});
+    // an SDK configured with both a token and a key sends both
+    let r = rig.http.post_with_headers("/v1/messages", &body, &[("authorization", "Bearer other"), ("x-api-key", "s3cret")]);
+    assert_eq!(r.status, 200, "{}", r.text);
+    let port = rig.server.port.to_string();
+    let toml = "[server]\nport = \"${HC_PORT}\"\n";
+    assert!(run(&["--healthcheck"], Some(toml), &[("HC_PORT", port.as_str())]).status.success());
+}

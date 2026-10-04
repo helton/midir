@@ -1,0 +1,5 @@
+# The toolchain for this repository (rustup reads it): CI and the image build use the same version.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

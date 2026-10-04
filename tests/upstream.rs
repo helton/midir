@@ -3,7 +3,7 @@
 mod common;
 
 use common::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn rate() -> Value {
     json!({"type": "TooManyRequests", "code": "INFERENCE_3008_CHAT_RATE_LIMIT_EXCEEDED", "details": "Maximum number of requests reached."})
@@ -139,7 +139,7 @@ fn retry_backoff_follows_the_configured_base() {
     rig.upstream.set_default(Reply::status(500, json!({"message": "boom"})));
     let t0 = std::time::Instant::now();
     assert_eq!(chat(&rig).status, 502);
-    assert!(t0.elapsed().as_secs_f64() < 2.0);
+    assert!(t0.elapsed().as_secs_f64() < 5.0); // the default base would wait 1 + 2 + 4 s
     assert_eq!(rig.upstream.calls().len(), 4);
 }
 
@@ -268,4 +268,17 @@ fn health_reports_queue_state() {
     for key in ["in_flight", "waiting", "starts_last_60s", "paused_s", "requests_per_minute", "effective_rpm"] {
         assert!(q.get(key).is_some(), "{key}");
     }
+}
+
+#[test]
+fn an_event_with_a_lone_surrogate_keeps_its_text() {
+    let rig = Rig::new();
+    let lone = format!("{{\"message\": \"ok {}u{}\"}}", char::from(92u8), "d83c");
+    rig.upstream.add(Reply::events(vec![
+        json!(lone),
+        json!({"message": " done"}),
+        json!({"stop_reason": "stop", "tokens": {"input": 3, "output": 2}}),
+    ]));
+    let r = chat(&rig);
+    assert_eq!(r.json()["choices"][0]["message"]["content"], format!("ok {} done", char::REPLACEMENT_CHARACTER));
 }

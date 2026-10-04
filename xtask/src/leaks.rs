@@ -73,9 +73,5 @@ pub fn run() -> Result<(), String> {
     for h in &hits {
         println!("  {h}");
     }
-    if hits.is_empty() {
-        Ok(())
-    } else {
-        Err("possible leaks found".into())
-    }
+    if hits.is_empty() { Ok(()) } else { Err("possible leaks found".into()) }
 }

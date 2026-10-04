@@ -1,20 +1,24 @@
 # Midir container image (published to ghcr.io by .github/workflows; build context: repository root).
 # Two stages: a static musl build of the binary (rust:alpine targets <arch>-unknown-linux-musl natively, so each
 # platform is built on its own architecture), and a `scratch` image with only the binary, CA certificates, time zone
-# data and an owner-writable /app: about 7 MB, 3 MB to download. No shell and no libc: the HEALTHCHECK runs
+# data and an owner-writable /app: about 12 MB, 5 MB to download. No shell and no libc: the HEALTHCHECK runs
 # `midir --healthcheck`. Runtime files come from the working directory /app: .env values arrive as environment
 # variables (compose env_file) and config/midir.toml as a compose config.
 
-FROM rust:1.81-alpine AS build
-RUN apk add --no-cache musl-dev ca-certificates tzdata
+FROM rust:1.99.0-alpine AS build
+# make: jemalloc (the allocator) is built from source
+RUN apk add --no-cache musl-dev make ca-certificates tzdata
 WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 # the workspace's other member (repository tasks): only its manifest is read, nothing of it is built
 COPY xtask ./xtask
+# jemalloc fixes its page size at build time: on arm64, 64 KiB covers kernels with 4, 16 or 64 KiB pages (Raspberry Pi
+# 5, Asahi, ARM servers); the build machine's 4 KiB would abort at startup on those
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked --package midir && cp target/release/midir /midir \
+    if [ "$(uname -m)" = "aarch64" ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi \
+ && cargo build --release --locked --package midir && cp target/release/midir /midir \
  && mkdir -p /rootfs/app/config /rootfs/app/data /rootfs/tmp
 
 FROM scratch

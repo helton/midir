@@ -1,19 +1,21 @@
 //! Which build is running: a release, a development snapshot, a local image or a source build.
 //!
 //! Images get MIDIR_BUILD_CHANNEL, MIDIR_BUILD_COMMIT and MIDIR_BUILD_DATE baked in at build time (docker/Dockerfile,
-//! from the workflows or the poe deploy tasks); a binary built in a git checkout carries the commit (build.rs). Only a
+//! from the workflows or `cargo xtask deploy`); a binary built in a git checkout carries the commit (build.rs). Only a
 //! release reports the bare version; everything else carries semver build metadata, so a snapshot is never mistaken
 //! for the release it came after:
 //!
-//!     release   0.1.0
-//!     dev       0.1.0+dev.a817822              image built from develop
-//!     local     0.1.0+local.a817822.dirty      image built on this machine (".dirty": uncommitted changes)
-//!     source    0.1.0+src.a817822              `cargo build` in a git checkout
-//!     unknown   0.1.0+unknown                  anything else
+//! ```text
+//! release   0.1.0
+//! dev       0.1.0+dev.a817822              image built from develop
+//! local     0.1.0+local.a817822.dirty      image built on this machine (".dirty": uncommitted changes)
+//! source    0.1.0+src.a817822              `cargo build` in a git checkout
+//! unknown   0.1.0+unknown                  anything else
+//! ```
 
 use std::sync::OnceLock;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

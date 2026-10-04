@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::text::prefix;
 
@@ -39,11 +39,7 @@ impl BackendError {
 
     /// The status the client gets: the backend's own for the ones clients handle, 502 for everything else.
     pub fn http_status(&self) -> u16 {
-        if matches!(self.status, 400 | 401 | 403 | 404 | 429) {
-            self.status
-        } else {
-            502
-        }
+        if matches!(self.status, 400 | 401 | 403 | 404 | 429) { self.status } else { 502 }
     }
 
     fn body_text(&self) -> String {
@@ -159,7 +155,8 @@ impl fmt::Display for NetError {
 #[derive(Debug, Clone)]
 pub enum Error {
     Client(ClientError),
-    Backend(BackendError),
+    /// boxed: the backend's body makes it the largest variant, and errors travel through every request path
+    Backend(Box<BackendError>),
     Net(NetError),
     /// A bug or an unexpected state inside Midir (500 / "midir internal error" mid-stream).
     Internal(String),
@@ -173,7 +170,7 @@ impl From<ClientError> for Error {
 
 impl From<BackendError> for Error {
     fn from(e: BackendError) -> Self {
-        Error::Backend(e)
+        Error::Backend(Box::new(e))
     }
 }
 

@@ -56,10 +56,10 @@ What the gateway relies on, measured against the live API (2026-09/10):
 
 | Item | Value |
 |---|---|
-| Token | `POST https://idm.stackspot.com/{realm}/oidc/oauth/token`, client credentials; valid 20 minutes (renewed 60 s before expiry; a 401 from the agent forces one renewal) |
+| Token | `POST https://idm.stackspot.com/{realm}/oidc/oauth/token`, client credentials; valid 20 minutes (renewed 60 s before expiry; a 401 from the agent forces one renewal; the call gives up after 30 s) |
 | Chat | `POST https://genai-inference-app.stackspot.com/v1/agent/{agent_id}/chat`, body `{"streaming": true, "user_prompt": ..., "stackspot_knowledge": false, "return_ks_in_response": false}` |
 | Stream | SSE; deltas carry only `message`; a final event carries `stop_reason`, `message_id` and `tokens` (`input`, `output`) |
-| Input limit | 272,000 tokens: above it, `400 INFERENCE_6001_LLM_MODEL_BAD_REQUEST` ("Your messages resulted in N tokens"), never 413. The gateway caps prompts at 1M characters and, on that error, retries once with a proportionally smaller prompt |
+| Input limit | 272,000 tokens: above it, `400 INFERENCE_6001_LLM_MODEL_BAD_REQUEST` ("Your messages resulted in N tokens"), never 413. The gateway caps prompts at 1M characters (oldest turns dropped, then the largest tool results cut in the middle) and, on that error, retries once with a proportionally smaller prompt |
 | Rate limit | 100 requests per minute per account (realm + client id), shared by every agent: `429 INFERENCE_3008_CHAT_RATE_LIMIT_EXCEEDED`, no `Retry-After` |
 | Output tokens | GPT 5.x counts its reasoning as output (a one-word answer costs 20-40 tokens; 1 on GPT 4.1) |
 | Latency | time to first byte 1.5-2 s for small prompts; 4-8 s with 30-40k-token prompts on GPT 5.1, about 2 s on GPT 4.1 |

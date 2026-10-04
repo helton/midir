@@ -4,7 +4,8 @@ OpenAI Chat Completions (`/v1/chat/completions`), streaming. Validated with `@de
 three models (file edits, shell, tests, commits).
 
 1. Copy `cordis.patch.yml` (this folder) to `$DSH_HOME` (default `~/.dsh`).
-2. `export GATEWAY_API_KEY=gateway` (any value) and, optionally, `DSH_MODEL=gpt-4.1` or `flex`.
+2. `export GATEWAY_API_KEY=gateway` (any value, or Midir's `MIDIR_API_KEY` when it sets one) and, optionally,
+   `DSH_MODEL=gpt-4.1` or `flex`.
 3. Run `dsh`, or one-shot: `dsh --profile headless --json "<task>"`.
 
 Privacy: dsh sends telemetry and session logs to DeepSeek by default. The patch disables the session-log upload; for

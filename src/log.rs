@@ -1,6 +1,8 @@
-//! Logging: `tracing` events printed to stderr as `HH:MM:SS LEVEL target: message` in local time. `--debug` adds the
-//! DEBUG level (which includes the full rendered prompts).
+//! Logging: `tracing` events on stderr as `HH:MM:SS LEVEL target: message` in local time, or one JSON object per line
+//! with `MIDIR_LOG_FORMAT=json`. The level is INFO; `--debug` adds Midir's DEBUG events (which include the full
+//! rendered prompts); `MIDIR_LOG` takes a filter (`info,midir::store=debug`) and wins over both.
 
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
 
@@ -20,6 +22,17 @@ impl FormatTime for LocalClock {
 }
 
 pub fn init(debug: bool) {
-    let level = if debug { tracing::Level::DEBUG } else { tracing::Level::INFO };
-    tracing_subscriber::fmt().with_max_level(level).with_timer(LocalClock).with_ansi(false).with_writer(std::io::stderr).init();
+    let default = if debug { "info,midir=debug" } else { "info" };
+    let filter = std::env::var("MIDIR_LOG")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .and_then(|v| EnvFilter::try_new(v.trim()).map_err(|e| eprintln!("warning: MIDIR_LOG: {e}; using {default:?}")).ok())
+        .unwrap_or_else(|| EnvFilter::new(default));
+    let json = std::env::var("MIDIR_LOG_FORMAT").is_ok_and(|v| v.trim().eq_ignore_ascii_case("json"));
+    let logs = tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(std::io::stderr);
+    if json {
+        logs.json().init();
+    } else {
+        logs.with_timer(LocalClock).init();
+    }
 }

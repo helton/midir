@@ -14,13 +14,13 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
-use axum::Router;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub const MIDIR_TOML: &str = r#"
 default_model = "gpt-5.1"
@@ -364,6 +364,7 @@ pub struct Server {
     pub workdir: PathBuf,
     extra_env: Vec<(String, String)>,
     child: Option<Child>,
+    retries: u32,
     _dir: tempfile::TempDir,
 }
 
@@ -381,6 +382,7 @@ impl Server {
             workdir,
             extra_env: extra_env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             child: None,
+            retries: 0,
             _dir: dir,
         };
         server.spawn();
@@ -404,9 +406,20 @@ impl Server {
         let client = reqwest::blocking::Client::builder().timeout(Duration::from_millis(500)).build().unwrap();
         while Instant::now() < deadline {
             if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
+                // free_port() can race with another test that got the same port: take another one
+                if self.logs().contains("cannot listen") && self.retries < 3 {
+                    self.retries += 1;
+                    self.port = free_port();
+                    self.url = format!("http://127.0.0.1:{}", self.port);
+                    return self.spawn();
+                }
                 panic!("midir exited with {status}:\n{}", self.logs());
             }
-            if client.get(format!("{}/health", self.url)).send().map(|r| r.status().as_u16() == 200).unwrap_or(false) {
+            // another test's server may hold the same port (free_port races): only our own config counts
+            let ours = self.workdir.join("config").join("midir.toml").to_string_lossy().into_owned();
+            let health = client.get(format!("{}/health", self.url)).send().ok().filter(|r| r.status().as_u16() == 200);
+            let body = health.and_then(|r| r.text().ok()).and_then(|t| serde_json::from_str::<Value>(&t).ok());
+            if body.is_some_and(|h| h["config"] == ours.as_str()) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -428,17 +441,17 @@ impl Server {
 
     /// SIGTERM, then wait: everything pending (telemetry) must be flushed.
     pub fn stop(&mut self) {
-        if let Some(mut child) = self.child.take() {
+        if let Some(mut child) = self.child.take()
+            && child.try_wait().unwrap().is_none()
+        {
+            unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             if child.try_wait().unwrap().is_none() {
-                unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
-                let deadline = Instant::now() + Duration::from_secs(8);
-                while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                if child.try_wait().unwrap().is_none() {
-                    child.kill().ok();
-                    child.wait().ok();
-                }
+                child.kill().ok();
+                child.wait().ok();
             }
         }
     }
@@ -519,6 +532,13 @@ impl Http {
     }
     pub fn get(&self, path: &str) -> Resp {
         Self::wrap(self.client.get(format!("{}{path}", self.base)).send())
+    }
+    pub fn get_with_headers(&self, path: &str, headers: &[(&str, &str)]) -> Resp {
+        let mut req = self.client.get(format!("{}{path}", self.base));
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        Self::wrap(req.send())
     }
     /// A streaming POST read line by line: (seconds since the request, line) for every line of the body.
     pub fn post_lines(&self, path: &str, body: &Value) -> Vec<(f64, String)> {

@@ -10,16 +10,16 @@
 mod common;
 
 use common::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn first_tool(body: &Value) -> Option<String> {
     for t in body["tools"].as_array().into_iter().flatten() {
         let name = t["name"].as_str().or_else(|| t["function"]["name"].as_str());
         let kind = t["type"].as_str().unwrap_or("function");
-        if let Some(name) = name {
-            if matches!(kind, "function" | "custom") || t.get("input_schema").is_some() {
-                return Some(name.to_string());
-            }
+        if let Some(name) = name
+            && (matches!(kind, "function" | "custom") || t.get("input_schema").is_some())
+        {
+            return Some(name.to_string());
         }
     }
     None

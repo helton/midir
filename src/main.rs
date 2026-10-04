@@ -1,22 +1,6 @@
 //! midir: OpenAI- and Anthropic-compatible gateway for LLM backends.
-//! Command line: arguments, the startup banner, .env, configuration, and the server with a graceful stop that flushes
-//! telemetry (SIGTERM).
-
-mod app;
-mod backends;
-mod buildinfo;
-mod canonical;
-mod config;
-mod emulation;
-mod errors;
-mod gateway;
-mod limiter;
-mod log;
-mod otlp;
-mod protocols;
-mod store;
-mod telemetry;
-mod text;
+//! Command line: arguments, the startup banner, .env, configuration, and the server with a graceful stop (SIGTERM):
+//! no new connections, in-flight requests finish (up to shutdown_grace_s), then telemetry is flushed.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -24,9 +8,16 @@ use std::process::ExitCode;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use axum::serve::ListenerExt;
 use clap::Parser;
+use midir::{app, buildinfo, config, gateway, log, telemetry};
 use tower::Layer;
 use tower_http::normalize_path::NormalizePathLayer;
+
+/// jemalloc: the request path allocates many short-lived buffers from many threads, where the system allocators
+/// (musl's above all, in the static image) contend.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 const ABOUT: &str = "Midir: OpenAI- and Anthropic-compatible gateway for LLM backends.";
 
@@ -38,18 +29,22 @@ const DETAILS: &str = "Endpoints (http://<host>:<port>)
   POST /v1/messages/count_tokens  Anthropic count_tokens (estimate)
   GET  /v1/models                 configured models (unknown names go to the default model)
   GET  /health, GET /ready        liveness (mapping, queues) and readiness (backend credentials and network)
+  GET  /metrics                   Prometheus metrics (with [telemetry] prometheus = true)
 
 Configuration: config/midir.toml under the working directory (or MIDIR_CONFIG=<path>); format in
 config/midir.example.toml. Secrets live in .env (working directory) and are referenced as ${NAME}. Environment
-variables win over the file: MIDIR_PORT, MIDIR_MAX_PROMPT_CHARS, MIDIR_TAIL_REMINDER, MIDIR_TOOL_DESC_MAX,
-MIDIR_RESPONSES_DIR, MIDIR_RESPONSES_RETENTION_DAYS, MIDIR_RESPONSES_MAX_MB, MIDIR_KEEPALIVE_S, MIDIR_RETRY_BACKOFF_S,
-MIDIR_MAX_CONCURRENT, MIDIR_REQUESTS_PER_MINUTE, MIDIR_QUEUE_TIMEOUT, MIDIR_COOLDOWN_ON_429,
-OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME, and per backend (StackSpot): STACKSPOT_REALM, STACKSPOT_CLIENT_ID,
-STACKSPOT_CLIENT_SECRET, STACKSPOT_CA_BUNDLE. Without [[models]], STACKSPOT_DEFAULT_AGENT_ID and
+variables win over the file: MIDIR_PORT, MIDIR_API_KEY, MIDIR_MAX_PROMPT_CHARS, MIDIR_TAIL_REMINDER,
+MIDIR_TOOL_DESC_MAX, MIDIR_RESPONSES_DIR, MIDIR_RESPONSES_RETENTION_DAYS, MIDIR_RESPONSES_MAX_MB,
+MIDIR_RESPONSES_MEMORY_MB, MIDIR_KEEPALIVE_S, MIDIR_RETRY_BACKOFF_S, MIDIR_SHUTDOWN_GRACE_S, MIDIR_PROMETHEUS,
+OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME; for every backend, MIDIR_MAX_CONCURRENT, MIDIR_REQUESTS_PER_MINUTE,
+MIDIR_QUEUE_TIMEOUT and MIDIR_COOLDOWN_ON_429; for every StackSpot backend, STACKSPOT_REALM, STACKSPOT_CLIENT_ID,
+STACKSPOT_CLIENT_SECRET, STACKSPOT_CA_BUNDLE, STACKSPOT_IDM_BASE_URL and STACKSPOT_AGENT_BASE_URL (a second StackSpot
+account goes in its [backends.<name>] options, with these unset). Without [[models]], STACKSPOT_DEFAULT_AGENT_ID and
 STACKSPOT_<MODEL>_AGENT_ID define the models (STACKSPOT_GPT_5_1_AGENT_ID -> model \"gpt-5.1\").
-MIDIR_NO_BANNER=1 skips the startup banner.
+Logs: MIDIR_LOG=<filter> (e.g. info,midir::store=debug), MIDIR_LOG_FORMAT=json. MIDIR_NO_BANNER=1 skips the banner.
 
-No authentication: local use only. Do not expose it on a network without something in front of it.";
+Without MIDIR_API_KEY there is no authentication: keep the port local, or set a key and give it to the clients
+(Authorization: Bearer <key> or x-api-key: <key>).";
 
 /// `--version` shows the full build identity (release, snapshot, local image or source build).
 fn version() -> &'static str {
@@ -103,10 +98,10 @@ fn print_banner() {
 /// Variables from `.env` in the working directory; the environment wins over the file.
 fn load_dotenv(dir: &Path) {
     let path = dir.join(".env");
-    if path.is_file() {
-        if let Err(e) = dotenvy::from_path(&path) {
-            eprintln!("warning: {}: {e}", path.display());
-        }
+    if path.is_file()
+        && let Err(e) = dotenvy::from_path(&path)
+    {
+        eprintln!("warning: {}: {e}", path.display());
     }
 }
 
@@ -120,7 +115,12 @@ fn healthcheck(args: &Args, cwd: &Path) -> ExitCode {
             .map(PathBuf::from)
             .unwrap_or_else(|| cwd.join("config").join("midir.toml"));
         let t: toml::Table = std::fs::read_to_string(file).ok()?.parse().ok()?;
-        u16::try_from(t.get("server")?.get("port")?.as_integer()?).ok()
+        match t.get("server")?.get("port")? {
+            toml::Value::Integer(n) => u16::try_from(*n).ok(),
+            // a string, as the configuration allows: "18880" or "${PORT}"
+            toml::Value::String(s) => config::expand_str(s, &config::environment()).trim().parse().ok(),
+            _ => None,
+        }
     });
     let port = port.unwrap_or(18880);
     let probe = || -> std::io::Result<bool> {
@@ -132,15 +132,11 @@ fn healthcheck(args: &Args, cwd: &Path) -> ExitCode {
         s.read_to_string(&mut buf)?;
         Ok(buf.starts_with("HTTP/1.1 200") || buf.starts_with("HTTP/1.0 200"))
     };
-    if probe().unwrap_or(false) {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    if probe().unwrap_or(false) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 async fn shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
         return std::future::pending().await;
     };
@@ -157,10 +153,10 @@ fn main() -> ExitCode {
     if args.healthcheck {
         return healthcheck(&args, &cwd);
     }
+    load_dotenv(&cwd); // before the banner and the log, which read MIDIR_NO_BANNER, MIDIR_LOG and MIDIR_LOG_FORMAT
     print_banner();
     log::init(args.debug);
     tracing::info!("midir v{} starting", buildinfo::full_version());
-    load_dotenv(&cwd);
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(r) => r,
         Err(e) => {
@@ -179,7 +175,7 @@ async fn run(args: Args, cwd: PathBuf) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let tel = Arc::new(telemetry::Telemetry::new(&cfg.telemetry.otlp_endpoint, &cfg.telemetry.service_name));
+    let tel = Arc::new(telemetry::Telemetry::new(&cfg.telemetry.otlp_endpoint, &cfg.telemetry.service_name, cfg.telemetry.prometheus));
     let gw = match gateway::Gateway::new(cfg.clone(), tel.clone()).and_then(|g| g.validate().map(|_| g)) {
         Ok(g) => Arc::new(g),
         Err(e) => {
@@ -195,7 +191,7 @@ async fn run(args: Args, cwd: PathBuf) -> ExitCode {
             format!("{}->{}:{}", m.name, m.backend, gw.backends.get(&m.backend).map_or(m.target.clone(), |b| b.describe_target(&m.target)))
         })
         .collect();
-    let backends: Vec<String> = gw.backends.iter().map(|(n, b)| format!("{n} ({})", b.type_)).collect();
+    let backends: Vec<String> = gw.backends.iter().map(|(n, b)| format!("{n} ({})", b.kind())).collect();
     tracing::info!(
         "midir {} at http://{}:{port}/v1 (chat/completions, responses, messages); config {}; backends {}; default {}; models: {} (max prompt {} chars)",
         buildinfo::full_version(),
@@ -229,17 +225,29 @@ async fn run(args: Args, cwd: PathBuf) -> ExitCode {
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
         let make = axum::ServiceExt::<axum::extract::Request>::into_make_service(service);
+        let listener = listener.tap_io(|tcp| {
+            let _ = tcp.set_nodelay(true);
+        });
         let _ = axum::serve(listener, make)
-            .tcp_nodelay(true)
             .with_graceful_shutdown(async move {
                 let _ = stop_rx.await;
             })
             .await;
     });
+    if cfg.server.api_key.is_none() && !args.host.starts_with("127.") && args.host != "localhost" && args.host != "::1" {
+        // in a container this is the usual case (compose publishes the port on 127.0.0.1 only): information, not alarm
+        tracing::info!(
+            "no API key (MIDIR_API_KEY): whoever reaches {}:{port} can use the backend account; keep the port private",
+            args.host
+        );
+    }
     shutdown_signal().await;
-    tracing::info!("shutting down");
+    let grace = cfg.server.shutdown_grace_s.max(0.0);
+    tracing::info!("shutting down: no new connections; in-flight requests get up to {grace}s to finish");
     let _ = stop_tx.send(());
-    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+    if tokio::time::timeout(Duration::from_secs_f64(grace), server).await.is_err() {
+        tracing::warn!("shutdown grace period ({grace}s) over: cutting the requests still running");
+    }
     tel.shutdown().await; // flush pending spans and metrics on a graceful stop (SIGTERM)
     ExitCode::SUCCESS
 }

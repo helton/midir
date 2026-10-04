@@ -5,7 +5,7 @@
    `chatLanguageModels.json`; paste the contents of the file in this folder: one provider (`apiType: responses`) with the models `gpt-5.1`, `gpt-4.1`
    and `flex`. To use another API type, change `apiType` for the whole provider (`chat-completions` or `messages`);
    Responses is recommended because its telemetry has a stable session id (`prompt_cache_key`).
-   Any value works as the API key: Midir ignores it.
+   Any value works as the API key (Midir ignores it), unless Midir sets `MIDIR_API_KEY`: then use that key.
 3. Keep `url` as the prefix `http://localhost:18880/v1`; VS Code appends `/responses` (or `/chat/completions`, `/messages`)
    according to `apiType`.
 4. `vision: false` and `thinking: false` are deliberate (text-only API; reasoning is not exposed).

@@ -1,13 +1,14 @@
-//! Runs canonical requests on a text-only backend: renders the prompt, streams the backend's
-//! text through the tool-call parser and the output limiter, and makes the automatic follow-ups (invalid tool JSON,
-//! announce-and-stop, false incapacity, tool_choice retry, JSON-mode repair).
+//! Runs canonical requests on a text-only backend: renders the prompt, streams the backend's text through the
+//! tool-call parser and the output limiter, and makes the automatic follow-ups (invalid tool JSON, forced tool choice,
+//! false incapacity, announce-and-stop, JSON-mode repair). Each follow-up is a function that returns the request to
+//! send, or None.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use serde_json::json;
 
 use super::followups;
@@ -15,16 +16,24 @@ use super::jsonmode::check_json;
 use super::output::OutputLimiter;
 use super::parser::{Parsed, ToolCallParser};
 use super::prompt::render_prompt;
-use crate::backends::{Completion, Item, StackSpotBackend};
-use crate::canonical::{estimate_tokens, CanonicalRequest, CanonicalResponse, Event, Finish, ToolCall, ToolChoice, Usage, CHARS_PER_TOKEN};
+use crate::backends::{Completion, Item, TextBackend};
+use crate::canonical::{CHARS_PER_TOKEN, CanonicalRequest, CanonicalResponse, Event, Finish, ToolCall, ToolChoice, Usage, estimate_tokens};
 use crate::config::Config;
 use crate::errors::Error;
+use crate::json;
+use crate::telemetry::Telemetry;
 use crate::text::{char_len, prefix};
 
 pub type EventStream = BoxStream<'static, Result<Event, Error>>;
 
+/// Follow-ups that ask for tool calls (forced tool choice, false incapacity, announce-and-stop): at most this many per
+/// turn; a second one only when the first reply announced again without acting.
+const MAX_ACT_FOLLOWUPS: usize = 2;
+static NAME_KEY_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#""name"\s*:"#).unwrap());
+
 pub struct EmulationEngine {
-    pub backend: Arc<StackSpotBackend>,
+    pub backend: Arc<dyn TextBackend>,
+    telemetry: Arc<Telemetry>,
     config: Arc<Config>,
     /// target -> prompt cap learned from an input-too-long refusal
     learned_max_chars: Mutex<HashMap<String, i64>>,
@@ -35,9 +44,176 @@ fn add_usage(a: &Usage, b: Option<Usage>) -> Usage {
     b.map_or(*a, |b| a.add(&b))
 }
 
+/// A follow-up call: the request, the suffix of its log id ("repair", "act", ...) and what it asks.
+struct FollowUp {
+    req: CanonicalRequest,
+    suffix: String,
+    prompt: String,
+}
+
+/// What a reply produced so far: its text (as streamed to the client), its tool calls and how it ended.
+#[derive(Default)]
+struct Reply {
+    text: String,
+    calls: Vec<ToolCall>,
+    resp: CanonicalResponse,
+}
+
+/// The invalid-JSON repair: one follow-up that asks for the broken call(s) only.
+fn repair_request(req: &CanonicalRequest, reply: &Reply) -> Option<FollowUp> {
+    let rejected = &reply.resp.rejected_calls;
+    if rejected.is_empty() || !req.tools_on() || !matches!(reply.resp.finish, Finish::Stop | Finish::ToolCalls) {
+        return None;
+    }
+    let mut follow = req.derive();
+    follow.add("assistant", &reply.text, reply.calls.clone(), vec![]);
+    let bad: Vec<String> = rejected.iter().map(|b| format!("<tool_call>\n{b}\n</tool_call>")).collect();
+    let mut ask = format!(
+        "These {} <tool_call> block(s) could not be parsed as JSON, so they were not executed:\n{}\nRe-emit only these call(s) as valid JSON, with the same tool and the same intended values (file contents and commands unchanged). Reply with the <tool_call> block(s) only.",
+        rejected.len(),
+        bad.join("\n")
+    );
+    if !reply.calls.is_empty() {
+        let done: Vec<String> = reply.calls.iter().map(|c| format!("{} {}", c.name, followups::call_target(c))).collect();
+        ask.push_str(&format!(" Do not repeat the calls that already went through ({}).", prefix(&done.join("; "), 500)));
+    }
+    follow.add_text("user", &ask);
+    Some(FollowUp { req: follow, suffix: "repair".into(), prompt: ask })
+}
+
+/// Which calls of a repair reply to keep: not a re-emission of a call that already went through (unless the broken
+/// block targeted the same thing, a second edit of the same file), and no more than were asked for.
+struct RepairFilter {
+    seen: HashSet<(String, String)>,
+    exact: HashSet<(String, String)>,
+    rejected_text: String,
+    wanted: usize,
+    kept: usize,
+    dropped: usize,
+}
+
+impl RepairFilter {
+    fn new(calls: &[ToolCall], rejected: &[String]) -> Self {
+        // a broken block may hold several calls: one per "name" key in it, at least one per block
+        let wanted = rejected.iter().map(|b| NAME_KEY_RE.find_iter(b).count().max(1)).sum();
+        RepairFilter {
+            seen: calls.iter().map(followups::call_key).collect(),
+            exact: calls.iter().map(|c| (c.name.clone(), json::sorted(&c.arguments))).collect(),
+            rejected_text: rejected.join("\n"),
+            wanted,
+            kept: 0,
+            dropped: 0,
+        }
+    }
+
+    fn accept(&mut self, c: &ToolCall) -> bool {
+        let key = followups::call_key(c);
+        let target = key.1.split_once('=').map_or(key.1.as_str(), |(_, t)| t);
+        let quoted = json!(target).to_string();
+        let as_in_json = &quoted[1..quoted.len() - 1];
+        let dup = self.exact.contains(&(c.name.clone(), json::sorted(&c.arguments)))
+            || (self.seen.contains(&key) && !self.rejected_text.contains(as_in_json));
+        if dup || self.kept >= self.wanted {
+            self.dropped += 1;
+            return false;
+        }
+        self.seen.insert(key);
+        self.kept += 1;
+        true
+    }
+}
+
+/// The follow-up that asks for tool calls the reply should have made, if any: a forced tool choice with no call, a
+/// denied ability a tool provides, or an announced action without its call. `round` > 0 asks again after a follow-up
+/// whose reply still announced without acting.
+fn act_request(req: &CanonicalRequest, reply: &Reply, history: &[(String, String)], round: usize) -> Option<FollowUp> {
+    if !reply.calls.is_empty() || !req.tools_on() || reply.resp.finish != Finish::Stop {
+        return None;
+    }
+    let again = if round > 0 { format!("{}", round + 1) } else { String::new() };
+    let (suffix, prompt, keep_max_tokens) = if req.tool_choice.forced() && req.json_schema.is_none() {
+        // CAVEAT: tool_choice required/named is a prompt instruction; the model ignored it
+        tracing::warn!("tool_choice={} but no tool call; asking again", req.tool_choice);
+        ("retry", "You did not call a tool. You MUST respond with a <tool_call> block now, and nothing else.".to_string(), true)
+    } else if let tools @ [_, ..] = followups::false_incapacity(req, &reply.resp, &reply.text, &reply.calls).as_slice() {
+        // CAVEAT: the model denied having web/file/shell access although a listed tool provides it
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        let names = prefix(&names.join(", "), 300).to_string();
+        tracing::warn!("response denies an ability that a tool provides ({}); requesting the call", prefix(&names, 80));
+        (
+            "ability",
+            format!(
+                "You do have that ability through your tools ({names}). Use the appropriate tool now: reply with the <tool_call> block(s) only, inferring the URL or path if the user did not give one."
+            ),
+            false,
+        )
+    } else if followups::promise_only(req, &reply.resp, &reply.text, &reply.calls) {
+        // CAVEAT: the model announced an action and stopped without a <tool_call>
+        let confirm = followups::redundant_confirmation(req, &reply.text);
+        let note = confirm.map_or(String::new(), |c| format!(" [asked to confirm '{c}', already requested]"));
+        tracing::warn!("response only announces an action without a tool call; requesting the calls{note}");
+        let prompt = match confirm {
+            Some(c) => format!("The request already asks for this ({c}); do not ask for confirmation. Do it now, and only that: reply with the <tool_call> block(s) only."),
+            None => "You announced an action but emitted no <tool_call>. Do it now: reply with the <tool_call> block(s) for what you just announced, and nothing else.".to_string(),
+        };
+        ("act", prompt, false)
+    } else if followups::forgotten_commit(req, &reply.resp, &reply.text, &reply.calls) {
+        // CAVEAT: the final report claims the work done, but the commit the user ordered was never made
+        tracing::warn!("response reports the work done without the commit the request orders; requesting it");
+        (
+            "commit",
+            "The request also asks for a commit, and none was made. Make it now: reply with the <tool_call> block(s) only.".to_string(),
+            false,
+        )
+    } else {
+        return None;
+    };
+    let mut follow = if keep_max_tokens { CanonicalRequest { max_tokens: req.max_tokens, ..req.derive() } } else { req.derive() };
+    for (assistant, user) in history {
+        follow.add_text("assistant", assistant);
+        follow.add_text("user", user);
+    }
+    follow.add_text("assistant", &reply.text);
+    follow.add_text("user", &prompt);
+    Some(FollowUp { req: follow, suffix: format!("{suffix}{again}"), prompt })
+}
+
+/// `parallel_tool_calls: false`: the first call goes through, later ones are dropped (and counted).
+struct CallGate {
+    one: bool,
+    passed: usize,
+    dropped: usize,
+}
+
+impl CallGate {
+    fn new(req: &CanonicalRequest) -> Self {
+        CallGate { one: !req.parallel_tool_calls, passed: 0, dropped: 0 }
+    }
+
+    /// Whether another call would go through.
+    fn open(&self) -> bool {
+        !(self.one && self.passed > 0)
+    }
+
+    fn pass(&mut self) -> bool {
+        if !self.open() {
+            self.dropped += 1;
+            return false;
+        }
+        self.passed += 1;
+        true
+    }
+}
+
 impl EmulationEngine {
-    pub fn new(backend: Arc<StackSpotBackend>, config: Arc<Config>) -> Self {
-        EmulationEngine { backend, config, learned_max_chars: Mutex::new(HashMap::new()), ignored_seen: Mutex::new(HashSet::new()) }
+    pub fn new(backend: Arc<dyn TextBackend>, telemetry: Arc<Telemetry>, config: Arc<Config>) -> Self {
+        EmulationEngine {
+            backend,
+            telemetry,
+            config,
+            learned_max_chars: Mutex::new(HashMap::new()),
+            ignored_seen: Mutex::new(HashSet::new()),
+        }
     }
 
     /// Parameters accepted without effect: reported once per client and set of parameters at INFO, then at DEBUG.
@@ -55,7 +231,8 @@ impl EmulationEngine {
         tracing::info!("{rid} accepted parameters without effect: {} (client {client}; reported once per client)", req.ignored.join(", "));
     }
 
-    /// Event stream. JSON mode is fully buffered (CAVEAT: no incremental streaming) so it can be validated and repaired.
+    /// The event stream of one request: the first backend call streamed to the client, then the follow-ups' tool calls.
+    /// JSON mode is fully buffered (CAVEAT: no incremental streaming) so it can be validated and repaired.
     pub fn run(self: &Arc<Self>, req: Arc<CanonicalRequest>, rid: String) -> EventStream {
         let this = self.clone();
         Box::pin(async_stream::try_stream! {
@@ -63,211 +240,188 @@ impl EmulationEngine {
                 this.report_ignored(&req, &rid);
             }
             if req.json_schema.is_some() {
-                let resp = this.json_mode(&req, &rid).await?;
-                if !resp.text.is_empty() {
-                    yield Event::Text(resp.text.clone());
+                let mut s = this.json_mode(req.clone(), rid.clone());
+                while let Some(ev) = s.next().await {
+                    yield ev?;
                 }
-                yield Event::Done(resp);
                 return;
             }
-            let mut text_ = String::new();
-            let mut calls: Vec<ToolCall> = vec![];
-            let mut final_: Option<CanonicalResponse> = None;
+            let mut gate = CallGate::new(&req);
+            let mut reply = Reply::default();
             {
                 let mut s = this.stream_once(req.clone(), rid.clone());
                 while let Some(ev) = s.next().await {
                     match ev? {
                         Event::Done(r) => {
-                            final_ = Some(r);
+                            reply.resp = r;
                             break;
                         }
                         Event::Text(t) => {
-                            text_.push_str(&t);
+                            reply.text.push_str(&t);
                             yield Event::Text(t);
                         }
                         Event::ToolCall(c) => {
-                            calls.push(c.clone());
-                            yield Event::ToolCall(c);
+                            if gate.pass() {
+                                reply.calls.push(c.clone());
+                                yield Event::ToolCall(c);
+                            }
                         }
+                        e @ Event::Prompt { .. } => yield e,
                         Event::Keepalive => {}
                     }
                 }
             }
-            let mut resp = final_.unwrap_or_default();
-            if !resp.rejected_calls.is_empty() && req.tools_on() && matches!(resp.finish, Finish::Stop | Finish::ToolCalls) {
+            reply.resp.tool_calls.clone_from(&reply.calls);
+            if let Some(follow) = repair_request(&req, &reply).filter(|_| gate.open()) {
                 // CAVEAT: a <tool_call> had JSON that could not be decoded; one follow-up asks for only the broken call(s)
-                tracing::warn!("{rid} {} tool call(s) with invalid JSON; asking for corrected calls (1 follow-up)", resp.rejected_calls.len());
+                tracing::warn!("{rid} {} tool call(s) with invalid JSON; asking for corrected calls (1 follow-up)", reply.resp.rejected_calls.len());
                 req.meta().followups += 1;
-                let mut follow = req.derive();
-                follow.add("assistant", &text_, calls.clone(), vec![]);
-                let bad: Vec<String> = resp.rejected_calls.iter().map(|b| format!("<tool_call>\n{b}\n</tool_call>")).collect();
-                let done: Vec<String> = calls.iter().map(|c| format!("{} {}", c.name, followups::call_target(c))).collect();
-                let done = done.join("; ");
-                let mut ask = format!(
-                    "These {} <tool_call> block(s) could not be parsed as JSON, so they were not executed:\n{}\nRe-emit only these call(s) as valid JSON, with the same tool and the same intended values (file contents and commands unchanged). Reply with the <tool_call> block(s) only.",
-                    resp.rejected_calls.len(),
-                    bad.join("\n")
-                );
-                if !calls.is_empty() {
-                    ask.push_str(&format!(" Do not repeat the calls that already went through ({}).", prefix(&done, 500)));
-                }
-                follow.add_text("user", &ask);
-                let mut extra: Vec<ToolCall> = vec![];
-                let mut extra_usage: Option<Usage> = None;
-                let mut seen: HashSet<(String, String)> = calls.iter().map(followups::call_key).collect();
-                let exact: HashSet<(String, String)> = calls.iter().map(|c| (c.name.clone(), followups::sorted_json(&c.arguments))).collect();
-                let rejected_text = resp.rejected_calls.join("\n");
-                let mut dropped = 0;
-                let mut s = this.stream_once(Arc::new(follow), format!("{rid}/repair"));
+                let mut filter = RepairFilter::new(&reply.calls, &reply.resp.rejected_calls);
+                let mut usage = None;
+                let mut s = this.stream_once(Arc::new(follow.req), format!("{rid}/{}", follow.suffix));
                 while let Some(ev) = s.next().await {
                     match ev? {
                         Event::ToolCall(c) => {
-                            // a re-emission of a call that already went through is a duplicate, unless the broken block
-                            // targeted the same thing (a second edit of the same file)
-                            let key = followups::call_key(&c);
-                            let target = key.1.split_once('=').map_or(key.1.as_str(), |(_, t)| t);
-                            let quoted = json!(target).to_string();
-                            let as_in_json = &quoted[1..quoted.len() - 1];
-                            let dup = exact.contains(&(c.name.clone(), followups::sorted_json(&c.arguments))) || (seen.contains(&key) && !rejected_text.contains(as_in_json));
-                            if dup || extra.len() >= resp.rejected_calls.len() {
-                                dropped += 1;
-                                continue;
+                            if gate.open() && filter.accept(&c) && gate.pass() {
+                                reply.calls.push(c.clone());
+                                yield Event::ToolCall(c);
                             }
-                            seen.insert(key);
-                            extra.push(c.clone());
-                            yield Event::ToolCall(c);
                         }
-                        Event::Done(r) => extra_usage = Some(r.usage),
+                        Event::Done(r) => usage = Some(r.usage),
                         _ => {}
                     }
                 }
                 drop(s);
-                tracing::info!("{rid}/repair kept {} call(s), dropped {dropped} (duplicates of streamed calls or beyond the {} requested)", extra.len(), resp.rejected_calls.len());
-                if !extra.is_empty() {
-                    let mut all = calls.clone();
-                    all.extend(extra);
-                    resp.tool_calls = all;
-                    resp.finish = Finish::ToolCalls;
-                }
-                resp.usage = add_usage(&resp.usage, extra_usage);
-                if !resp.tool_calls.is_empty() {
-                    calls = resp.tool_calls.clone();
-                }
+                tracing::info!("{rid}/repair kept {} call(s), dropped {} (duplicates of streamed calls or beyond the {} requested)", filter.kept, filter.dropped, filter.wanted);
+                reply.resp.usage = add_usage(&reply.resp.usage, usage);
             }
-            let ask = if followups::false_incapacity(&req, &resp, &text_, &calls) {
-                // CAVEAT: the model denied having web/file/shell access although a listed tool provides it
-                let names: Vec<&str> = req.tools.iter().filter(|t| followups::TOOL_ABILITY_RE.is_match(&format!("{} {}", t.name, t.description))).map(|t| t.name.as_str()).collect();
-                let names = prefix(&names.join(", "), 300).to_string();
-                tracing::warn!("{rid} response denies an ability that a tool provides ({}); requesting the call (1 follow-up)", prefix(&names, 80));
-                Some((format!("{rid}/ability"), format!(
-                    "You do have that ability through your tools ({names}). Use the appropriate tool now: reply with the <tool_call> block(s) only, inferring the URL or path if the user did not give one."
-                )))
-            } else if followups::promise_only(&req, &resp, &text_, &calls) {
-                // CAVEAT: the model announced an action and stopped without a <tool_call>; one follow-up asks for the calls
-                let confirm = followups::redundant_confirmation(&req, &text_);
-                let note = confirm.map_or(String::new(), |c| format!(" [asked to confirm '{c}', already requested]"));
-                tracing::warn!("{rid} response only announces an action without a tool call; requesting the calls (1 follow-up){note}");
-                let prompt = match confirm {
-                    Some(c) => format!("The request already asks for this ({c}); do not ask for confirmation. Do it now: reply with the <tool_call> block(s) only."),
-                    None => "You announced an action but emitted no <tool_call>. Do it now: reply with the <tool_call> block(s) for what you just announced, and nothing else.".to_string(),
-                };
-                Some((format!("{rid}/act"), prompt))
-            } else {
-                None
-            };
-            if let Some((frid, prompt)) = ask {
+            // follow-ups that ask for calls the reply should have made; their text is not shown, only their calls
+            let mut history: Vec<(String, String)> = vec![];
+            let mut current = Reply { text: reply.text.clone(), calls: reply.calls.clone(), resp: reply.resp.clone() };
+            for round in 0..MAX_ACT_FOLLOWUPS {
+                let Some(follow) = act_request(&req, &current, &history, round) else { break };
                 req.meta().followups += 1;
-                let mut follow = req.derive();
-                follow.add_text("assistant", &text_);
-                follow.add_text("user", &prompt);
-                let mut extra: Vec<ToolCall> = vec![];
-                let mut extra_usage: Option<Usage> = None;
-                let mut s = this.stream_once(Arc::new(follow), frid);
+                let prompt = follow.prompt;
+                let mut next = Reply::default();
+                let mut s = this.stream_once(Arc::new(follow.req), format!("{rid}/{}", follow.suffix));
                 while let Some(ev) = s.next().await {
                     match ev? {
                         Event::ToolCall(c) => {
-                            extra.push(c.clone());
-                            yield Event::ToolCall(c);
+                            if gate.pass() {
+                                next.calls.push(c.clone());
+                                yield Event::ToolCall(c);
+                            }
                         }
-                        Event::Done(r) => extra_usage = Some(r.usage),
+                        Event::Text(t) => next.text.push_str(&t),
+                        Event::Done(r) => next.resp = r,
                         _ => {}
                     }
                 }
                 drop(s);
-                if !extra.is_empty() {
-                    let mut all = calls.clone();
-                    all.extend(extra);
-                    resp.tool_calls = all;
-                    resp.finish = Finish::ToolCalls;
-                }
-                resp.usage = add_usage(&resp.usage, extra_usage);
+                reply.resp.usage = add_usage(&reply.resp.usage, Some(next.resp.usage));
+                reply.calls.extend(next.calls.iter().cloned());
+                history.push((current.text.clone(), prompt));
+                current = next;
             }
-            yield Event::Done(resp);
+            if gate.dropped > 0 {
+                tracing::info!("{rid} parallel_tool_calls=false: kept the first tool call, dropped {}", gate.dropped);
+            }
+            if !reply.calls.is_empty() {
+                reply.resp.finish = if reply.resp.finish == Finish::Stop { Finish::ToolCalls } else { reply.resp.finish };
+            }
+            reply.resp.tool_calls = reply.calls;
+            yield Event::Done(reply.resp);
         })
     }
 
-    /// Non-streaming: collect everything; retry once when tool_choice is required/named and nothing was called (CAVEAT).
+    /// Non-streaming: everything `run` streams, collected.
     pub async fn complete(self: &Arc<Self>, req: Arc<CanonicalRequest>, rid: &str) -> Result<CanonicalResponse, Error> {
-        let resp = collect(self.run(req.clone(), rid.to_string())).await?;
-        if !req.tools.is_empty() && req.tool_choice.forced() && req.json_schema.is_none() && resp.tool_calls.is_empty() {
-            tracing::warn!("{rid} tool_choice={} but no tool call; retrying once", req.tool_choice);
-            req.meta().followups += 1;
-            let mut follow = CanonicalRequest { max_tokens: req.max_tokens, ..req.derive() };
-            follow.add_text("assistant", &resp.text);
-            follow.add_text("user", "You did not call a tool. You MUST respond with a <tool_call> block now, and nothing else.");
-            let mut retry = collect(self.stream_once(Arc::new(follow), format!("{rid}/retry"))).await?;
-            if !retry.tool_calls.is_empty() {
-                retry.usage = resp.usage.add(&retry.usage);
-                return Ok(retry);
-            }
-        }
-        Ok(resp)
+        collect(self.run(req, rid.to_string())).await
     }
 
-    async fn json_mode(self: &Arc<Self>, req: &Arc<CanonicalRequest>, rid: &str) -> Result<CanonicalResponse, Error> {
-        let mut resp = collect(self.stream_once(req.clone(), rid.to_string())).await?;
-        let schema = req.json_schema.clone().unwrap_or_else(|| json!({}));
-        let (normalized, errs) = check_json(&resp.text, &schema);
-        if let Some(n) = normalized {
-            resp.text = n;
-            return Ok(resp);
-        }
-        let joined = errs.join("; ");
-        tracing::warn!("{rid} invalid JSON ({}); one repair attempt", prefix(&joined, 200));
-        req.meta().repairs += 1;
-        let mut repair = CanonicalRequest {
-            tools: vec![],
-            tool_choice: ToolChoice::None,
-            json_schema: req.json_schema.clone(),
-            max_tokens: req.max_tokens,
-            ..req.derive()
-        };
-        repair.add_text("assistant", &resp.text);
-        repair.add_text(
-            "user",
-            &format!(
-                "Your previous response was not valid: {}. Respond again with only the JSON value, no fences, no prose.",
-                prefix(&joined, 500)
-            ),
-        );
-        let mut repaired = collect(self.stream_once(Arc::new(repair), format!("{rid}/repair"))).await?;
-        let (normalized, errs) = check_json(&repaired.text, &schema);
-        repaired.usage = resp.usage.add(&repaired.usage);
-        match normalized {
-            Some(n) => repaired.text = n,
-            None => tracing::error!("{rid} JSON still invalid after repair: {}", prefix(&errs.join("; "), 200)),
-        }
-        Ok(repaired)
+    /// Structured output: the reply must be a JSON value matching the schema (one repair otherwise). A reply with tool
+    /// calls is an answer of its own: the calls are returned as they are.
+    fn json_mode(self: &Arc<Self>, req: Arc<CanonicalRequest>, rid: String) -> EventStream {
+        let this = self.clone();
+        Box::pin(async_stream::try_stream! {
+            let mut gate = CallGate::new(&req);
+            let mut reply = Reply::default();
+            {
+                let mut s = this.stream_once(req.clone(), rid.clone());
+                while let Some(ev) = s.next().await {
+                    match ev? {
+                        e @ Event::Prompt { .. } => yield e,
+                        Event::Text(t) => reply.text.push_str(&t),
+                        Event::ToolCall(c) => {
+                            if gate.pass() {
+                                reply.calls.push(c);
+                            }
+                        }
+                        Event::Done(r) => reply.resp = r,
+                        Event::Keepalive => {}
+                    }
+                }
+            }
+            let mut resp = reply.resp;
+            if !reply.calls.is_empty() {
+                resp.text = reply.text.trim().to_string();
+                if !resp.text.is_empty() {
+                    yield Event::Text(resp.text.clone());
+                }
+                for c in &reply.calls {
+                    yield Event::ToolCall(c.clone());
+                }
+                resp.tool_calls = reply.calls;
+                yield Event::Done(resp);
+                return;
+            }
+            let schema = req.json_schema.clone().unwrap_or_else(|| json!({}));
+            let (normalized, errs) = check_json(&reply.text, &schema);
+            if let Some(n) = normalized {
+                resp.text = n;
+            } else {
+                let joined = errs.join("; ");
+                tracing::warn!("{rid} invalid JSON ({}); one repair attempt", prefix(&joined, 200));
+                req.meta().repairs += 1;
+                let mut repair = CanonicalRequest {
+                    tools: Arc::new([]),
+                    tool_choice: ToolChoice::None,
+                    json_schema: req.json_schema.clone(),
+                    max_tokens: req.max_tokens,
+                    ..req.derive()
+                };
+                repair.add_text("assistant", &reply.text);
+                repair.add_text(
+                    "user",
+                    &format!("Your previous response was not valid: {}. Respond again with only the JSON value, no fences, no prose.", prefix(&joined, 500)),
+                );
+                let mut repaired = collect(this.stream_once(Arc::new(repair), format!("{rid}/repair"))).await?;
+                let (normalized, errs) = check_json(&repaired.text, &schema);
+                repaired.usage = resp.usage.add(&repaired.usage);
+                match normalized {
+                    Some(n) => repaired.text = n,
+                    None => tracing::error!("{rid} JSON still invalid after repair: {}", prefix(&errs.join("; "), 200)),
+                }
+                resp = repaired;
+            }
+            if !resp.text.is_empty() {
+                yield Event::Text(resp.text.clone());
+            }
+            yield Event::Done(resp);
+        })
     }
 
     fn target(&self, req: &CanonicalRequest) -> String {
         req.route.as_ref().map_or_else(|| self.config.default.target.clone(), |r| r.target.clone())
     }
 
-    /// One backend call (plus one input-too-long retry), parsed into text and tool-call events, then `done`.
+    /// One backend call (plus one input-too-long retry), parsed into text and tool-call events, then `done`. The first
+    /// event says how big the prompt is.
     pub fn stream_once(self: &Arc<Self>, req: Arc<CanonicalRequest>, rid: String) -> EventStream {
         let this = self.clone();
-        Box::pin(async_stream::try_stream! {
+        let meta = req.meta.clone();
+        let label = rid.split_once('/').map_or("first", |(_, s)| s).to_string();
+        let call = Box::pin(async_stream::try_stream! {
             let (configured, tail_reminder, tool_desc_max) = this.config.knobs(req.route.as_deref());
             let target = this.target(&req);
             let mut max_chars = {
@@ -280,18 +434,26 @@ impl EmulationEngine {
             for attempt in 1..=2 {
                 let (p, info) = render_prompt(&req, max_chars, tail_reminder, tool_desc_max);
                 prompt = p;
-                let dropped = if info.dropped_turns > 0 { format!(", -{} dropped", info.dropped_turns) } else { String::new() };
-                tracing::info!("{rid} prompt={} chars (system={}, history={} turns, tools={}{dropped})", info.chars, info.system_chars, info.history_turns, info.tools);
+                let mut cut = String::new();
+                if info.dropped_turns > 0 {
+                    cut.push_str(&format!(", -{} dropped", info.dropped_turns));
+                }
+                if info.shrunk > 0 {
+                    cut.push_str(&format!(", {} cut", info.shrunk));
+                }
+                tracing::info!("{rid} prompt={} chars (system={}, history={} turns, tools={}{cut})", info.chars, info.system_chars, info.history_turns, info.tools);
                 {
                     let mut m = req.meta();
                     m.prompt_chars += info.chars as i64;
                     m.dropped_turns += info.dropped_turns as i64;
+                    m.shrunk_parts += info.shrunk as i64;
                     m.upstream_calls += 1;
                 }
-                if info.dropped_turns > 0 {
+                if info.dropped_turns > 0 || info.shrunk > 0 {
                     let m = req.meta().clone();
-                    this.backend.telemetry.truncated(&m, info.dropped_turns as i64);
+                    this.telemetry.truncated(&m, info.dropped_turns as i64);
                 }
+                yield Event::Prompt { tokens: estimate_tokens(&prompt) };
                 tracing::debug!("{rid} PROMPT >>>\n{prompt}\n<<< PROMPT");
                 let result = match this.backend.stream(&prompt, &target, Some(req.meta.clone())).await {
                     Ok(mut s) => match s.next().await {
@@ -343,22 +505,22 @@ impl EmulationEngine {
                                 first = false;
                             }
                             for p in parser.feed(&t) {
-                                match p {
-                                    Parsed::Text(v) => {
-                                        let (out, stop) = limiter.apply(&v, false);
-                                        stopped = stop;
-                                        if !out.is_empty() {
-                                            emitted += char_len(&out);
-                                            yield Event::Text(out);
-                                        }
-                                        if stopped {
-                                            break;
-                                        }
-                                    }
-                                    Parsed::Call(c) => {
-                                        calls.push(c.clone());
-                                        yield Event::ToolCall(c);
-                                    }
+                                let (out, stop) = match &p {
+                                    Parsed::Text(v) => limiter.apply(v, false),
+                                    // text held back for a stop sequence goes out before the call, not after it
+                                    Parsed::Call(_) => limiter.apply("", true),
+                                };
+                                stopped = stop;
+                                if !out.is_empty() {
+                                    emitted += char_len(&out);
+                                    yield Event::Text(out);
+                                }
+                                if stopped {
+                                    break;
+                                }
+                                if let Parsed::Call(c) = p {
+                                    calls.push(c.clone());
+                                    yield Event::ToolCall(c);
                                 }
                             }
                             if stopped {
@@ -378,11 +540,15 @@ impl EmulationEngine {
                 drop(stream); // releases the backend slot now
             }
             if !stopped {
-                let tail = parser.finish();
                 let mut tail_text = String::new();
-                for p in tail {
+                for p in parser.finish() {
                     match p {
                         Parsed::Call(c) => {
+                            let (out, _) = limiter.apply(&std::mem::take(&mut tail_text), true);
+                            if !out.is_empty() {
+                                emitted += char_len(&out);
+                                yield Event::Text(out);
+                            }
                             calls.push(c.clone());
                             yield Event::ToolCall(c);
                         }
@@ -421,10 +587,12 @@ impl EmulationEngine {
             };
             tracing::info!("{rid} ok in {:.1}s, {emitted} chars, {} tool calls, finish={finish}, usage={}", t0.elapsed().as_secs_f64(), calls.len(), resp.usage);
             yield Event::Done(resp);
-        })
+        });
+        self.telemetry.trace_call(call, &meta, self.backend.kind(), &label)
     }
 }
 
+/// Everything a stream says, as one response (text, calls, the final usage and finish).
 pub async fn collect(mut events: EventStream) -> Result<CanonicalResponse, Error> {
     let mut text_ = String::new();
     let mut calls: Vec<ToolCall> = vec![];
@@ -434,7 +602,7 @@ pub async fn collect(mut events: EventStream) -> Result<CanonicalResponse, Error
             Event::Text(t) => text_.push_str(&t),
             Event::ToolCall(c) => calls.push(c),
             Event::Done(r) => final_ = Some(r),
-            Event::Keepalive => {}
+            Event::Keepalive | Event::Prompt { .. } => {}
         }
     }
     let mut resp = final_.unwrap_or_default();

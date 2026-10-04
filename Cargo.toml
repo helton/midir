@@ -1,57 +1,78 @@
 [package]
 name = "midir"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.81"
+edition = "2024"
+rust-version = "1.99"
 description = "Midir: OpenAI- and Anthropic-compatible gateway for LLM backends (StackSpot AI agents today)"
 license = "MIT"
 repository = "https://github.com/helton/midir"
 publish = false
 build = "build.rs"
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "midir"
 path = "src/main.rs"
+doc = false  # the library documents everything
 
 [workspace]
 members = ["xtask"]
 
 [dependencies]
-axum = { version = "0.7", default-features = false, features = ["http1", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "io-util"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+# rustls with the platform verifier: the system trust store (and SSL_CERT_FILE), so a corporate CA installed or mounted
+# there is trusted; proxies from HTTPS_PROXY/https_proxy/NO_PROXY (system-proxy)
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "system-proxy", "stream", "form"] }
+# preserve_order: clients' key order in prompts; raw_value: echo request fields without re-parsing them;
+# arbitrary_precision: numbers exactly as the client wrote them (64-bit limits would round big integers)
+serde_json = { version = "1", features = ["preserve_order", "raw_value", "arbitrary_precision"] }
 indexmap = { version = "2", features = ["serde"] }
 regex = "1"
-toml = { version = "0.8", default-features = false, features = ["parse", "preserve_order"] }
+toml = { version = "1", default-features = false, features = ["std", "serde", "parse", "preserve_order"] }
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 async-stream = "0.3"
 bytes = "1"
-sha1 = "0.10"
-sha2 = "0.10"
-getrandom = "0.2"
+sha1 = "0.11"
+sha2 = "0.11"
+getrandom = "0.4"
 libc = "0.2"
-# idna_adapter >= 1.2.1 pulls icu 2.x, which needs rustc 1.82; pinned for the 1.81 toolchain.
-idna_adapter = "=1.2.0"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_path_to_error = "0.1"
-clap = { version = "=4.5.20", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 dotenvy = "0.15"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
-tower-http = { version = "0.6", default-features = false, features = ["normalize-path"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "env-filter", "json"] }
+tower-http = { version = "0.7", default-features = false, features = ["normalize-path", "catch-panic"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
+memchr = "2"
+serde_ignored = "0.1"
+# jemalloc: the request path allocates many short-lived buffers from many threads; measured against glibc, musl and
+# mimalloc (.internal reviews), it gives the lowest CPU per request under concurrency and works in the static musl image
+tikv-jemallocator = "0.7"
 
 [dev-dependencies]
 # the black-box suite (tests/): the binary as a process, a StackSpot stand-in on axum, plain HTTP as the clients see it
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "stream"] }
-tempfile = "~3.14"  # newer releases pull getrandom 0.4, which needs a newer cargo than 1.81
-opentelemetry-proto = { version = "0.27", default-features = false, features = ["gen-tonic-messages", "trace", "metrics"] }
-prost = "0.13"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "stream"] }
+tempfile = "3"
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "trace", "metrics"] }
+prost = "0.14"
+# unit tests: a paused clock for the limiter; generated inputs for the parsers of untrusted text
+tokio = { version = "1", features = ["test-util", "macros", "rt"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
 
+# The image's build. Panics unwind (the default): a bug fails one request, not the process and every stream with it.
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
 strip = "symbols"
+
+# CI and local test runs: optimized like the release (the black-box suite times real streams) without its slow link.
+[profile.ci]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+incremental = false

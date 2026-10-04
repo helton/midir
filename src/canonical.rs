@@ -6,7 +6,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::config::ModelSpec;
 use crate::text::char_len;
@@ -34,7 +34,7 @@ pub fn hex(bytes: &[u8]) -> String {
 /// `n` random hex digits (at most 32), for ids.
 pub fn hex_id(n: usize) -> String {
     let mut buf = [0u8; 16];
-    let _ = getrandom::getrandom(&mut buf);
+    let _ = getrandom::fill(&mut buf);
     hex(&buf)[..n.min(32)].to_string()
 }
 
@@ -126,6 +126,31 @@ impl Turn {
     pub fn new(role: &str, text: &str) -> Self {
         Turn { role: role.into(), text: text.into(), tool_calls: vec![], tool_results: vec![], after: String::new() }
     }
+
+    /// Approximate heap size, for the Responses store's memory budget.
+    pub fn approx_bytes(&self) -> usize {
+        let calls: usize = self.tool_calls.iter().map(|c| c.id.len() + c.name.len() + value_bytes(&c.arguments)).sum();
+        let results: usize = self.tool_results.iter().map(|r| r.call_id.len() + r.content.len() + r.name.len()).sum();
+        std::mem::size_of::<Turn>() + self.role.len() + self.text.len() + self.after.len() + calls + results
+    }
+}
+
+/// Approximate heap size of a JSON value.
+pub fn value_bytes(v: &Value) -> usize {
+    std::mem::size_of::<Value>()
+        + match v {
+            Value::String(s) => s.len(),
+            Value::Number(n) => n.as_str().len(),
+            Value::Array(a) => a.iter().map(value_bytes).sum(),
+            Value::Object(m) => m.iter().map(|(k, v)| k.len() + value_bytes(v)).sum(),
+            Value::Null | Value::Bool(_) => 0,
+        }
+}
+
+impl ToolSpec {
+    pub fn approx_bytes(&self) -> usize {
+        std::mem::size_of::<ToolSpec>() + self.name.len() + self.description.len() + value_bytes(&self.parameters)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -177,17 +202,57 @@ pub struct Meta {
     pub queue_wait_ms: Option<f64>,
     pub prompt_chars: i64,
     pub dropped_turns: i64,
+    /// tool results and messages cut in the middle to fit the size cap
+    pub shrunk_parts: i64,
     pub usage_estimated: bool,
+    /// the client's trace (W3C traceparent), when it sent one: the request span becomes its child
+    pub parent: Option<TraceContext>,
+    /// the request span, once telemetry started it: backend calls become its children
+    pub span: Option<TraceContext>,
+}
+
+/// A span's identity in a trace (W3C Trace Context).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceContext {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+}
+
+impl TraceContext {
+    /// `00-<trace id>-<parent span id>-<flags>`; None for anything else (or an all-zero id).
+    pub fn parse_traceparent(header: &str) -> Option<TraceContext> {
+        let mut parts = header.trim().split('-');
+        let (version, trace, span) = (parts.next()?, parts.next()?, parts.next()?);
+        let flags = parts.next()?;
+        if version.len() != 2 || version == "ff" || flags.len() != 2 || (version == "00" && parts.next().is_some()) {
+            return None;
+        }
+        let trace_id: [u8; 16] = unhex(trace)?.try_into().ok()?;
+        let span_id: [u8; 8] = unhex(span)?.try_into().ok()?;
+        (trace_id != [0; 16] && span_id != [0; 8]).then_some(TraceContext { trace_id, span_id })
+    }
+}
+
+/// Bytes from lowercase or uppercase hex digits.
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
 }
 
 pub type SharedMeta = Arc<Mutex<Meta>>;
 
+/// A request in protocol-neutral form. History, system prompts and tools are shared, not copied: a request that
+/// continues a stored conversation (previous_response_id) and the follow-up calls of a turn hold the same turns.
 #[derive(Debug, Clone)]
 pub struct CanonicalRequest {
-    pub system: Vec<String>,
-    pub turns: Vec<Turn>,
-    pub tools: Vec<ToolSpec>,
+    pub system: Arc<[String]>,
+    pub turns: Vec<Arc<Turn>>,
+    pub tools: Arc<[ToolSpec]>,
     pub tool_choice: ToolChoice,
+    /// false: at most one tool call per response (`parallel_tool_calls: false`, `disable_parallel_tool_use`)
+    pub parallel_tool_calls: bool,
     /// `{"type": "object"}` alone means "any JSON object"
     pub json_schema: Option<Value>,
     pub stop: Vec<String>,
@@ -201,10 +266,11 @@ pub struct CanonicalRequest {
 impl Default for CanonicalRequest {
     fn default() -> Self {
         CanonicalRequest {
-            system: vec![],
+            system: Arc::new([]),
             turns: vec![],
-            tools: vec![],
+            tools: Arc::new([]),
             tool_choice: ToolChoice::Auto,
+            parallel_tool_calls: true,
             json_schema: None,
             stop: vec![],
             max_tokens: None,
@@ -223,6 +289,7 @@ impl CanonicalRequest {
             return;
         }
         if let Some(t) = self.turns.last_mut().filter(|t| t.role == role) {
+            let t = Arc::make_mut(t); // copies the turn only when another request shares it
             let join = |a: &str, b: &str| if a.is_empty() { b.to_string() } else { format!("{a}\n{b}") };
             if !text.is_empty() && (!t.tool_results.is_empty() || !t.after.is_empty()) {
                 t.after = join(&t.after, text);
@@ -232,16 +299,12 @@ impl CanonicalRequest {
             t.tool_calls.extend(tool_calls);
             t.tool_results.extend(tool_results);
         } else {
-            self.turns.push(Turn { role: role.into(), text: text.into(), tool_calls, tool_results, after: String::new() });
+            self.turns.push(Arc::new(Turn { role: role.into(), text: text.into(), tool_calls, tool_results, after: String::new() }));
         }
     }
 
     pub fn add_text(&mut self, role: &str, text: &str) {
         self.add(role, text, vec![], vec![]);
-    }
-
-    pub fn tool_name_for(&self, call_id: &str) -> String {
-        self.turns.iter().flat_map(|t| &t.tool_calls).find(|c| c.id == call_id).map(|c| c.name.clone()).unwrap_or_default()
     }
 
     pub fn custom_tool_names(&self) -> Vec<String> {
@@ -253,7 +316,8 @@ impl CanonicalRequest {
         !self.tools.is_empty() && self.tool_choice != ToolChoice::None
     }
 
-    /// Copy for a follow-up call (retry, repair), keeping system and turns; meta and route are shared.
+    /// The request a follow-up call (retry, repair) starts from: the same system, turns and tools (shared), meta and
+    /// route; without the JSON schema, max_tokens and the ignored parameters.
     pub fn derive(&self) -> CanonicalRequest {
         CanonicalRequest { ignored: vec![], json_schema: None, max_tokens: None, ..self.clone() }
     }
@@ -328,9 +392,14 @@ impl Default for CanonicalResponse {
 /// One item of a response stream.
 #[derive(Debug, Clone)]
 pub enum Event {
+    /// the first backend call's prompt is rendered (before the call): its estimated size, for protocols that report
+    /// input tokens before the answer (Anthropic `message_start`)
+    Prompt {
+        tokens: i64,
+    },
     Text(String),
     ToolCall(ToolCall),
     Done(CanonicalResponse),
-    /// nothing yet: the transport should send a keepalive
+    /// nothing for a while: the transport should send a keepalive
     Keepalive,
 }

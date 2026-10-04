@@ -6,21 +6,29 @@
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use regex::Regex;
-use serde::Deserialize;
-use serde_json::{json, Value};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
-use super::{Completion, Item, ItemStream};
+use super::{Completion, Item, ItemStream, TextBackend};
 use crate::canonical::{SharedMeta, Usage};
 use crate::config::{BackendSettings, ConfigError};
 use crate::errors::{BackendError, Error, NetError};
-use crate::limiter::{monotonic, UpstreamLimiter};
+use crate::json;
+use crate::limiter::UpstreamLimiter;
 use crate::store::time_now;
 use crate::telemetry::Telemetry;
-use crate::text::prefix;
+use crate::text::{char_len, prefix};
+
 const DEFAULT_AGENT_BASE: &str = "https://genai-inference-app.stackspot.com/v1/agent";
 const DEFAULT_IDM_BASE: &str = "https://idm.stackspot.com";
+/// The options a [backends.<name>] table of type "stackspot" understands (anything else is reported at startup).
+const OPTIONS: [&str; 7] = ["type", "realm", "client_id", "client_secret", "idm_base_url", "agent_base_url", "ca_bundle"];
+/// The token call as a whole (connect, send, answer): a hung idm must not hold every request for minutes.
+const TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
 static TOO_LONG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)limit of (\d+) tokens.*?resulted in (\d+) tokens").unwrap());
 
 struct Token {
@@ -29,8 +37,7 @@ struct Token {
 }
 
 pub struct StackSpotBackend {
-    pub name: String,
-    pub type_: String,
+    name: String,
     realm: String,
     client_id: String,
     client_secret: String,
@@ -40,9 +47,18 @@ pub struct StackSpotBackend {
     http_error: Option<String>,
     token: tokio::sync::Mutex<Token>,
     token_cache: std::sync::Mutex<(String, f64)>,
-    pub limiter: Arc<UpstreamLimiter>,
-    pub telemetry: Arc<Telemetry>,
+    limiter: UpstreamLimiter,
+    telemetry: Arc<Telemetry>,
     backoff_s: f64,
+}
+
+/// The Agent API request: the prompt is serialized once, straight from the engine's string.
+#[derive(Serialize)]
+struct AgentRequest<'a> {
+    streaming: bool,
+    user_prompt: &'a str,
+    stackspot_knowledge: bool,
+    return_ks_in_response: bool,
 }
 
 /// A token count as the Agent API sends it: a number, a numeric string or null.
@@ -87,7 +103,10 @@ impl StackSpotBackend {
             })
         };
         let s = |key: &str, env_name: &str, default: &str| -> String { get(key, env_name).unwrap_or_else(|| default.to_string()) };
-        let limiter = Arc::new(UpstreamLimiter::new(&settings.limits, telemetry.clone(), &settings.name));
+        for key in o.keys().filter(|k| !OPTIONS.contains(&k.as_str())) {
+            tracing::warn!("backend {:?}: unknown option {key:?} ignored (stackspot options: {})", settings.name, OPTIONS[1..].join(", "));
+        }
+        let limiter = UpstreamLimiter::new(&settings.limits, telemetry.clone(), &settings.name);
         let ca_bundle = get("ca_bundle", "STACKSPOT_CA_BUNDLE");
         let n = (limiter.max_concurrent + 2).max(4) as usize;
         let mut builder = reqwest::Client::builder()
@@ -103,19 +122,14 @@ impl StackSpotBackend {
                 .map_err(|e| e.to_string())
                 .and_then(|pem| reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| e.to_string()))
             {
-                Ok(certs) => {
-                    builder = builder.tls_built_in_root_certs(false);
-                    for c in certs {
-                        builder = builder.add_root_certificate(c);
-                    }
-                }
+                // added to the system's trust store (a corporate CA next to the public roots)
+                Ok(certs) => builder = builder.tls_certs_merge(certs),
                 Err(e) => http_error = Some(format!("cannot read ca_bundle {path}: {e}")),
             }
         }
         let http = builder.build().unwrap_or_default();
         StackSpotBackend {
             name: settings.name.clone(),
-            type_: "stackspot".into(),
             realm: s("realm", "STACKSPOT_REALM", "").trim().to_string(),
             client_id: s("client_id", "STACKSPOT_CLIENT_ID", "").trim().to_string(),
             client_secret: s("client_secret", "STACKSPOT_CLIENT_SECRET", "").trim().to_string(),
@@ -131,7 +145,7 @@ impl StackSpotBackend {
         }
     }
 
-    pub fn validate(&self) -> Result<(), ConfigError> {
+    fn check(&self) -> Result<(), ConfigError> {
         let missing: Vec<&str> = [
             ("realm (STACKSPOT_REALM)", &self.realm),
             ("client_id (STACKSPOT_CLIENT_ID)", &self.client_id),
@@ -158,10 +172,6 @@ impl StackSpotBackend {
         format!("{}/{agent_id}/chat", self.agent_base)
     }
 
-    pub fn describe_target(&self, target: &str) -> String {
-        format!("{}...", prefix(target, 6))
-    }
-
     fn cached_token(&self) -> Option<String> {
         let c = self.token_cache.lock().unwrap_or_else(|e| e.into_inner());
         (!c.0.is_empty() && c.1 - 60.0 > time_now()).then(|| c.0.clone())
@@ -169,10 +179,8 @@ impl StackSpotBackend {
 
     /// Client-credentials token, cached and renewed 60 s before expiry (tokens last 20 min).
     pub async fn token(&self, force: bool) -> Result<String, Error> {
-        if !force {
-            if let Some(t) = self.cached_token() {
-                return Ok(t);
-            }
+        if !force && let Some(t) = self.cached_token() {
+            return Ok(t);
         }
         let mut tok = self.token.lock().await;
         if !force && !tok.value.is_empty() && tok.expires_at - 60.0 > time_now() {
@@ -180,7 +188,14 @@ impl StackSpotBackend {
         }
         let form =
             [("grant_type", "client_credentials"), ("client_id", self.client_id.as_str()), ("client_secret", self.client_secret.as_str())];
-        let r = self.http.post(self.idm_url()).form(&form).send().await.map_err(|e| NetError::from_reqwest(&e, false))?;
+        let r = self
+            .http
+            .post(self.idm_url())
+            .form(&form)
+            .timeout(TOKEN_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| NetError::from_reqwest(&e, false))?;
         let status = r.status().as_u16();
         if status != 200 {
             return Err(BackendError::new(status, body_of(r).await, "idm", &self.name).into());
@@ -199,26 +214,7 @@ impl StackSpotBackend {
         Ok(tok.value.clone())
     }
 
-    pub async fn ready(&self) -> Result<(), Error> {
-        self.token(false).await.map(|_| ())
-    }
-
-    /// (limit, actual) input tokens when `error` is the backend refusing a prompt for its size.
-    pub fn input_limit_exceeded(&self, error: &BackendError) -> Option<(i64, i64)> {
-        if error.status != 400 {
-            return None;
-        }
-        let body = match &error.body {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
-        let c = TOO_LONG_RE.captures(&body)?;
-        Some((c.get(1)?.as_str().parse().ok()?, c.get(2)?.as_str().parse().ok()?))
-    }
-
-    async fn open_once(&self, target: &str, prompt: &str, deadline: f64) -> Result<reqwest::Response, Error> {
-        let body =
-            json!({"streaming": true, "user_prompt": prompt, "stackspot_knowledge": false, "return_ks_in_response": false}).to_string();
+    async fn open_once(&self, target: &str, body: &Bytes, deadline: tokio::time::Instant) -> Result<reqwest::Response, Error> {
         let mut resp = None;
         for attempt in 1..=2 {
             let token = self.token(attempt == 2).await?;
@@ -261,11 +257,20 @@ impl StackSpotBackend {
     }
 
     /// Text deltas, then one Completion. Waits in the queue first; retries only until the response headers arrive.
-    pub async fn stream(self: &Arc<Self>, prompt: &str, target: &str, meta: Option<SharedMeta>) -> Result<ItemStream, Error> {
-        let t_queue = monotonic();
-        let deadline = t_queue + self.limiter.timeout;
+    async fn open(&self, prompt: &str, target: &str, meta: Option<SharedMeta>) -> Result<ItemStream, Error> {
+        let body = Bytes::from(
+            serde_json::to_vec(&AgentRequest {
+                streaming: true,
+                user_prompt: prompt,
+                stackspot_knowledge: false,
+                return_ks_in_response: false,
+            })
+            .map_err(|e| Error::Internal(format!("cannot encode the agent request: {e}")))?,
+        );
+        let t_queue = tokio::time::Instant::now();
+        let deadline = self.limiter.deadline();
         let slot = self.limiter.acquire_slot(deadline).await?;
-        let queued = monotonic() - t_queue;
+        let queued = t_queue.elapsed().as_secs_f64();
         if let Some(m) = &meta {
             let mut m = m.lock().unwrap_or_else(|e| e.into_inner());
             m.queue_wait_ms = Some(m.queue_wait_ms.unwrap_or(0.0) + queued * 1000.0);
@@ -277,7 +282,7 @@ impl StackSpotBackend {
         let mut attempt = 0;
         let r = loop {
             attempt += 1;
-            match self.open_once(target, prompt, deadline).await {
+            match self.open_once(target, &body, deadline).await {
                 Ok(r) => break r,
                 Err(e) if Self::retryable(&e) && attempt < 4 => {
                     let b = self.backoff_s;
@@ -294,6 +299,48 @@ impl StackSpotBackend {
             }
         };
         Ok(read_sse(r, slot))
+    }
+}
+
+impl TextBackend for StackSpotBackend {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn kind(&self) -> &'static str {
+        "stackspot"
+    }
+
+    fn limiter(&self) -> &UpstreamLimiter {
+        &self.limiter
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        self.check()
+    }
+
+    fn describe_target(&self, target: &str) -> String {
+        format!("{}...", prefix(target, 6))
+    }
+
+    fn ready(&self) -> BoxFuture<'_, Result<(), Error>> {
+        Box::pin(async move { self.token(false).await.map(|_| ()) })
+    }
+
+    fn stream<'a>(&'a self, prompt: &'a str, target: &'a str, meta: Option<SharedMeta>) -> BoxFuture<'a, Result<ItemStream, Error>> {
+        Box::pin(self.open(prompt, target, meta))
+    }
+
+    fn input_limit_exceeded(&self, error: &BackendError) -> Option<(i64, i64)> {
+        if error.status != 400 {
+            return None;
+        }
+        let body = match &error.body {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let c = TOO_LONG_RE.captures(&body)?;
+        Some((c.get(1)?.as_str().parse().ok()?, c.get(2)?.as_str().parse().ok()?))
     }
 }
 
@@ -348,29 +395,50 @@ enum Line {
     Skip,
 }
 
+/// One Agent API event: deltas carry `message`; the final one `stop_reason`, `message_id` and `tokens` (present, even
+/// as null, is what marks it).
+#[derive(Deserialize)]
+struct AgentEvent {
+    message: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    stop_reason: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    tokens: Option<Value>,
+    message_id: Option<Value>,
+}
+
+/// Some(value) whenever the field is there, null included.
+fn present<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
+}
+
+/// One SSE line. Model output is not logged at WARN (it may hold secrets): problems are described by size, the content
+/// goes to DEBUG.
 fn parse_line(line: &str) -> Line {
     let Some(payload) = line.strip_prefix("data:") else { return Line::Skip };
     let payload = payload.trim();
     if payload.is_empty() {
         return Line::Skip;
     }
-    let Ok(ev) = serde_json::from_str::<Value>(payload) else {
-        tracing::warn!("ignoring non-JSON SSE event: {:?}", prefix(payload, 200));
-        return Line::Skip;
+    // a lone UTF-16 surrogate or a NaN would make the whole event, and its text, unreadable
+    let ev: AgentEvent = match serde_json::from_slice(&json::sanitize(payload.as_bytes())) {
+        Ok(ev) => ev,
+        Err(e) => {
+            tracing::warn!("ignoring an SSE event that is not a JSON object ({} chars: {e})", char_len(payload));
+            tracing::debug!("ignored SSE event: {:?}", prefix(payload, 2000));
+            return Line::Skip;
+        }
     };
-    let Value::Object(ev) = ev else {
-        tracing::warn!("ignoring SSE event that is not an object: {:?}", prefix(payload, 200));
-        return Line::Skip;
-    };
-    if ev.contains_key("stop_reason") || ev.contains_key("tokens") {
-        let message_id = ev.get("message_id").and_then(Value::as_str).map(String::from);
-        return Line::Done(Completion { usage: usage_from(ev.get("tokens")), message_id });
+    if ev.stop_reason.is_some() || ev.tokens.is_some() {
+        let message_id = ev.message_id.as_ref().and_then(Value::as_str).map(String::from);
+        return Line::Done(Completion { usage: usage_from(ev.tokens.as_ref()), message_id });
     }
-    match ev.get("message") {
-        Some(Value::String(m)) if !m.is_empty() => Line::Item(Item::Text(m.clone())),
+    match ev.message {
+        Some(Value::String(m)) if !m.is_empty() => Line::Item(Item::Text(m)),
         Some(Value::String(_)) | None | Some(Value::Null) => Line::Skip,
-        Some(_) => {
-            tracing::warn!("ignoring SSE event with a non-text message: {:?}", prefix(payload, 200));
+        Some(other) => {
+            tracing::warn!("ignoring an SSE event whose message is not text ({} chars)", char_len(payload));
+            tracing::debug!("ignored SSE message: {:?}", prefix(&other.to_string(), 2000));
             Line::Skip
         }
     }
@@ -416,4 +484,43 @@ fn read_sse(r: reqwest::Response, slot: crate::limiter::SlotGuard) -> ItemStream
             yield Item::Completion(Completion::default());
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn lines_are_the_same_in_any_chunking(body in "(data: [a-zé{}\":]{0,12}(\r\n|\n|\r){1,2}){0,8}", cuts in prop::collection::vec(0usize..200, 0..10)) {
+            let bytes = body.as_bytes();
+            let mut whole = Lines::default();
+            let mut expected = whole.feed(bytes);
+            expected.extend(whole.finish());
+            let mut bounds: Vec<usize> = cuts.iter().map(|c| c % (bytes.len() + 1)).collect();
+            bounds.extend([0, bytes.len()]);
+            bounds.sort_unstable();
+            bounds.dedup();
+            let mut chunked = Lines::default();
+            let mut got = vec![];
+            for w in bounds.windows(2) {
+                got.extend(chunked.feed(&bytes[w[0]..w[1]]));
+            }
+            got.extend(chunked.finish());
+            prop_assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    fn events_are_read_whatever_their_shape() {
+        assert!(matches!(parse_line("data: {\"message\": \"hi\"}"), Line::Item(Item::Text(t)) if t == "hi"));
+        assert!(matches!(parse_line("data: {\"stop_reason\": null}"), Line::Done(_)));
+        assert!(
+            matches!(parse_line("data: {\"tokens\": {\"input\": \"7\", \"output\": 2}}"), Line::Done(c) if c.usage == Some(Usage::new(7, 2)))
+        );
+        for skipped in ["data: [1]", "data: nope", "event: x", "data: {\"message\": {\"a\": 1}}", "data: {\"message\": null}"] {
+            assert!(matches!(parse_line(skipped), Line::Skip), "{skipped}");
+        }
+    }
 }
