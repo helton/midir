@@ -45,6 +45,7 @@ pub struct ModelSpec {
     pub max_prompt_chars: Option<i64>,
     pub tail_reminder: Option<bool>,
     pub tool_desc_max: Option<i64>,
+    pub followups: Option<bool>,
 }
 
 impl ModelSpec {
@@ -60,8 +61,18 @@ impl ModelSpec {
             max_prompt_chars: None,
             tail_reminder: None,
             tool_desc_max: None,
+            followups: None,
         }
     }
+}
+
+/// The settings a model can override (`[[models]]`), resolved for one model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Knobs {
+    pub max_prompt_chars: i64,
+    pub tail_reminder: bool,
+    pub tool_desc_max: i64,
+    pub followups: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +81,9 @@ pub struct ServerSettings {
     pub max_prompt_chars: i64,
     pub tail_reminder: bool,
     pub tool_desc_max: i64,
+    /// the automatic follow-ups for replies that announce without acting, deny a tool's ability or forget an
+    /// ordered commit (`MIDIR_FOLLOWUPS`; a model can override it)
+    pub followups: bool,
     pub responses_dir: Option<PathBuf>,
     pub responses_retention_days: f64,
     pub responses_max_mb: f64,
@@ -180,6 +194,8 @@ struct ServerFile {
     tail_reminder: Option<bool>,
     #[serde(deserialize_with = "num")]
     tool_desc_max: Option<i64>,
+    #[serde(deserialize_with = "flag")]
+    followups: Option<bool>,
     responses_dir: Option<String>,
     #[serde(deserialize_with = "num")]
     responses_retention_days: Option<f64>,
@@ -269,6 +285,8 @@ struct ModelFile {
     tail_reminder: Option<bool>,
     #[serde(deserialize_with = "num")]
     tool_desc_max: Option<i64>,
+    #[serde(deserialize_with = "flag")]
+    followups: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -380,6 +398,7 @@ impl Config {
                 max_prompt_chars: m.max_prompt_chars,
                 tail_reminder: m.tail_reminder,
                 tool_desc_max: m.tool_desc_max,
+                followups: m.followups,
             }));
         }
         let default_name = default_model.unwrap_or_default().trim().to_lowercase();
@@ -456,15 +475,22 @@ impl Config {
         if self.models.is_empty() { vec![self.default.clone()] } else { self.models.clone() }
     }
 
-    /// (max_prompt_chars, tail_reminder, tool_desc_max) for a model: its own values, else `[server]`'s.
-    pub fn knobs(&self, spec: Option<&ModelSpec>) -> (i64, bool, i64) {
+    /// A model's knobs: its own values, else `[server]`'s.
+    pub fn knobs(&self, spec: Option<&ModelSpec>) -> Knobs {
         let s = &self.server;
-        let Some(spec) = spec else { return (s.max_prompt_chars, s.tail_reminder, s.tool_desc_max) };
-        (
-            spec.max_prompt_chars.filter(|n| *n > 0).unwrap_or(s.max_prompt_chars),
-            spec.tail_reminder.unwrap_or(s.tail_reminder),
-            spec.tool_desc_max.unwrap_or(s.tool_desc_max),
-        )
+        let server = Knobs {
+            max_prompt_chars: s.max_prompt_chars,
+            tail_reminder: s.tail_reminder,
+            tool_desc_max: s.tool_desc_max,
+            followups: s.followups,
+        };
+        let Some(spec) = spec else { return server };
+        Knobs {
+            max_prompt_chars: spec.max_prompt_chars.filter(|n| *n > 0).unwrap_or(s.max_prompt_chars),
+            tail_reminder: spec.tail_reminder.unwrap_or(s.tail_reminder),
+            tool_desc_max: spec.tool_desc_max.unwrap_or(s.tool_desc_max),
+            followups: spec.followups.unwrap_or(s.followups),
+        }
     }
 }
 
@@ -507,6 +533,7 @@ fn server_settings(f: &ServerFile, env: &EnvLookup, root: &Path) -> R<ServerSett
         max_prompt_chars: env.parse("MIDIR_MAX_PROMPT_CHARS")?.or(f.max_prompt_chars).unwrap_or(1_000_000),
         tail_reminder: env.flag("MIDIR_TAIL_REMINDER")?.or(f.tail_reminder).unwrap_or(true),
         tool_desc_max: env.parse("MIDIR_TOOL_DESC_MAX")?.or(f.tool_desc_max).unwrap_or(0),
+        followups: env.flag("MIDIR_FOLLOWUPS")?.or(f.followups).unwrap_or(true),
         responses_dir,
         responses_retention_days: env.parse("MIDIR_RESPONSES_RETENTION_DAYS")?.or(f.responses_retention_days).unwrap_or(30.0),
         responses_max_mb: env.parse("MIDIR_RESPONSES_MAX_MB")?.or(f.responses_max_mb).unwrap_or(500.0),
@@ -656,12 +683,17 @@ mod tests {
     fn per_model_knobs() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("midir.toml");
-        let toml = "[server]\nmax_prompt_chars = 5000\ntool_desc_max = 80\n[backends.stackspot]\n[[models]]\nname = \"a\"\ntarget = \"A\"\nmax_prompt_chars = 100\ntail_reminder = false\n[[models]]\nname = \"b\"\ntarget = \"B\"\nmax_prompt_chars = 0\n";
+        let toml = "[server]\nmax_prompt_chars = 5000\ntool_desc_max = 80\n[backends.stackspot]\n[[models]]\nname = \"a\"\ntarget = \"A\"\nmax_prompt_chars = 100\ntail_reminder = false\nfollowups = false\n[[models]]\nname = \"b\"\ntarget = \"B\"\nmax_prompt_chars = 0\n";
         std::fs::write(&file, toml).unwrap();
-        let cfg = Config::load_file(IndexMap::new(), file, dir.path().into()).unwrap();
-        assert_eq!(cfg.knobs(Some(&cfg.resolve("a"))), (100, false, 80));
-        assert_eq!(cfg.knobs(Some(&cfg.resolve("b"))), (5000, true, 80)); // 0 means the server's cap
-        assert_eq!(cfg.knobs(None), (5000, true, 80));
+        let knobs = |max_prompt_chars, tail_reminder, followups| Knobs { max_prompt_chars, tail_reminder, tool_desc_max: 80, followups };
+        let cfg = Config::load_file(IndexMap::new(), file.clone(), dir.path().into()).unwrap();
+        assert_eq!(cfg.knobs(Some(&cfg.resolve("a"))), knobs(100, false, false));
+        assert_eq!(cfg.knobs(Some(&cfg.resolve("b"))), knobs(5000, true, true)); // 0 means the server's cap
+        assert_eq!(cfg.knobs(None), knobs(5000, true, true));
+        // MIDIR_FOLLOWUPS turns them off for the models that do not set their own
+        let env = IndexMap::from([("MIDIR_FOLLOWUPS".to_string(), "0".to_string())]);
+        let cfg = Config::load_file(env, file, dir.path().into()).unwrap();
+        assert!(!cfg.knobs(Some(&cfg.resolve("b"))).followups);
     }
 
     #[test]

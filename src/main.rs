@@ -19,6 +19,22 @@ use tower_http::normalize_path::NormalizePathLayer;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// jemalloc's settings, read when it starts (`_RJEM_MALLOC_CONF` overrides them): one background thread gives memory
+/// freed after a burst back to the system within about a second. Without it the process keeps its peak (300 MB after
+/// 32 concurrent large requests) until the next allocation.
+#[repr(transparent)]
+struct MallocConf(*const std::ffi::c_char);
+// SAFETY: a pointer to a static, immutable C string
+unsafe impl Sync for MallocConf {}
+#[unsafe(export_name = "_rjem_malloc_conf")]
+static MALLOC_CONF: MallocConf =
+    MallocConf(c"background_thread:true,max_background_threads:1,dirty_decay_ms:1000,muzzy_decay_ms:0".as_ptr());
+
+/// Async worker threads unless TOKIO_WORKER_THREADS says otherwise (tokio's default is one per core). Each thread
+/// holds its own allocator arena, so memory under load grows with them; four serve far more than a backend allows
+/// (measured: 644 against 693 requests/s with 32 threads, peak 104 against 297 MB).
+const WORKER_THREADS: usize = 4;
+
 const ABOUT: &str = "Midir: OpenAI- and Anthropic-compatible gateway for LLM backends.";
 
 const DETAILS: &str = "Endpoints (http://<host>:<port>)
@@ -34,7 +50,7 @@ const DETAILS: &str = "Endpoints (http://<host>:<port>)
 Configuration: config/midir.toml under the working directory (or MIDIR_CONFIG=<path>); format in
 config/midir.example.toml. Secrets live in .env (working directory) and are referenced as ${NAME}. Environment
 variables win over the file: MIDIR_PORT, MIDIR_API_KEY, MIDIR_MAX_PROMPT_CHARS, MIDIR_TAIL_REMINDER,
-MIDIR_TOOL_DESC_MAX, MIDIR_RESPONSES_DIR, MIDIR_RESPONSES_RETENTION_DAYS, MIDIR_RESPONSES_MAX_MB,
+MIDIR_TOOL_DESC_MAX, MIDIR_FOLLOWUPS, MIDIR_RESPONSES_DIR, MIDIR_RESPONSES_RETENTION_DAYS, MIDIR_RESPONSES_MAX_MB,
 MIDIR_RESPONSES_MEMORY_MB, MIDIR_KEEPALIVE_S, MIDIR_RETRY_BACKOFF_S, MIDIR_SHUTDOWN_GRACE_S, MIDIR_PROMETHEUS,
 OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME; for every backend, MIDIR_MAX_CONCURRENT, MIDIR_REQUESTS_PER_MINUTE,
 MIDIR_QUEUE_TIMEOUT and MIDIR_COOLDOWN_ON_429; for every StackSpot backend, STACKSPOT_REALM, STACKSPOT_CLIENT_ID,
@@ -42,6 +58,7 @@ STACKSPOT_CLIENT_SECRET, STACKSPOT_CA_BUNDLE, STACKSPOT_IDM_BASE_URL and STACKSP
 account goes in its [backends.<name>] options, with these unset). Without [[models]], STACKSPOT_DEFAULT_AGENT_ID and
 STACKSPOT_<MODEL>_AGENT_ID define the models (STACKSPOT_GPT_5_1_AGENT_ID -> model \"gpt-5.1\").
 Logs: MIDIR_LOG=<filter> (e.g. info,midir::store=debug), MIDIR_LOG_FORMAT=json. MIDIR_NO_BANNER=1 skips the banner.
+TOKIO_WORKER_THREADS=<n> changes the async worker threads (default 4, fewer on smaller machines).
 
 Without MIDIR_API_KEY there is no authentication: keep the port local, or set a key and give it to the clients
 (Authorization: Bearer <key> or x-api-key: <key>).";
@@ -157,7 +174,11 @@ fn main() -> ExitCode {
     print_banner();
     log::init(args.debug);
     tracing::info!("midir v{} starting", buildinfo::full_version());
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
+        builder.worker_threads(std::thread::available_parallelism().map_or(WORKER_THREADS, |n| n.get().min(WORKER_THREADS)));
+    }
+    let runtime = match builder.enable_all().build() {
         Ok(r) => r,
         Err(e) => {
             eprintln!("cannot start the async runtime: {e}");

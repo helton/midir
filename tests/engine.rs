@@ -380,6 +380,21 @@ fn a_follow_up_never_repeats_a_call_that_returned_the_same_twice() {
 }
 
 #[test]
+fn followups_off_return_the_reply_as_written() {
+    let rig = Rig::with(&toml_with_server("followups = false"), &[]);
+    rig.upstream.add("Vou ler o arquivo a.py agora.").add(tool_call_text("read_file", json!({"path": "a.py"})));
+    let r = chat(&rig, json!({"tools": chat_tools()}));
+    assert_eq!(r["choices"][0]["finish_reason"], "stop");
+    assert_eq!(rig.upstream.calls().len(), 1);
+    // the client's forced tool_choice is still asked for again (MIDIR_FOLLOWUPS=0 is the same switch)
+    let rig = Rig::with(&toml_with_server(""), &[("MIDIR_FOLLOWUPS", "0")]);
+    rig.upstream.add("Vou ler o arquivo.").add(tool_call_text("read_file", json!({"path": "a.py"})));
+    let r = chat(&rig, json!({"tools": chat_tools(), "tool_choice": "required"}));
+    assert_eq!(r["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(rig.upstream.calls().len(), 2);
+}
+
+#[test]
 fn a_second_announcement_gets_a_second_follow_up() {
     let rig = Rig::new();
     rig.upstream

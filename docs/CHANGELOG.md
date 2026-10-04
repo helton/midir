@@ -44,7 +44,8 @@ release may change configuration or behavior.
   (VS Code Copilot's `fetch_webpage` answering 403 on PyPI), or that cites the failure (a 403, a timeout), reports what
   the tool returned. The ability follow-up treated it as a false incapacity and appended the same fetch to every reply,
   so the client ran it again, round after round, until the user stopped it. And a follow-up never makes again a call
-  whose last two runs in the turn returned the same result.
+  whose last two runs in the turn returned the same result. `followups = false` in `[server]` or a model
+  (`MIDIR_FOLLOWUPS=0`) turns these heuristic follow-ups off; a forced `tool_choice` is still asked for again.
 - **Tool calls**: JSON with raw newlines or tabs inside strings, or with trailing commas, is read as the model meant
   it instead of costing a repair round trip; JSON mode with tools returns the model's tool calls (they were dropped);
   a forced `tool_choice` is retried when streaming too; text held back for a stop sequence comes out before a tool
@@ -93,6 +94,10 @@ release may change configuration or behavior.
   its follow-ups and the store; the binary uses jemalloc (built for 4 to 64 KiB memory pages on arm64). Against a local mock with the largest captured Copilot
   request (230 KB) and 32 concurrent clients, the image went from 131 ms of CPU per request (musl's allocator) to about
   8 ms, and from 164 to about 900 requests per second (865 to 961 across runs).
+  Memory under load: 4 async worker threads by default (`TOKIO_WORKER_THREADS` changes it) instead of one per core,
+  each with its own allocator arena, and jemalloc gives memory back about a second after a burst. With 32 concurrent
+  large requests on a 32-core machine the peak went from about 300 to 104 MB and, 15 seconds later, from about 300 to
+  32 MB, for 7 to 10% fewer requests per second (still over 640 per second).
 - **Clearer errors for malformed requests**: each protocol decodes the body into typed requests, so a field of the
   wrong type is a 400 that names it (`invalid request: messages[2].content: invalid type: integer 5, expected a string
   or a list of content parts`); unknown endpoints and methods answer 404/405 in the protocol's error format; a

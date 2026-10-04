@@ -125,8 +125,9 @@ impl RepairFilter {
 
 /// The follow-up that asks for tool calls the reply should have made, if any: a forced tool choice with no call, a
 /// denied ability a tool provides, or an announced action without its call. `round` > 0 asks again after a follow-up
-/// whose reply still announced without acting.
-fn act_request(req: &CanonicalRequest, reply: &Reply, history: &[(String, String)], round: usize) -> Option<FollowUp> {
+/// whose reply still announced without acting. Without `heuristics` (the `followups` setting off) only the forced tool
+/// choice is asked for: the client required a call.
+fn act_request(req: &CanonicalRequest, reply: &Reply, history: &[(String, String)], round: usize, heuristics: bool) -> Option<FollowUp> {
     if !reply.calls.is_empty() || !req.tools_on() || reply.resp.finish != Finish::Stop {
         return None;
     }
@@ -135,6 +136,8 @@ fn act_request(req: &CanonicalRequest, reply: &Reply, history: &[(String, String
         // CAVEAT: tool_choice required/named is a prompt instruction; the model ignored it
         tracing::warn!("tool_choice={} but no tool call; asking again", req.tool_choice);
         ("retry", "You did not call a tool. You MUST respond with a <tool_call> block now, and nothing else.".to_string(), true)
+    } else if !heuristics {
+        return None;
     } else if let tools @ [_, ..] = followups::false_incapacity(req, &reply.resp, &reply.text, &reply.calls).as_slice() {
         // CAVEAT: the model denied having web/file/shell access although a listed tool provides it
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -298,8 +301,9 @@ impl EmulationEngine {
             // follow-ups that ask for calls the reply should have made; their text is not shown, only their calls
             let mut history: Vec<(String, String)> = vec![];
             let mut current = Reply { text: reply.text.clone(), calls: reply.calls.clone(), resp: reply.resp.clone() };
+            let heuristics = this.config.knobs(req.route.as_deref()).followups;
             for round in 0..MAX_ACT_FOLLOWUPS {
-                let Some(follow) = act_request(&req, &current, &history, round) else { break };
+                let Some(follow) = act_request(&req, &current, &history, round, heuristics) else { break };
                 req.meta().followups += 1;
                 let prompt = follow.prompt;
                 let mut next = Reply::default();
@@ -433,7 +437,8 @@ impl EmulationEngine {
         let meta = req.meta.clone();
         let label = rid.split_once('/').map_or("first", |(_, s)| s).to_string();
         let call = Box::pin(async_stream::try_stream! {
-            let (configured, tail_reminder, tool_desc_max) = this.config.knobs(req.route.as_deref());
+            let knobs = this.config.knobs(req.route.as_deref());
+            let configured = knobs.max_prompt_chars;
             let target = this.target(&req);
             let mut max_chars = {
                 let learned = this.learned_max_chars.lock().unwrap_or_else(|e| e.into_inner());
@@ -443,7 +448,7 @@ impl EmulationEngine {
             let mut opened = None;
             let mut prompt = String::new();
             for attempt in 1..=2 {
-                let (p, info) = render_prompt(&req, max_chars, tail_reminder, tool_desc_max);
+                let (p, info) = render_prompt(&req, max_chars, knobs.tail_reminder, knobs.tool_desc_max);
                 prompt = p;
                 let mut cut = String::new();
                 if info.dropped_turns > 0 {

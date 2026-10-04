@@ -86,6 +86,7 @@ target = "${STACKSPOT_GPT_5_1_AGENT_ID}"  # StackSpot: the agent id
 aliases = ["claude-opus-4-5"]             # extra exact names some clients send
 # match = "^(openai/)?gpt-5"              # optional regex
 # tail_reminder = true                    # per-model knobs override [server]
+# followups = false                       # e.g. no hidden follow-ups for this model
 ```
 
 **Routing** of a requested `model`: exact name or alias (case-insensitive) > `match` regex (file order) > exact after
@@ -146,7 +147,8 @@ event format; real token usage; errors in each protocol's format; `previous_resp
   confirms a commit or a test run the user explicitly ordered (and did not forbid, condition or keep for themselves);
   push, merge, deploy and install are never confirmed for the user. A reply that reports a failed call (a 403 after
   trying the fetch tool) is left as it is, and no follow-up makes again a call whose last two runs returned the same
-  result.
+  result. `followups = false` in `[server]` or a model (`MIDIR_FOLLOWUPS=0`) turns these follow-ups off; a forced
+  `tool_choice` is still asked for again.
 - Structured JSON is prompt + validation + one repair, not streamed incrementally.
 - `max_tokens` and `stop` are applied after generation; `count_tokens` is an estimate (4 chars per token).
 - Whenever a stream is idle (the backend can take a minute to start, a follow-up runs after the text), an SSE
