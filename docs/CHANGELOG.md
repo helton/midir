@@ -3,6 +3,12 @@
 All notable changes are listed here. Versions follow [Semantic Versioning](https://semver.org/); before 1.0.0 a minor
 release may change configuration or behavior.
 
+## Unreleased
+
+- **Documentation**: a new README (logo, diagram, highlights, quick start, measured performance) and the reference
+  material in guides: [configuration](configuration.md), [API compatibility](compatibility.md),
+  [operations](operations.md) and [development](development.md).
+
 ## 0.1.1 (2026-10-05)
 
 - **No more patches written as text**: the tool protocol now tells every model that text changes nothing: to create

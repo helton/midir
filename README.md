@@ -1,287 +1,200 @@
-# Midir
+<p align="center">
+  <img src="docs/assets/midir-logo.svg" alt="MIDIR logo: a Celtic triquetra" width="112">
+</p>
 
-**An LLM gateway for agent platforms.** One local endpoint that speaks **OpenAI Chat Completions**, **OpenAI
-Responses** and **Anthropic Messages**, so agent and coding clients (Claude Code, GitHub Copilot, Hermes Agent,
-DeepSeek Harness, OpenClaw) use the models behind it as if they were native providers.
+<h1 align="center">MIDIR</h1>
 
-Backends are pluggable. Today the one backend is **StackSpot AI**: its Agent API takes one text prompt and streams text
-back, so Midir emulates everything else on top of it: conversation roles, streaming in each protocol's own events,
-tool calling (including parallel calls), `tool_choice`, structured JSON output, stop sequences, `previous_response_id`.
-The request's `model` picks the model, and each model points to a backend and a target (a StackSpot agent), so
-several LLMs (GPT 5.1, GPT 4.1, StackSpot's Flex) are served side by side.
+<p align="center">
+  <strong>One local endpoint for every agent client, on any LLM platform.</strong><br>
+  An OpenAI- and Anthropic-compatible gateway that lets Claude Code, GitHub Copilot and other agents<br>
+  use models they cannot talk to natively, with tool calling, streaming and structured output.
+</p>
 
-> **Why "Midir"?** In Irish mythology, Midir is a king of the Tuatha Dé Danann who lives in the Otherworld and crosses
-> into the world of mortals; one of the tasks set for him is building a causeway across a bog, a road where there was
-> none. Midir does the same between clients and agent platforms that do not speak the same language.
+<p align="center">
+  <a href="https://github.com/helton/midir/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/helton/midir/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/helton/midir/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/helton/midir?sort=semver&color=4338CA"></a>
+  <a href="https://github.com/helton/midir/pkgs/container/midir"><img alt="Container image" src="https://img.shields.io/badge/ghcr.io-helton%2Fmidir-0891B2?logo=docker&logoColor=white"></a>
+  <img alt="Platforms" src="https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-555">
+  <a href="rust-toolchain.toml"><img alt="Rust 1.99" src="https://img.shields.io/badge/rust-1.99-CE422B?logo=rust&logoColor=white"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/helton/midir?color=2E7D32"></a>
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#connect-your-client">Clients</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#documentation">Docs</a> ·
+  <a href="docs/CHANGELOG.md">Changelog</a>
+</p>
+
+---
+
+Agent platforms often expose their models through an API of their own: plain text in, plain text out. Coding agents
+expect OpenAI or Anthropic APIs, with tools, roles and streaming. **Midir sits in between**: clients talk to it as if
+it were a native provider, and Midir turns each request into what the platform understands, then turns the answer
+back into tool calls, streaming events and usage, in each protocol's own format.
+
+Backends are pluggable. Today Midir serves **StackSpot AI** agents (GPT-5.1, GPT-4.1 and StackSpot's Flex side by
+side), and the request's `model` picks which one answers.
+
+## Highlights
+
+- **Three APIs, one endpoint**: OpenAI Chat Completions, OpenAI Responses (with `previous_response_id`) and Anthropic
+  Messages, streaming or not, each with its own events, errors and usage.
+- **Tool calling on text-only models**: tools, parallel calls and `tool_choice` emulated on top of the backend, with
+  lenient JSON parsing and a repair round for broken calls, so agents run multi-step tasks end to end.
+- **Agents that finish the job**: hidden follow-ups when a model announces an action without doing it, with strict
+  rules: never confirming for the user what they did not order, never looping on a failed call.
+- **Built for shared quotas**: a queue per backend with concurrency and rate limits, backoff on 429, and keepalives
+  for backends that take a minute to start.
+- **Observable**: OpenTelemetry traces and metrics, a ready-made Grafana dashboard and a proxy view of every request
+  in one `docker compose` command; Prometheus `/metrics` without a collector.
+- **Small and fast**: one static Rust binary, a 5 MB image (amd64 and arm64), 10 MB of memory at rest, about a
+  millisecond of overhead per request.
+
+## How it works
+
+```mermaid
+flowchart LR
+    subgraph clients["Agent clients"]
+        cc["Claude Code"]
+        gh["GitHub Copilot"]
+        ot["Hermes#160;Agent<br/>OpenClaw<br/>DeepSeek#160;Harness"]
+    end
+
+    subgraph midir["Midir"]
+        direction LR
+        api["<b>Protocol#160;adapters</b><br/>Chat#160;Completions<br/>Responses#160;·#160;Messages"]
+        engine["<b>Emulation#160;engine</b><br/>tool#160;calls#160;·#160;streaming<br/>JSON#160;output#160;·#160;follow#8209;ups"]
+        queue["<b>Backend#160;queue</b><br/>rate#160;limits#160;·#160;retries<br/>keepalives"]
+        api --> engine --> queue
+    end
+
+    cc -- Anthropic Messages --> api
+    gh -- OpenAI Responses --> api
+    ot -- Chat Completions --> api
+    queue -- "text prompt · SSE" --> agents[("<b>StackSpot#160;AI</b><br/>GPT#8209;5.1#160;·#160;GPT#8209;4.1<br/>Flex")]
+    engine -. "traces · metrics" .-> obs["<b>Observability</b><br/>Grafana#160;·#160;Tempo<br/>Prometheus"]
+
+    classDef core fill:#EEF2FF,stroke:#4338CA,stroke-width:2px,color:#1E1B4B
+    classDef edge fill:#ECFEFF,stroke:#0891B2,color:#083344
+    class api,engine,queue core
+    class cc,gh,ot,agents,obs edge
+    style midir fill:transparent,stroke:#4338CA,stroke-width:2px
+    style clients fill:transparent,stroke:#0891B2,stroke-dasharray:4 4
+```
+
+Each request is decoded into one canonical form, so every protocol gets the same emulation: the conversation and the
+tool list become a prompt, the model's text is parsed back into tool calls as it streams, and the result is encoded
+in the client's protocol. Details: [docs/architecture.md](docs/architecture.md).
 
 ## Quick start
 
-You need a StackSpot client key (client id and secret of your realm) and at least one agent configured as in
+You need Docker, a StackSpot client key (client id and secret of your realm) and at least one agent configured as in
 [docs/backends/stackspot.md](docs/backends/stackspot.md).
 
 ```bash
 git clone https://github.com/helton/midir && cd midir
-cp .env.example .env                                   # credentials and agent ids
-cp config/midir.example.toml config/midir.toml         # backends and models
+cp .env.example .env                                # credentials and agent ids
+cp config/midir.example.toml config/midir.toml      # backends and models
 mkdir -p docker/data/gateway
-docker compose -f docker/compose.yml up -d             # pulls ghcr.io/helton/midir (public, ~5 MB, amd64 and arm64)
-curl -s http://127.0.0.1:18880/ready                   # {"ok": true, ...} once the credentials work
+docker compose -f docker/compose.yml up -d          # pulls ghcr.io/helton/midir
+curl -s http://127.0.0.1:18880/ready                # {"ok": true, ...} once the credentials work
 ```
 
-Then point a client at `http://127.0.0.1:18880/v1` (Anthropic clients: `http://127.0.0.1:18880`) with any API key, or
-with the key you set in `MIDIR_API_KEY`; see [Clients](#clients).
+Point your client at `http://127.0.0.1:18880/v1` (Anthropic clients: `http://127.0.0.1:18880`). Any API key works,
+unless you set `MIDIR_API_KEY`.
 
-**From source** (Rust 1.99, pinned in `rust-toolchain.toml`; rustup installs it; Midir is a single binary):
+<details>
+<summary><strong>With the observability stack</strong> (mitmproxy + Grafana)</summary>
 
 ```bash
-cargo build --release      # target/release/midir
+docker compose -f docker/compose.yml -f docker/compose.observability.yml up -d
+```
+
+Clients keep using port 18880. Every request and backend call shows up in mitmweb at
+`http://127.0.0.1:18882/?token=gateway`, and the **midir** dashboard in Grafana at `http://127.0.0.1:18883`.
+</details>
+
+<details>
+<summary><strong>From source</strong> (Rust 1.99, installed by rustup)</summary>
+
+```bash
+cargo build --release      # target/release/midir, a single binary
 ./target/release/midir     # reads .env and config/midir.toml from the current directory; --help for the options
 ```
+</details>
 
-**Docker, building the image locally** (with or without the observability stack):
+## Connect your client
 
-```bash
-cargo xtask deploy standalone  # Midir only
-cargo xtask deploy full        # Midir + mitmproxy + Grafana LGTM
-```
+Ready-to-use configurations live in [examples/clients/](examples/clients/):
 
-## Ports
+| Client | API | Configuration |
+|---|---|---|
+| **Claude Code** | Anthropic Messages | [`claude-code/settings.json`](examples/clients/claude-code/settings.json): Opus, Sonnet and Haiku mapped to gpt-5.1, flex and gpt-4.1 |
+| **GitHub Copilot** (VS Code) | OpenAI Responses | [`copilot/`](examples/clients/copilot/): one provider with every model |
+| **Hermes Agent** | Chat Completions | [`hermes/`](examples/clients/hermes/) |
+| **DeepSeek Harness** (`dsh`) | Chat Completions | [`deepseek-harness/`](examples/clients/deepseek-harness/) |
+| **OpenClaw** | Chat Completions or Responses | [`openclaw/`](examples/clients/openclaw/) |
 
-Everything the stack publishes lives in the block **18880-18889**, bound to 127.0.0.1:
-
-| Port | What |
-|---|---|
-| 18880 | Midir; point clients here (through mitmproxy when the observability overlay is on) |
-| 18881 | Midir directly (overlay only) |
-| 18882 | mitmweb, `http://127.0.0.1:18882/?token=gateway`: every client request and every backend call |
-| 18883 | Grafana, dashboard **midir** (no login) |
-| 18884 | OTLP/HTTP, for Midir running outside Docker |
-
-Container data lives in `docker/data/`, one folder per service: `gateway` (the `previous_response_id` store),
-`mitm` (proxy CA) and `lgtm` (Grafana, Prometheus, Tempo). The Midir container runs as your user, never root.
+Validated end to end with Claude Code, GitHub Copilot CLI, Hermes Agent, DeepSeek Harness and OpenClaw on every
+model (multi-file edits, test runs and commits); GitHub Copilot in VS Code is in daily use. Agents running on top of
+Midir can read [docs/agent-brief.md](docs/agent-brief.md) to learn what the emulation means for them.
 
 ## Configuration
 
-Two files at the repository root (or the working directory):
-
-- **`config/midir.toml`** (copy [config/midir.example.toml](config/midir.example.toml)): `[server]` (port, prompt
-  cap, tool-protocol knobs, Responses store), `[telemetry]`, the **backends** (`[backends.<name>]` with its `type`,
-  its options and `[backends.<name>.limits]`) and the **models** clients see (`default_model` and one `[[models]]`
-  entry each).
-- **`.env`** (copy [.env.example](.env.example)): secrets and agent ids only, referenced from the TOML. Never committed.
+Models are declared once and routed by name. A minimal `config/midir.toml`:
 
 ```toml
 default_model = "gpt-5.1"
 
 [backends.stackspot]
 type = "stackspot"
-realm = "${STACKSPOT_REALM}"
+realm = "${STACKSPOT_REALM}"                 # secrets stay in .env
 client_id = "${STACKSPOT_CLIENT_ID}"
 client_secret = "${STACKSPOT_CLIENT_SECRET}"
 
 [[models]]
 name = "gpt-5.1"
-backend = "stackspot"                     # optional while there is one backend
-target = "${STACKSPOT_GPT_5_1_AGENT_ID}"  # StackSpot: the agent id
-aliases = ["claude-opus-4-5"]             # extra exact names some clients send
-# match = "^(openai/)?gpt-5"              # optional regex
-# tail_reminder = true                    # per-model knobs override [server]
-# followups = false                       # e.g. no hidden follow-ups for this model
+target = "${STACKSPOT_GPT_5_1_AGENT_ID}"     # the StackSpot agent that serves it
+aliases = ["claude-opus-4-5"]                # names some clients send by default
 ```
 
-**Routing** of a requested `model`: exact name or alias (case-insensitive) > `match` regex (file order) > exact after
-a provider prefix (`openai/gpt-4.1`, `stackspot-gpt-4.1`) > longest configured name contained in it > `default_model`.
-`GET /v1/models` lists the models; `GET /health` shows the mapping, the loaded file and each backend's queue.
+Every setting can be overridden by an environment variable. Routing rules, variables and security:
+[docs/configuration.md](docs/configuration.md).
 
-**Environment wins over the file**, so Docker and other machines override without editing it: `MIDIR_PORT`,
-`MIDIR_CONFIG` (path of the TOML), `MIDIR_REQUESTS_PER_MINUTE`, `MIDIR_MAX_CONCURRENT`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
-the StackSpot credentials `STACKSPOT_REALM`, `STACKSPOT_CLIENT_ID`, `STACKSPOT_CLIENT_SECRET`, `STACKSPOT_CA_BUNDLE`, and
-the rest listed in `midir --help`. The queue limits and the `STACKSPOT_*` variables apply to every backend (of that
-type): a second StackSpot account goes in its own `[backends.<name>]` options, with those variables unset. In Docker, `config/midir.toml` is injected as a compose config: after editing it,
-run `docker compose -f docker/compose.yml up -d --force-recreate midir`. A configuration in the pre-0.0.1 layout
-(`[stackspot]`, `[[agents]]`) is still read, with a warning.
+## Performance
 
-## Clients
+Measured against a local StackSpot stand-in, so only Midir's own cost counts:
 
-Ready configurations in [examples/clients/](examples/clients/) (with a README where there is more to say):
-
-| Client | API used | Files |
-|---|---|---|
-| Claude Code | Anthropic Messages | `claude-code/settings.json`: run `claude --settings examples/clients/claude-code/settings.json` (Opus, Sonnet and Haiku slots mapped to gpt-5.1, flex and gpt-4.1; also overrides a corporate Bedrock/Vertex setting) |
-| GitHub Copilot (VS Code) | OpenAI Responses | `copilot/chatLanguageModels.json` (one provider, all models) |
-| Hermes Agent | Chat Completions | `hermes/config.yaml` |
-| DeepSeek Harness (`dsh`) | Chat Completions | `deepseek-harness/cordis.patch.yml` |
-| OpenClaw | Chat Completions or Responses | `openclaw/openclaw.json` |
-
-Validated end to end on the three models with Claude Code, GitHub Copilot CLI, Hermes Agent, DeepSeek Harness and
-OpenClaw (multi-file edits, tests, commits, and tool arguments with quotes, backslashes and tabs); GitHub Copilot in
-VS Code uses the same OpenAI APIs and is in daily use with the configuration above. Without `MIDIR_API_KEY`, Midir
-needs no API key and clients may send any value; with it, clients send that key as their API key. For agents running
-on top of it, [docs/agent-brief.md](docs/agent-brief.md) explains what the
-emulation means for them.
-
-## Endpoints
-
-| Method and path | What |
+| | |
 |---|---|
-| `POST /v1/chat/completions` | OpenAI Chat Completions, streaming or not |
-| `POST /v1/responses`, `GET /v1/responses/{id}` | OpenAI Responses, streaming or not, `previous_response_id` |
-| `POST /v1/messages`, `POST /v1/messages/count_tokens` | Anthropic Messages, streaming or not |
-| `GET /v1/models` | configured models |
-| `GET /health` | version, model mapping, backends and their queues, the Responses memory cache (liveness) |
-| `GET /ready` | each backend's readiness: credentials, network and TLS, without spending model quota (503 on failure) |
-| `GET /metrics` | the metrics in Prometheus format, with `[telemetry] prometheus = true` |
+| Image | ~12 MB, ~5 MB compressed (amd64, arm64) |
+| Memory | ~10 MB at rest; ~100 MB with 32 concurrent 230 KB requests, most of it given back within seconds |
+| Startup | under 100 ms |
+| Overhead | ~1 ms per small request; ~11 ms for a 230 KB Copilot request with 36 tools |
+| Throughput | 600+ requests/s with 32 concurrent 230 KB requests (the backend allows 100 per minute) |
 
-## How faithful the emulation is
+## Documentation
 
-**Native-like**: all message roles; function tools with schemas, parallel calls (or one call with
-`parallel_tool_calls: false`) and results; `tool_choice` auto/none/required/named; streaming in each protocol's own
-event format; real token usage; errors in each protocol's format; `previous_response_id` chains that survive restarts
-(30 days, 500 MB cap) and `item_reference` to their output items.
-
-**With caveats** (search the code for `CAVEAT`):
-- Tool calling is prompt-based: `<tool_call>` blocks are parsed from the model's text. JSON with raw newlines, tabs or
-  trailing commas is read as meant; a call whose JSON is still invalid gets one hidden follow-up and is never passed on
-  broken. A reply that only announces an action, denies an ability a tool provides, or leaves pending an action the
-  user ordered gets a hidden follow-up (two at most) whose calls are appended to the same response. A follow-up only
-  confirms a commit or a test run the user explicitly ordered (and did not forbid, condition or keep for themselves);
-  push, merge, deploy and install are never confirmed for the user. A reply that reports a failed call (a 403 after
-  trying the fetch tool) is left as it is, and no follow-up makes again a call whose last two runs returned the same
-  result. `followups = false` in `[server]` or a model (`MIDIR_FOLLOWUPS=0`) turns these follow-ups off; a forced
-  `tool_choice` is still asked for again.
-- Structured JSON is prompt + validation + one repair, not streamed incrementally.
-- `max_tokens` and `stop` are applied after generation; `count_tokens` is an estimate (4 chars per token).
-- Whenever a stream is idle (the backend can take a minute to start, a follow-up runs after the text), an SSE
-  keepalive goes out every 15 s (`[server] keepalive_s`) so clients and proxies with idle timeouts do not abort.
-- Above the prompt cap the oldest turns are dropped and the model is told; if the recent turns alone are still too
-  big, the largest tool results (then user messages) are cut in the middle, keeping head and tail. A backend refusal
-  for input length is retried once with a proportionally smaller prompt.
-- Images, audio and files become a text placeholder; built-in provider tools (web search, ...) are omitted.
-- **Refused**: `logprobs`, `n > 1`, `/v1/embeddings`. **Accepted and ignored** (logged once per client): `temperature`,
-  `top_p`, `seed`, `reasoning`, `reasoning_effort`, `thinking`, `cache_control`, `metadata`.
-
-How the pieces fit, and how to add a backend: [docs/architecture.md](docs/architecture.md).
-
-## Limits (StackSpot)
-
-- Input up to **272,000 tokens**.
-- **100 requests per minute per account**, shared by every agent and client. Midir queues instead of failing
-  (`[backends.stackspot.limits]`: 8 concurrent, 90 per minute by default); a backend 429 pauses new requests and
-  halves the local budget, which recovers by one request per minute, so a second Midir or StackSpot's own chat on the
-  same account is absorbed. Midir's own 429s carry `Retry-After`.
-- GPT 5.x counts its reasoning as output tokens; time to first byte is 1.5-8 s depending on prompt size and model.
-
-More in [docs/backends/stackspot.md](docs/backends/stackspot.md).
-
-## Telemetry
-
-With `OTEL_EXPORTER_OTLP_ENDPOINT` set (the observability overlay does it), each request produces an OpenTelemetry
-span (kind SERVER, the child of the client's `traceparent` when it sends one) with a CLIENT child span per backend
-call, and a few metrics (`midir.*`): tokens, duration, time to first byte, model and backend, client (`claude-code`,
-`copilot`, `hermes`, `openclaw`, `deepseek-harness`, ...), session, tool calls, follow-ups, retries, queue waits,
-truncations. Series idle for an hour are dropped. Without a collector, `[telemetry] prometheus = true` serves the
-metrics at `GET /metrics`. Prompt content is never exported. Responses carry the request id (`x-request-id`, or
-`request-id` for Anthropic clients), which the log and the spans also show. Logs: `MIDIR_LOG=<filter>` (for example
-`info,midir::store=debug`) and `MIDIR_LOG_FORMAT=json`. The Grafana dashboard is provisioned from
-[docker/grafana/](docker/grafana/).
-
-## Security
-
-Binds to `127.0.0.1`. By default it has **no authentication**: keep it local, or set `MIDIR_API_KEY` (or
-`[server] api_key`) and every endpoint but `/health` and `/ready` wants it as `Authorization: Bearer <key>` or
-`x-api-key: <key>`; without a key, Midir notes in the log when it listens beyond localhost. Everything a client sends
-(open files, terminal output) goes to the backend, as it would to any hosted LLM. Prompts and model output are logged
-only at the DEBUG level (`--debug`, or a `MIDIR_LOG` filter that turns it on), to stderr. The only data written to disk is the Responses store
-(`docker/data/gateway/responses`, or `data/gateway/responses` from source): conversation content in owner-only files
-(0600, folders 0700), kept 30 days, capped at 500 MB, not encrypted. `responses_dir = ""` keeps it in memory only, and
-so does a folder that cannot be created (a container started without its data volume), with a warning in the log.
-
-## Development
-
-Everything is Rust: rustup installs the toolchain pinned in `rust-toolchain.toml` (Rust 1.99); Docker builds the
-images. The regression suite is black-box: each test starts the binary Cargo built as a process, in front of a
-scripted StackSpot (nothing leaves the machine), and checks what clients see over HTTP; unit and property tests cover
-the parsers of untrusted input. Repository tasks are a workspace member, `xtask`, run through a Cargo alias.
-
-```bash
-cargo run --release                         # build and run from source (reads .env and config/midir.toml)
-cargo test --profile ci                     # unit, property and black-box tests, as CI runs them (~1 min)
-cargo clippy --all-targets -- -D warnings   # lints, as CI runs them (also: cargo fmt --check, cargo deny check)
-cargo xtask smoke                           # live acceptance against a running Midir (25 checks, real backend requests)
-cargo xtask check-leaks                     # scan what git would publish for secrets, agent ids, home paths, e-mails
-cargo xtask                                 # all tasks
-```
-
-Opt-in tests, for material that stays out of the repository: `--test replay -- --ignored` (real client requests,
-`MIDIR_CAPTURES=<dir>`), `--test followups_corpus -- --ignored` (labeled model replies, `MIDIR_PROMISE_CORPUS=<dir>`)
-and `--test mitm -- --ignored` (the observability proxy streams SSE; needs mitmproxy 12). The one file in another
-language is `docker/mitm/sse_stream.py`: a mitmproxy addon for the observability stack (mitmproxy only loads Python
-addons).
-
-| Path | Contents |
+| Guide | What it covers |
 |---|---|
-| `src/` | the gateway: `protocols/`, `emulation/`, `backends/`, `gateway.rs`, `app.rs`, `config.rs`, `store.rs`, `telemetry.rs`, `main.rs` ([architecture](docs/architecture.md)) |
-| `tests/` | black-box regression suite: the binary as a process, a scripted backend (`tests/common/`) |
-| `config/` | `midir.example.toml` (your `midir.toml` is not versioned) |
-| `docker/` | `Dockerfile`, compose files, Grafana provisioning, `data/` (runtime, not versioned) |
-| `examples/clients/` | client configurations |
-| `docs/` | architecture, backend notes, agent brief, changelog |
-| `xtask/` | repository tasks (`cargo xtask`): version, bump, check-leaks, smoke, deploy |
-| `.github/workflows/` | CI: tests, images and releases to ghcr.io from `main` |
+| [Configuration](docs/configuration.md) | files, models and routing, environment variables, security |
+| [API compatibility](docs/compatibility.md) | endpoints, what is native-like, what is emulated with caveats, backend limits |
+| [Operations](docs/operations.md) | ports, images and versions, telemetry, logs, troubleshooting |
+| [Architecture](docs/architecture.md) | how a request flows, the emulation engine, adding a backend |
+| [StackSpot backend](docs/backends/stackspot.md) | agents, credentials, limits and quirks |
+| [Agent brief](docs/agent-brief.md) | for agents that run on Midir: what to expect |
+| [Development](docs/development.md) | building, testing, repository layout, releases |
+| [Changelog](docs/CHANGELOG.md) | what changed in each version |
 
-**Branches and images** (trunk-based): everything lands on `main`, directly or through a pull request from a
-feature branch. [ci.yml](.github/workflows/ci.yml) runs the tests on every pull request and push; then:
+## Why "Midir"?
 
-| Push to `main` | Image on `ghcr.io/helton/midir` (amd64 + arm64) |
-|---|---|
-| any | `dev` (the latest `main` build) and `sha-<commit>` |
-| whose `Cargo.toml` version has no `vX.Y.Z` tag yet | the same build also as `X.Y.Z`, `X.Y` and `latest`, then the tag `vX.Y.Z` and a GitHub release with that version's section of the CHANGELOG |
-
-Tags are never created by hand. Changes go under `## Unreleased` in [docs/CHANGELOG.md](docs/CHANGELOG.md); to
-release:
-
-```bash
-cargo xtask bump [patch|minor|major|X.Y.Z]  # Cargo.toml, Cargo.lock and the default image tag in docker/compose.yml
-# rename "## Unreleased" in docs/CHANGELOG.md to "## X.Y.Z (date)", then commit
-git push                                     # CI tests, publishes X.Y.Z and latest, tags vX.Y.Z
-```
-
-A version that is not released and has no CHANGELOG section fails CI, on `main` and in pull requests.
-
-Every build says what it is (`midir --version`, the startup banner, `GET /health`): a release reports the bare version
-(`0.1.0`); anything else carries the commit as semver build metadata, `0.1.0+dev.a817822` for any other `main` build,
-`0.1.0+local.a817822` for an image built here (`.dirty` with uncommitted changes) and `0.1.0+src.a817822` for a
-binary built from a git checkout.
-
-`docker/compose.yml` runs the release it was bumped to; another build runs with `MIDIR_IMAGE`, e.g.
-`MIDIR_IMAGE=ghcr.io/helton/midir:sha-a817822 docker compose -f docker/compose.yml up -d`. Prefer a version or
-`sha-<commit>` to `dev` and `latest`: those move, and a registry mirror (a corporate Artifactory, for one) can keep
-serving an old build under them for hours. The version lives only in
-`Cargo.toml` (`midir --version`, `GET /health`, first log line); changes are listed in
-[docs/CHANGELOG.md](docs/CHANGELOG.md).
-
-## Troubleshooting
-
-- **`/ready` answers 503**: a backend's readiness check failed; the message says why (StackSpot: realm, client id or
-  secret, network, CA).
-- **403 with an empty body on requests**: an agent id is wrong or not shared with the client key; `GET /health` shows
-  which target each model maps to.
-- **429**: the account's 100 requests per minute were exceeded (several clients or Midir instances on one account).
-- **401 from Midir**: `MIDIR_API_KEY` is set and the client sent another key (or none).
-- **Client says the model does not support tools or images**: declare tool calling on and vision off (see the client
-  examples); images become placeholders on purpose.
-- **Log times in UTC**: containers run in UTC; set `TZ` in `.env` (for example `TZ=America/Sao_Paulo`) and recreate
-  the container. Running from source uses the machine's time zone.
-- **Corporate TLS**: Midir trusts the system's certificate store (and `SSL_CERT_FILE`); for a CA that is not there,
-  set `STACKSPOT_CA_BUNDLE` to a PEM bundle with it (added to the trusted roots). Cargo itself honors
-  `CARGO_HTTP_CAINFO`.
-- **Corporate proxy**: Midir honors `HTTPS_PROXY`/`https_proxy` and `NO_PROXY`/`no_proxy`; when both spellings are
-  set, the uppercase one wins.
-- **Pulling the image**: `ghcr.io/helton/midir` is public, no login needed; for a registry mirror or a fork, set
-  `MIDIR_IMAGE=<registry>/midir:<tag>` in the shell or `docker/.env`.
-- **Name resolution behind a corporate proxy**: the image's binary is static (musl's resolver). If names resolve
-  differently than on the host, run a binary built for the host from source (`cargo build --release`).
+In Irish mythology, Midir is a king of the Tuatha Dé Danann who lives in the Otherworld and crosses into the world of
+mortals; one of the tasks set for him is building a causeway across a bog, a road where there was none. Midir does the
+same between agent clients and the platforms that do not speak their language. The logo is a triquetra, a Celtic knot of three
+woven loops.
 
 ## License
 
-[MIT](LICENSE).
+[MIT](LICENSE)

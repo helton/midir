@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-labelledby="title">
+  <title id="title">MIDIR</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="128" y2="128" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3730A3"/>
+      <stop offset="1" stop-color="#0E7490"/>
+    </linearGradient>
+    <mask id="m0" maskUnits="userSpaceOnUse" x="0" y="0" width="128" height="128"><rect width="128" height="128" fill="#fff"/><g fill="none"><path d="M70.67 86.43 A33 33 0 0 1 58.26 78.23" stroke="#000" stroke-width="14.0"/></g></mask>
+    <mask id="m1" maskUnits="userSpaceOnUse" x="0" y="0" width="128" height="128"><rect width="128" height="128" fill="#fff"/><g fill="none"><path d="M42.97 61.57 A33 33 0 0 1 56.28 54.92" stroke="#000" stroke-width="14.0"/></g></mask>
+    <mask id="m2" maskUnits="userSpaceOnUse" x="0" y="0" width="128" height="128"><rect width="128" height="128" fill="#fff"/><g fill="none"><path d="M78.35 50.01 A33 33 0 0 1 77.46 64.85" stroke="#000" stroke-width="14.0"/></g></mask>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="url(#bg)"/>
+  <!-- a triquetra, Celtic knotwork: three woven loops, each going over one neighbor and under the other -->
+  <g fill="none" stroke-linejoin="round" transform="translate(64 64) scale(1.2) translate(-64 -56.5)">
+    <path d="M31.06 85.02 A33 33 0 0 1 78.75 57.48 A33 33 0 0 1 31.06 85.02 Z" stroke="#FFFFFF" stroke-width="8.0" mask="url(#m0)"/>
+    <path d="M64.00 27.96 A33 33 0 0 1 64.00 83.04 A33 33 0 0 1 64.00 27.96 Z" stroke="#FFFFFF" stroke-width="8.0" mask="url(#m1)"/>
+    <path d="M96.94 85.02 A33 33 0 0 1 49.25 57.48 A33 33 0 0 1 96.94 85.02 Z" stroke="#FFFFFF" stroke-width="8.0" mask="url(#m2)"/>
+  </g>
+</svg>
