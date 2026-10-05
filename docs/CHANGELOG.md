@@ -3,7 +3,7 @@
 All notable changes are listed here. Versions follow [Semantic Versioning](https://semver.org/); before 1.0.0 a minor
 release may change configuration or behavior.
 
-## Unreleased
+## 0.1.1 (2026-10-05)
 
 - **No more patches written as text**: the tool protocol now tells every model that text changes nothing: to create
   or edit a file it calls a tool that writes it, never a patch or diff in the reply (`*** Begin Patch`, `diff --git`).
