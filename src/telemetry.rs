@@ -40,6 +40,8 @@ const SESSION_HEADERS: [&str; 7] = [
 /// LLM calls take from a fraction of a second to minutes.
 const LATENCY_BUCKETS: [f64; 12] = [100.0, 250.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0, 30000.0, 60000.0, 120000.0, 300000.0];
 /// Queue waits are usually nothing, sometimes seconds.
+/// The GenAI semantic conventions' advice for durations, in seconds.
+const SECONDS_BUCKETS: [f64; 14] = [0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92];
 const QUEUE_BUCKETS: [f64; 15] = [0.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0, 750.0, 1000.0, 2500.0, 5000.0, 7500.0, 10000.0];
 /// A series not updated for this long is dropped (its last value stays in the metrics backend).
 const SERIES_TTL: Duration = Duration::from_secs(3600);
@@ -179,7 +181,7 @@ const fn instrument(name: &'static str, kind: Kind, unit: &'static str, descript
     Instrument { name, kind, unit, description, buckets: &[] }
 }
 
-const INSTRUMENTS: [Instrument; 12] = [
+const INSTRUMENTS: [Instrument; 14] = [
     instrument("midir.requests", Kind::Counter, "1", "LLM requests handled"),
     instrument(
         "gen_ai.client.token.usage",
@@ -211,6 +213,14 @@ const INSTRUMENTS: [Instrument; 12] = [
         "Upstream calls whose prompt was cut to the size cap (old turns dropped or texts cut)",
     ),
     instrument("midir.dropped_turns", Kind::Counter, "{turn}", "Old conversation turns dropped to fit the size cap"),
+    Instrument {
+        buckets: &SECONDS_BUCKETS,
+        ..instrument("gen_ai.server.request.duration", Kind::Histogram, "s", "GenAI server request duration (semantic conventions)")
+    },
+    Instrument {
+        buckets: &SECONDS_BUCKETS,
+        ..instrument("gen_ai.server.time_to_first_token", Kind::Histogram, "s", "Time to the first output (semantic conventions)")
+    },
 ];
 
 fn instrument_of(name: &str) -> &'static Instrument {
@@ -315,8 +325,10 @@ impl Metrics {
     fn prometheus(&self) -> String {
         fn name_of(m: &MetricData) -> String {
             let mut n = m.name.replace('.', "_");
-            if m.unit == "ms" {
-                n.push_str("_milliseconds");
+            match m.unit {
+                "ms" => n.push_str("_milliseconds"),
+                "s" => n.push_str("_seconds"),
+                _ => {}
             }
             n
         }
@@ -448,8 +460,8 @@ impl Telemetry {
         let mut headers = parse_pairs(&env("OTEL_EXPORTER_OTLP_HEADERS").unwrap_or_default());
         let mut resource: Attrs = vec![
             ("telemetry.sdk.language".into(), s("rust")),
-            ("telemetry.sdk.name".into(), s("opentelemetry")),
-            ("telemetry.sdk.version".into(), s("midir-otlp")),
+            ("telemetry.sdk.name".into(), s("midir")),
+            ("telemetry.sdk.version".into(), s(env!("CARGO_PKG_VERSION"))),
         ];
         let mut id = random::<16>();
         id[6] = (id[6] & 0x0f) | 0x40; // a random (version 4) UUID
@@ -461,9 +473,24 @@ impl Telemetry {
             resource.retain(|(x, _)| *x != k);
             resource.push((k, AttrValue::Str(v)));
         }
-        for (k, v) in [("service.name", service_name.to_string()), ("service.version", crate::buildinfo::full_version())] {
+        // service.name: OTEL_SERVICE_NAME, else OTEL_RESOURCE_ATTRIBUTES, else the configuration
+        let named = resource.iter().any(|(k, _)| k == "service.name");
+        let mut own = vec![("service.version", crate::buildinfo::full_version())];
+        if env("OTEL_SERVICE_NAME").is_some_and(|n| !n.is_empty()) || !named {
+            own.push(("service.name", service_name.to_string()));
+        }
+        for (k, v) in own {
             resource.retain(|(x, _)| x != k);
             resource.push((k.into(), AttrValue::Str(v)));
+        }
+        let service = match resource.iter().find(|(k, _)| k == "service.name") {
+            Some((_, AttrValue::Str(v))) => v.clone(),
+            _ => service_name.to_string(),
+        };
+        for var in ["OTEL_EXPORTER_OTLP_PROTOCOL", "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL"] {
+            if let Some(p) = env(var).filter(|p| !p.is_empty() && p != "http/protobuf") {
+                tracing::warn!("{var}={p} is not supported: Midir exports OTLP over HTTP/protobuf only");
+            }
         }
         headers.push(("Content-Type".into(), "application/x-protobuf".into()));
         let http = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap_or_default();
@@ -476,7 +503,7 @@ impl Telemetry {
             spans: Mutex::new(vec![]),
             closed: AtomicBool::new(false),
         });
-        tracing::info!("telemetry on: OTLP/HTTP -> {endpoint} (service {service_name})");
+        tracing::info!("telemetry on: OTLP/HTTP -> {endpoint} (service {service})");
         Telemetry { metrics, exp: Some(exp) }
     }
 
@@ -548,7 +575,10 @@ impl Telemetry {
     pub fn begin(&self, shared: &SharedMeta, rid: &str) -> Option<Span> {
         self.exp.as_ref()?;
         let mut meta = shared.lock().unwrap_or_else(|e| e.into_inner());
-        let ctx = TraceContext { trace_id: meta.parent.map_or_else(random::<16>, |p| p.trace_id), span_id: random::<8>() };
+        if meta.parent.is_some_and(|p| !p.sampled) {
+            return None;
+        }
+        let ctx = TraceContext { trace_id: meta.parent.map_or_else(random::<16>, |p| p.trace_id), span_id: random::<8>(), sampled: true };
         meta.span = Some(ctx);
         let provider = if meta.backend_type.is_empty() { "unknown" } else { meta.backend_type.as_str() };
         let attrs: Attrs = vec![
@@ -566,12 +596,15 @@ impl Telemetry {
             ("midir.stream".into(), AttrValue::Bool(meta.stream)),
             ("midir.tools_declared".into(), AttrValue::Int(meta.tools_declared)),
             ("midir.json_mode".into(), AttrValue::Bool(meta.json_mode)),
+            ("http.request.method".into(), s("POST")),
+            ("http.route".into(), s(route_of(&meta.protocol))),
+            ("url.path".into(), s(route_of(&meta.protocol))),
         ];
         Some(Span {
             ctx,
             parent: meta.parent.map(|p| p.span_id),
             kind: SpanKind::Server,
-            name: format!("gen_ai.chat {}", meta.protocol),
+            name: format!("chat {}", meta.model),
             start_ns: now_ns(),
             attrs,
         })
@@ -646,6 +679,14 @@ impl Telemetry {
         if let Some(t) = ttfb {
             self.record("midir.request.ttfb", lbl.clone(), 0, t * 1000.0);
         }
+        let mut semconv = semconv_labels(meta);
+        if let Some(e) = &error {
+            semconv.push(("error.type".into(), s(e)));
+        }
+        self.record("gen_ai.server.request.duration", semconv.clone(), 0, duration_ms / 1000.0);
+        if let Some(t) = ttfb {
+            self.record("gen_ai.server.time_to_first_token", semconv, 0, t);
+        }
         if let Some(r) = resp {
             let mut i = lbl.clone();
             i.push(("gen_ai.token.type".into(), s("input")));
@@ -690,7 +731,7 @@ impl Telemetry {
                 return;
             };
             let span = Span {
-                ctx: TraceContext { trace_id: parent.trace_id, span_id: random::<8>() },
+                ctx: TraceContext { trace_id: parent.trace_id, span_id: random::<8>(), sampled: true },
                 parent: Some(parent.span_id),
                 kind: SpanKind::Client,
                 name: format!("chat {model}"),
@@ -772,6 +813,26 @@ fn labels(meta: &Meta) -> Attrs {
         ("midir.initiator".into(), s(&meta.initiator)),
         ("session.id".into(), s(session)),
     ]
+}
+
+/// The few, bounded attributes of the semantic-convention histograms.
+fn semconv_labels(meta: &Meta) -> Attrs {
+    let provider = if meta.backend_type.is_empty() { "unknown" } else { meta.backend_type.as_str() };
+    vec![
+        ("gen_ai.operation.name".into(), s("chat")),
+        ("gen_ai.provider.name".into(), s(provider)),
+        ("gen_ai.response.model".into(), s(&meta.agent)),
+    ]
+}
+
+/// The HTTP route a protocol is served on.
+fn route_of(protocol: &str) -> &'static str {
+    match protocol {
+        "chat" => "/v1/chat/completions",
+        "responses" => "/v1/responses",
+        "messages" => "/v1/messages",
+        _ => "",
+    }
 }
 
 impl Exporter {

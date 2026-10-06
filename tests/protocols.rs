@@ -506,3 +506,19 @@ fn protocol_gaps_from_the_review() {
     let r = rig.http.post("/v1/messages", &json!({"model": "claude-opus-4-5", "max_tokens": 50, "messages": user("hi")})).json();
     assert_eq!(r["content"], json!([]));
 }
+
+#[test]
+fn wrong_methods_and_trailing_slashes() {
+    // review 2026-10-05 (F28): the 405 fallback and the path normalization had no black-box test
+    let rig = Rig::new();
+    let r = rig.http.get("/v1/chat/completions");
+    assert_eq!(r.status, 405);
+    assert_eq!(r.json()["error"]["code"], "method_not_allowed");
+    let r = rig.http.get_with_headers("/v1/messages", &[("anthropic-version", "2023-06-01")]);
+    assert_eq!(r.status, 405);
+    assert_eq!(r.json()["type"], "error"); // in the Anthropic shape
+    rig.upstream.add("ok");
+    let r = rig.http.post("/v1/chat/completions/", &json!({"model": "gpt-5.1", "messages": user("hi")}));
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(rig.http.get("/health/").status, 200);
+}

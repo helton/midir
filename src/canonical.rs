@@ -229,6 +229,8 @@ pub struct Meta {
 pub struct TraceContext {
     pub trace_id: [u8; 16],
     pub span_id: [u8; 8],
+    /// the `sampled` flag: a client that does not record its trace gets no spans from Midir either
+    pub sampled: bool,
 }
 
 impl TraceContext {
@@ -242,7 +244,8 @@ impl TraceContext {
         }
         let trace_id: [u8; 16] = unhex(trace)?.try_into().ok()?;
         let span_id: [u8; 8] = unhex(span)?.try_into().ok()?;
-        (trace_id != [0; 16] && span_id != [0; 8]).then_some(TraceContext { trace_id, span_id })
+        let sampled = unhex(flags)?.first()? & 1 == 1;
+        (trace_id != [0; 16] && span_id != [0; 8]).then_some(TraceContext { trace_id, span_id, sampled })
     }
 }
 

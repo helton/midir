@@ -2,8 +2,8 @@
 //! just built, `CARGO_BIN_EXE_midir`) in front of a scripted StackSpot stand-in (a real HTTP server in this process;
 //! nothing leaves the machine), and talks to it over HTTP exactly as the clients do.
 //!
-//!     cargo test --release                  # the whole suite (the release profile: the same binary the image ships)
-//!     cargo test --release --test protocols # one file
+//!     cargo test --profile ci                  # the whole suite (optimized like the release, without its slow link)
+//!     cargo test --profile ci --test protocols # one file
 #![allow(dead_code)]
 
 use std::collections::VecDeque;
@@ -21,6 +21,15 @@ use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use serde_json::{Value, json};
+
+/// Polls `done` every 20 ms for up to 5 s; panics with `what` when it never holds.
+pub fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
 
 pub const MIDIR_TOML: &str = r#"
 default_model = "gpt-5.1"

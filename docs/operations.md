@@ -51,13 +51,18 @@ for a binary built from a git checkout.
 ## Telemetry
 
 With `OTEL_EXPORTER_OTLP_ENDPOINT` set (the observability overlay does it), each request produces an OpenTelemetry
-span (kind SERVER, the child of the client's `traceparent` when it sends one) with a CLIENT child span per backend
-call, and a few metrics (`midir.*`): tokens, duration, time to first byte, model and backend, client (`claude-code`,
+span `chat <model>` (kind SERVER, the child of the client's `traceparent` when it sends one; none when that trace is
+not sampled) with a CLIENT child span per backend call, and metrics (`midir.*`, `gen_ai.client.token.usage`, and
+`gen_ai.server.request.duration` and `gen_ai.server.time_to_first_token` in seconds): tokens, duration, time to first byte, model and backend, client (`claude-code`,
 `copilot`, `hermes`, `openclaw`, `deepseek-harness`, ...), session, tool calls, follow-ups, retries, queue waits,
 truncations. Metric labels are bounded: the session label is "-" for a request that carries no session of its own
 (a stateless Responses request), and the requested model name stays on the spans. Series idle for an hour are
 dropped. Without a collector, `[telemetry] prometheus = true` serves the
-metrics at `GET /metrics`. Prompt content is never exported. The Grafana dashboard is provisioned from
+metrics at `GET /metrics` (behind `MIDIR_API_KEY` when one is set: give the scraper a `bearer_token`). Prompt
+content is never exported. The exporter reads `OTEL_EXPORTER_OTLP_ENDPOINT` (or `_TRACES_ENDPOINT` and
+`_METRICS_ENDPOINT`), `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` (the service
+name: `OTEL_SERVICE_NAME`, else the attributes', else `[telemetry] service_name`); it speaks OTLP over HTTP/protobuf
+only and logs a warning when `OTEL_EXPORTER_OTLP_PROTOCOL` asks for another. The Grafana dashboard is provisioned from
 [docker/grafana/](../docker/grafana/).
 
 ## Logs
@@ -65,7 +70,8 @@ metrics at `GET /metrics`. Prompt content is never exported. The Grafana dashboa
 Responses carry the request id (`x-request-id`, or `request-id` for Anthropic clients), which the log lines and the
 spans also show. `MIDIR_LOG=<filter>` sets the level per module (for example `info,midir::store=debug`),
 `MIDIR_LOG_FORMAT=json` writes one JSON object per line, and `--debug` turns on DEBUG, where prompts and model output
-appear. Containers log in UTC: set `TZ` in `.env` (for example `TZ=America/Sao_Paulo`) and recreate the container.
+appear. Containers log in UTC unless `TZ` is set in `.env` (the example sets `TZ=America/Sao_Paulo`); recreate the
+container after changing it.
 
 ## Troubleshooting
 

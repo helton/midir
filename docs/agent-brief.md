@@ -18,10 +18,10 @@ Everything below is what that means for you.
 ## Models (pick by the `model` field)
 | model | backend | use it for |
 |---|---|---|
-| `gpt-5.1` (default; aliases `claude-opus-*`) | GPT-5.1 | long, multi-step, autonomous work; the most reliable finisher; slowest (1.5-6 s to first token) |
-| `flex` (aliases `claude-sonnet-*`) | GPT-4.1 with StackSpot's own prompt | everyday agent work; about 2x faster than gpt-5.1; slightly noisier tool calls |
-| `gpt-4.1` (aliases `claude-haiku-*`) | GPT-4.1 | quick answers, short tool steps, background calls; fastest; may stop to ask before a final step |
-Unknown model names go to `gpt-5.1`.
+| `gpt-5.1` (default; also `claude-opus-4-5` and the other aliases configured) | GPT-5.1 | long, multi-step, autonomous work; the most reliable finisher; slowest (1.5-6 s to first token) |
+| `flex` (also its configured aliases, e.g. a `claude-sonnet-*` name) | GPT-4.1 with StackSpot's own prompt | everyday agent work; about 2x faster than gpt-5.1; slightly noisier tool calls |
+| `gpt-4.1` (also its configured aliases, e.g. a `claude-haiku-*` name) | GPT-4.1 | quick answers, short tool steps, background calls; fastest; may stop to ask before a final step |
+Aliases are exact names (`config/midir.toml`); unknown model names go to `gpt-5.1`.
 
 ## Tool calling (emulated)
 StackSpot has no native tools, so the gateway puts your tool list in the prompt and asks the model to write

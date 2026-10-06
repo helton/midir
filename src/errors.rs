@@ -43,7 +43,6 @@ impl BackendError {
         !self.queue_timeout && (self.status == 429 || self.status >= 500)
     }
 
-    /// The status the client gets: the backend's own for the ones clients handle, 502 for everything else.
     /// The status the client gets. The backend's own 401 and 403 (Midir's credentials for it, its access to an agent)
     /// are a gateway problem, not the client's key: a 502 with the backend's message, so SDKs do not ask the user to
     /// log in again or disable the provider. 401 stays for Midir's own API key.

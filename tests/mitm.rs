@@ -3,7 +3,7 @@
 //! mitmproxy 12: `mitmdump` on PATH (or MIDIR_MITMDUMP=<path>; the standalone binaries from mitmproxy.org need nothing
 //! else), or else the stack's image with Docker's host network (Linux):
 //!
-//!     cargo test --release --test mitm -- --ignored
+//!     cargo test --profile ci --test mitm -- --ignored
 
 mod common;
 
@@ -119,7 +119,7 @@ impl Drop for Mitm {
 }
 
 #[test]
-#[ignore = "needs mitmproxy 12 (mitmdump on PATH, MIDIR_MITMDUMP or Docker): cargo test --release --test mitm -- --ignored"]
+#[ignore = "needs mitmproxy 12 (mitmdump on PATH, MIDIR_MITMDUMP or Docker): cargo test --profile ci --test mitm -- --ignored"]
 fn keepalive_reaches_the_client_through_mitm_before_content() {
     let rig = Rig::with(&toml_with_server("keepalive_s = 0.2"), &[]);
     let mitm = Mitm::start(&rig.server.url);

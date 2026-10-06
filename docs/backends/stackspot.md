@@ -7,7 +7,8 @@ emulated by the gateway on top of it.
 ## Agent setup
 
 Create one agent in the StackSpot AI portal with exactly this configuration and put its id in
-`STACKSPOT_DEFAULT_AGENT_ID` and `STACKSPOT_GPT_5_1_AGENT_ID`. It is the winner of the configuration benchmark
+`STACKSPOT_GPT_5_1_AGENT_ID` (referenced by `config/midir.toml`; without `[[models]]`, `STACKSPOT_DEFAULT_AGENT_ID`
+sets the default model). It is the winner of the configuration benchmark
 (2026-09-29, re-validated 2026-10-01); any deviation changes latency and tool-call fidelity.
 
 Optional second agent: the same configuration with **LLM = Open AI - gpt-4.1**, id in `STACKSPOT_GPT_4_1_AGENT_ID`.

@@ -70,6 +70,15 @@ Fixes from the 2026-10-05 review (`.internal`, findings F-numbered):
   the system's random source fails.
 - **Token renewals are shared**: a wave of 401s renews the StackSpot token once, and a failed renewal is answered
   again for 5 s, so an open `/ready` polled in a loop no longer posts the client secret to idm on every hit.
+- **Telemetry follows the OpenTelemetry conventions more closely**: the request span is named `chat <model>` and
+  carries `http.request.method`, `http.route` and `url.path`; a client trace whose `traceparent` is not sampled gets
+  no spans (they were orphans in the collector); `service.name` from `OTEL_RESOURCE_ATTRIBUTES` is kept unless
+  `OTEL_SERVICE_NAME` is set; an `OTEL_EXPORTER_OTLP_PROTOCOL` other than `http/protobuf` is logged as unsupported;
+  new histograms `gen_ai.server.request.duration` and `gen_ai.server.time_to_first_token` (seconds, few labels) sit
+  next to the `midir.*` ones the dashboard reads.
+- **Tests**: black-box tests for the queue timeout and the rate window, 405 and trailing slashes, `/metrics` behind
+  the API key, escaped metric labels and the `/ready` failure body; the shutdown test waits for its request instead
+  of sleeping. The docs and `--help` match the code again (the OTEL variables, metric names, `retry_backoff_s`).
 
 - **Documentation**: a new README (logo, diagram, highlights, quick start, measured performance) and the reference
   material in guides: [configuration](configuration.md), [API compatibility](compatibility.md),
@@ -204,7 +213,7 @@ Fixes from the 2026-10-05 review (`.internal`, findings F-numbered):
 - **Telemetry fixed**: request spans and metrics are flushed when the process stops (SIGTERM), and only Midir's own
   spans are exported (0.0.1 also exported a span for every health check and internal step under
   `unknown_service:python`).
-- **Every build says what it is**: only a release reports the bare version; a `develop` snapshot is
+- **Every build says what it is**: only a release reports the bare version; another build of `main` is
   `0.1.0+dev.<commit>`, a local image `0.1.0+local.<commit>`, a binary built from a git checkout
   `0.1.0+src.<commit>` (`.dirty` with uncommitted changes), shown by `midir --version`, the startup banner,
   `/health`, `/ready` and telemetry.

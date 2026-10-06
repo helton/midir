@@ -66,26 +66,10 @@ fn attrs(kvs: &[KeyValue]) -> HashMap<String, serde_json::Value> {
     kvs.iter().map(|kv| (kv.key.clone(), value(kv))).collect()
 }
 
-const TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
-const PARENT: &str = "00f067aa0ba902b7";
+type Attributes = HashMap<String, serde_json::Value>;
 
-#[test]
-fn one_span_per_request_and_the_metrics() {
-    let collector = Collector::new();
-    let mut rig = Rig::with(MIDIR_TOML, &[("OTEL_EXPORTER_OTLP_ENDPOINT", collector.url.as_str())]);
-    rig.upstream.add("Hello.");
-    let traceparent = format!("00-{TRACE}-{PARENT}-01");
-    let r = rig.http.post_with_headers(
-        "/v1/chat/completions",
-        &json!({"model": "claude-haiku-4-5", "messages": user("hi")}),
-        &[("user-agent", "claude-cli/2.1.283 (external, cli)"), ("traceparent", traceparent.as_str())],
-    );
-    assert_eq!(r.status, 200);
-    let rid = s(&r.json()["id"]).to_string();
-    assert_eq!(r.header("x-request-id"), Some(rid.as_str()));
-    rig.http.get("/health"); // never a span
-    rig.server.stop(); // SIGTERM: everything pending must be flushed
-
+/// The resource attributes and the spans the collector received (name, kind, ids and status mixed into the attributes).
+fn spans_of(collector: &Collector) -> (Attributes, Vec<Attributes>) {
     let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     let mut resource = HashMap::new();
     let mut spans = vec![];
@@ -107,6 +91,30 @@ fn one_span_per_request_and_the_metrics() {
             }
         }
     }
+    (resource, spans)
+}
+
+const TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+const PARENT: &str = "00f067aa0ba902b7";
+
+#[test]
+fn one_span_per_request_and_the_metrics() {
+    let collector = Collector::new();
+    let mut rig = Rig::with(MIDIR_TOML, &[("OTEL_EXPORTER_OTLP_ENDPOINT", collector.url.as_str())]);
+    rig.upstream.add("Hello.");
+    let traceparent = format!("00-{TRACE}-{PARENT}-01");
+    let r = rig.http.post_with_headers(
+        "/v1/chat/completions",
+        &json!({"model": "claude-haiku-4-5", "messages": user("hi")}),
+        &[("user-agent", "claude-cli/2.1.283 (external, cli)"), ("traceparent", traceparent.as_str())],
+    );
+    assert_eq!(r.status, 200);
+    let rid = s(&r.json()["id"]).to_string();
+    assert_eq!(r.header("x-request-id"), Some(rid.as_str()));
+    rig.http.get("/health"); // never a span
+    rig.server.stop(); // SIGTERM: everything pending must be flushed
+
+    let (resource, spans) = spans_of(&collector);
     assert_eq!(resource.get("service.name"), Some(&json!("midir")));
     assert!(resource.contains_key("service.version"));
     assert_eq!(spans.len(), 2, "{spans:?}"); // the request and its backend call; nothing for /health
@@ -120,7 +128,9 @@ fn one_span_per_request_and_the_metrics() {
     assert_eq!(call["midir.call"], "first");
     assert!(call["gen_ai.usage.output_tokens"].as_i64().unwrap() > 0);
     assert_eq!(span["midir.request_id"], json!(rid));
-    assert_eq!(span["name"], "gen_ai.chat chat");
+    assert_eq!(span["name"], "chat claude-haiku-4-5"); // {operation} {model}
+    assert_eq!(span["http.request.method"], "POST");
+    assert_eq!(span["http.route"], "/v1/chat/completions");
     assert_eq!(span["gen_ai.provider.name"], "stackspot");
     assert_eq!(span["midir.backend"], "stackspot"); // the configured name; the provider is the backend's type
     assert_eq!(span["gen_ai.request.model"], "claude-haiku-4-5");
@@ -140,7 +150,12 @@ fn one_span_per_request_and_the_metrics() {
             }
         }
     }
-    for metric in ["midir.requests", "gen_ai.client.token.usage", "midir.request.duration"] {
+    for metric in [
+        "midir.requests",
+        "gen_ai.client.token.usage",
+        "midir.request.duration",
+        "gen_ai.server.request.duration", // in seconds; time to first token only for streams
+    ] {
         assert!(names.contains(metric), "{metric} not in {names:?}");
     }
 }
@@ -187,4 +202,79 @@ fn stateless_requests_do_not_mint_a_metric_series_each() {
     assert_eq!(sessions.len(), 1, "{sessions:?}");
     assert!(sessions.contains("-"));
     assert!(!text.contains("gen_ai_request_model")); // client-sent text is not a metric label
+}
+
+#[test]
+fn an_unsampled_trace_gets_no_spans() {
+    // review 2026-10-05 (F27): a traceparent with the sampled flag off still got recorded children (orphans in the
+    // collector, whose parent was never exported)
+    let collector = Collector::new();
+    let mut rig = Rig::with(MIDIR_TOML, &[("OTEL_EXPORTER_OTLP_ENDPOINT", collector.url.as_str())]);
+    rig.upstream.add("Hello.");
+    let traceparent = format!("00-{TRACE}-{PARENT}-00");
+    let r = rig.http.post_with_headers(
+        "/v1/chat/completions",
+        &json!({"model": "gpt-5.1", "messages": user("hi")}),
+        &[("traceparent", traceparent.as_str())],
+    );
+    assert_eq!(r.status, 200);
+    rig.server.stop();
+    let (_, spans) = spans_of(&collector);
+    assert!(spans.is_empty(), "{spans:?}");
+    assert!(!collector.exports("/v1/metrics").is_empty()); // the metrics are still recorded
+}
+
+#[test]
+fn the_service_name_follows_the_otel_variables() {
+    // review 2026-10-05 (F27): the configuration always overrode OTEL_RESOURCE_ATTRIBUTES' service.name, and an
+    // OTLP protocol Midir does not speak was ignored in silence
+    let collector = Collector::new();
+    let mut rig = Rig::with(
+        MIDIR_TOML,
+        &[
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", collector.url.as_str()),
+            ("OTEL_RESOURCE_ATTRIBUTES", "service.name=gateway-a,deployment.environment=lab"),
+            ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
+        ],
+    );
+    rig.upstream.add("Hello.");
+    assert_eq!(rig.http.post("/v1/chat/completions", &json!({"model": "gpt-5.1", "messages": user("hi")})).status, 200);
+    rig.server.stop();
+    let (resource, _) = spans_of(&collector);
+    assert_eq!(resource.get("service.name"), Some(&json!("gateway-a")));
+    assert_eq!(resource.get("deployment.environment"), Some(&json!("lab")));
+    assert_eq!(resource.get("telemetry.sdk.name"), Some(&json!("midir")));
+    assert!(rig.server.logs().contains("OTEL_EXPORTER_OTLP_PROTOCOL=grpc is not supported"), "{}", rig.server.logs());
+
+    let collector = Collector::new();
+    let mut rig = Rig::with(
+        MIDIR_TOML,
+        &[
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", collector.url.as_str()),
+            ("OTEL_RESOURCE_ATTRIBUTES", "service.name=gateway-a"),
+            ("OTEL_SERVICE_NAME", "gateway-b"),
+        ],
+    );
+    rig.upstream.add("Hello.");
+    assert_eq!(rig.http.post("/v1/chat/completions", &json!({"model": "gpt-5.1", "messages": user("hi")})).status, 200);
+    rig.server.stop();
+    assert_eq!(spans_of(&collector).0.get("service.name"), Some(&json!("gateway-b")));
+}
+
+#[test]
+fn metrics_behind_the_api_key_and_escaped_labels() {
+    // review 2026-10-05 (F28): /metrics under an API key and label values a client controls
+    let rig = Rig::with(MIDIR_TOML, &[("MIDIR_PROMETHEUS", "1"), ("MIDIR_API_KEY", "s3cret")]);
+    rig.upstream.add("x");
+    let r = rig.http.post_with_headers(
+        "/v1/chat/completions",
+        &json!({"model": "gpt-5.1", "messages": user("hi")}),
+        &[("authorization", "Bearer s3cret"), ("x-session-id", r#"a"b\c"#)],
+    );
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(rig.http.get("/metrics").status, 401);
+    let m = rig.http.get_with_headers("/metrics", &[("authorization", "Bearer s3cret")]);
+    assert_eq!(m.status, 200);
+    assert!(m.text.contains(r#"session_id="a\"b\\c""#), "{}", m.text);
+    assert!(m.text.contains("gen_ai_server_request_duration_seconds_bucket{"), "{}", m.text);
 }

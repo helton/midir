@@ -18,6 +18,7 @@ responses_retention_days = 30   # fixed from creation; purged hourly; a later pr
 responses_max_mb = 500          # above this, blobs no response uses go first, then the oldest responses
 responses_memory_mb = 64        # memory cache of stored responses (least recently used out first; misses are read from disk)
 shutdown_grace_s = 25           # on SIGTERM, how long in-flight requests (streams) get to finish
+retry_backoff_s = 1             # first wait before retrying a backend 429 or 5xx (doubles each attempt)
 # api_key = "${MIDIR_API_KEY}"  # when set, clients must send it (Authorization: Bearer <key> or x-api-key); /health and /ready stay open
 
 [telemetry]

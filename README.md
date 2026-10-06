@@ -49,7 +49,7 @@ side), and the request's `model` picks which one answers.
   for backends that take a minute to start.
 - **Observable**: OpenTelemetry traces and metrics, a ready-made Grafana dashboard and a proxy view of every request
   in one `docker compose` command; Prometheus `/metrics` without a collector.
-- **Small and fast**: one static Rust binary, a 5 MB image (amd64 and arm64), 10 MB of memory at rest, about a
+- **Small and fast**: one static Rust binary, a 12 MB image (5 MB compressed; amd64 and arm64), 10 MB of memory at rest, about a
   millisecond of overhead per request.
 
 ## How it works

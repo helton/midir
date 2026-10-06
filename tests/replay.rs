@@ -2,7 +2,7 @@
 //! They hold real conversations, so they are kept out of the repository: point MIDIR_CAPTURES at the folder (one JSON
 //! file per request: {"protocol": "chat"|"responses"|"messages", "body": {...}}) and run
 //!
-//!     MIDIR_CAPTURES=.internal/dev/captures cargo test --release --test replay -- --ignored
+//!     MIDIR_CAPTURES=.internal/dev/captures cargo test --profile ci --test replay -- --ignored
 //!
 //! Every request goes through its protocol adapter, the prompt renderer and the response/stream writer with a text
 //! reply and with a tool-call reply, streaming and not. Any 4xx/5xx or malformed SSE is a regression.
@@ -26,7 +26,7 @@ fn first_tool(body: &Value) -> Option<String> {
 }
 
 #[test]
-#[ignore = "needs the local captures: MIDIR_CAPTURES=<dir> cargo test --release --test replay -- --ignored"]
+#[ignore = "needs the local captures: MIDIR_CAPTURES=<dir> cargo test --profile ci --test replay -- --ignored"]
 fn captured_requests_replay_cleanly() {
     let dir = std::env::var("MIDIR_CAPTURES").expect("MIDIR_CAPTURES=<folder with the captures>");
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);

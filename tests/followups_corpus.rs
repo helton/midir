@@ -3,7 +3,7 @@
 //! sessions, so the corpus is kept out of the repository: point MIDIR_PROMISE_CORPUS at its folder (to_label_<set>.jsonl
 //! with {"id", "reply", ...} and labels_<set>.jsonl with {"id", "label"}) and run
 //!
-//!     MIDIR_PROMISE_CORPUS=.internal/dev/bench/promise cargo test --release --test followups_corpus -- --ignored --nocapture
+//!     MIDIR_PROMISE_CORPUS=.internal/dev/bench/promise cargo test --profile ci --test followups_corpus -- --ignored --nocapture
 //!
 //! A change to the detector's rules ships only with no false alarm and no recall lost.
 
@@ -20,7 +20,7 @@ fn read(path: &std::path::Path) -> Vec<Value> {
 }
 
 #[test]
-#[ignore = "needs the private corpus: MIDIR_PROMISE_CORPUS=<dir> cargo test --release --test followups_corpus -- --ignored"]
+#[ignore = "needs the private corpus: MIDIR_PROMISE_CORPUS=<dir> cargo test --profile ci --test followups_corpus -- --ignored"]
 fn labeled_replies() {
     let dir = std::env::var("MIDIR_PROMISE_CORPUS").expect("MIDIR_PROMISE_CORPUS=<folder with the corpus>");
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);

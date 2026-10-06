@@ -366,7 +366,12 @@ fn ready_reports_bad_credentials() {
     rig.upstream.set_token_status(401);
     let r = rig.http.get("/ready");
     assert_eq!(r.status, 503);
-    assert!(s(&r.json()["error"]).contains("idm"));
+    let body = r.json();
+    assert!(s(&body["error"]).contains("idm"));
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["backends"]["stackspot"]["ok"], false);
+    assert!(s(&body["backends"]["stackspot"]["error"]).contains("idm"));
+    assert!(body["version"].is_string() && body["backends"]["stackspot"]["queue"].is_object());
 }
 
 #[test]

@@ -288,7 +288,7 @@ fn a_stop_lets_running_streams_finish() {
     let http = Http::new(&rig.server.url);
     let request =
         std::thread::spawn(move || http.post("/v1/chat/completions", &json!({"model": "gpt-5.1", "messages": user("hi"), "stream": true})));
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    wait_until("the request to reach the backend", || rig.upstream.calls().len() == 1);
     rig.server.stop(); // SIGTERM while the backend is still thinking
     let r = request.join().unwrap();
     assert_eq!(chat_stream_text(&r.objects()), "slow but complete");

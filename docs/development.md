@@ -7,7 +7,7 @@ Everything is Rust: rustup installs the toolchain pinned in `rust-toolchain.toml
 ```bash
 cargo run --release                         # build and run from source (reads .env and config/midir.toml)
 cargo test --profile ci                     # unit, property and black-box tests, as CI runs them (~1 min)
-cargo clippy --all-targets -- -D warnings   # lints, as CI runs them (also: cargo fmt --check, cargo deny check)
+cargo clippy --workspace --all-targets --profile ci --locked -- -D warnings   # lints, as CI runs them (also: cargo fmt --check, cargo deny check)
 cargo xtask smoke                           # live acceptance against a running Midir (25 checks, real backend requests)
 cargo xtask check-leaks                     # scan what git would publish for secrets, agent ids, home paths, e-mails
 cargo xtask deploy standalone|full          # build the image here and (re)start the compose stack
@@ -57,5 +57,6 @@ cargo xtask bump [patch|minor|major|X.Y.Z]  # Cargo.toml, Cargo.lock and the def
 git push                                     # CI tests, publishes X.Y.Z and latest, tags vX.Y.Z
 ```
 
-A version that is not released and has no CHANGELOG section fails CI, on `main` and in pull requests. The version
-lives only in `Cargo.toml`.
+A version that is not released and has no CHANGELOG section fails CI in pull requests (on `main` the release waits
+and the `dev` image still goes out). The version is declared in `Cargo.toml`; `cargo xtask bump` keeps `Cargo.lock`
+and the compose image tag in step.
