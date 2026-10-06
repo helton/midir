@@ -16,9 +16,17 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # installs the toolchain and components of rust-toolchain.toml, and caches the build
-      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+      - name: Pins (actions by commit, the image's Rust is rust-toolchain.toml's)
+        run: |
+          if grep -rnE '^\s*(- )?uses: [^.][^@]*@' .github/workflows | grep -vE '@[0-9a-f]{40}( |$)'; then
+            echo "::error::pin every action to a full commit SHA (the version goes in a comment)"; exit 1
+          fi
+          channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          grep -qE "^FROM rust:${channel}-alpine[@ ]" docker/Dockerfile || {
+            echo "::error::docker/Dockerfile builds with another Rust than rust-toolchain.toml (${channel})"; exit 1; }
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --profile ci --locked -- -D warnings
       - run: cargo doc --no-deps --package midir --locked
@@ -30,7 +38,7 @@ jobs:
   dependencies:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check advisories bans licenses sources

@@ -60,7 +60,7 @@ services:
 
   lgtm:
     container_name: midir-lgtm
-    image: grafana/otel-lgtm:latest
+    image: grafana/otel-lgtm:0.35.0   # a version: the dashboard's datasource uids are a contract with this image
     ports:
       - "127.0.0.1:18883:3000"
       - "127.0.0.1:18884:4318"

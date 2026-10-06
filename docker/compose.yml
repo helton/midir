@@ -29,6 +29,11 @@ services:
     configs:
       - source: midir
         target: /app/config/midir.toml
+    # nothing to write but /data, and no privileges to gain
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     stop_grace_period: 30s   # in-flight streams get [server] shutdown_grace_s (25 s) to finish before the container stops
     restart: unless-stopped
 

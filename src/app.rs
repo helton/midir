@@ -347,6 +347,9 @@ impl App {
         let (route, runner) = self.gateway.route(&info.model);
         req.route = Some(route.clone());
         telemetry::request_meta(&Origin { headers, info: &info, protocol, rid }, &route, &req, &self.gateway.store);
+        if let Some(b) = self.gateway.backends.get(&route.backend) {
+            req.meta().backend_type = b.kind().to_string();
+        }
         {
             let m = req.meta();
             let prev = info.previous_response_id.as_deref().map_or(String::new(), |p| format!(" previous={p}"));
@@ -403,6 +406,10 @@ impl App {
             })
             .collect();
         let mut body = json!({"ok": failed.is_empty(), "version": buildinfo::full_version(), "build": buildinfo::build().as_json(), "backends": backends});
+        if let Some(why) = &self.gateway.store.fallback {
+            // ready, but worth seeing: a container without a writable data volume loses its chains on restart
+            body["warnings"] = json!([format!("responses store: {why}")]);
+        }
         if failed.is_empty() {
             return json_response(200, &body);
         }

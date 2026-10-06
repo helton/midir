@@ -98,6 +98,7 @@ git clone https://github.com/helton/midir && cd midir
 cp .env.example .env                                # credentials and agent ids
 cp config/midir.example.toml config/midir.toml      # backends and models
 mkdir -p docker/data/gateway
+printf 'UID=%s\nGID=%s\n' "$(id -u)" "$(id -g)" > docker/.env   # the container runs as you
 docker compose -f docker/compose.yml up -d          # pulls ghcr.io/helton/midir
 curl -s http://127.0.0.1:18880/ready                # {"ok": true, ...} once the credentials work
 ```
@@ -117,7 +118,7 @@ Clients keep using port 18880. Every request and backend call shows up in mitmwe
 </details>
 
 <details>
-<summary><strong>From source</strong> (Rust 1.99, installed by rustup)</summary>
+<summary><strong>From source</strong> (the Rust pinned in <code>rust-toolchain.toml</code>, installed by rustup)</summary>
 
 ```bash
 cargo build --release      # target/release/midir, a single binary

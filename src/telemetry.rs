@@ -96,8 +96,11 @@ pub struct Origin<'a> {
 }
 
 /// The session a request belongs to: a client header, else what the body carries (Claude Code's metadata, Responses'
-/// prompt_cache_key or user, the stored response it continues), else a hash of its first user message.
-fn session_of(o: &Origin, req: &CanonicalRequest, store: &ResponseStore) -> String {
+/// prompt_cache_key or user, the stored response it continues), else a hash of its first user message. The second
+/// value is the session as a metric label: "-" when it was made up for this request alone (a new Responses chain, a
+/// request with no user text), so a stateless client does not create metric series per request.
+fn session_of(o: &Origin, req: &CanonicalRequest, store: &ResponseStore) -> (String, String) {
+    let own_chain = format!("chain-{}", prefix(skip_chars(o.rid, 5), 10));
     let session = SESSION_HEADERS
         .iter()
         .find_map(|h| header(o.headers, h).filter(|v| !v.is_empty()))
@@ -106,8 +109,8 @@ fn session_of(o: &Origin, req: &CanonicalRequest, store: &ResponseStore) -> Stri
             let prev = o.info.previous_response_id.as_deref().filter(|p| !p.is_empty())?;
             store.session_of(prev).filter(|s| !s.is_empty())
         })
-        .or_else(|| (o.protocol == "responses").then(|| format!("chain-{}", prefix(skip_chars(o.rid, 5), 10))));
-    session.unwrap_or_else(|| {
+        .or_else(|| (o.protocol == "responses").then(|| own_chain.clone()));
+    let session = session.unwrap_or_else(|| {
         let first_user = req.turns.iter().find(|t| t.role == "user" && !t.text.is_empty()).map(|t| t.text.as_str()).unwrap_or("");
         if first_user.is_empty() {
             o.rid.to_string()
@@ -115,13 +118,15 @@ fn session_of(o: &Origin, req: &CanonicalRequest, store: &ResponseStore) -> Stri
             let digest = Sha1::digest(prefix(first_user, 500).as_bytes());
             format!("conv-{}", &crate::canonical::hex(&digest)[..10])
         }
-    })
+    });
+    let label = if session == own_chain || session == o.rid { "-".to_string() } else { prefix(&session, 64).to_string() };
+    (session, label)
 }
 
 /// Labels for one request: client, session, initiator, model, agent, and the client's trace.
 pub fn request_meta(o: &Origin, route: &ModelSpec, req: &CanonicalRequest, store: &ResponseStore) {
     let (client, version) = client_of(o.headers, req.system.first().map(String::as_str).unwrap_or(""));
-    let session = session_of(o, req, store);
+    let (session, session_label) = session_of(o, req, store);
     let initiator = header(o.headers, "x-initiator")
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| if req.turns.last().is_some_and(|t| !t.tool_results.is_empty()) { "agent".into() } else { "user".into() });
@@ -129,6 +134,7 @@ pub fn request_meta(o: &Origin, route: &ModelSpec, req: &CanonicalRequest, store
     m.client = client;
     m.client_version = version;
     m.session = prefix(&session, 64).to_string();
+    m.session_label = session_label;
     m.initiator = initiator;
     m.protocol = o.protocol.into();
     m.model = o.info.model.clone();
@@ -544,10 +550,10 @@ impl Telemetry {
         let mut meta = shared.lock().unwrap_or_else(|e| e.into_inner());
         let ctx = TraceContext { trace_id: meta.parent.map_or_else(random::<16>, |p| p.trace_id), span_id: random::<8>() };
         meta.span = Some(ctx);
-        let provider = if meta.backend.is_empty() { "unknown" } else { meta.backend.as_str() };
+        let provider = if meta.backend_type.is_empty() { "unknown" } else { meta.backend_type.as_str() };
         let attrs: Attrs = vec![
             ("gen_ai.provider.name".into(), s(provider)),
-            ("gen_ai.system".into(), s(provider)),
+            ("midir.backend".into(), s(&meta.backend)),
             ("gen_ai.operation.name".into(), s("chat")),
             ("gen_ai.request.model".into(), s(&meta.model)),
             ("gen_ai.response.model".into(), s(&meta.agent)),
@@ -755,14 +761,16 @@ impl Drop for CallObservation {
     }
 }
 
+/// Metric labels: bounded values only. The requested model name (client text) and a session made up for one request
+/// stay on the spans.
 fn labels(meta: &Meta) -> Attrs {
+    let session = if meta.session_label.is_empty() { meta.session.as_str() } else { meta.session_label.as_str() };
     vec![
         ("client.name".into(), s(&meta.client)),
-        ("gen_ai.request.model".into(), s(&meta.model)),
         ("gen_ai.response.model".into(), s(&meta.agent)),
         ("midir.protocol".into(), s(&meta.protocol)),
         ("midir.initiator".into(), s(&meta.initiator)),
-        ("session.id".into(), s(&meta.session)),
+        ("session.id".into(), s(session)),
     ]
 }
 

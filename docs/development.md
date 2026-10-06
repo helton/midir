@@ -1,8 +1,8 @@
 # Development
 
-Everything is Rust: rustup installs the toolchain pinned in `rust-toolchain.toml` (Rust 1.99); Docker builds the
-images. Repository tasks are a workspace member, `xtask`, run through a Cargo alias. How the code is organized:
-[architecture.md](architecture.md).
+Everything is Rust: rustup installs the toolchain pinned in `rust-toolchain.toml` (CI checks that
+`docker/Dockerfile` builds with the same version); Docker builds the images. Repository tasks are a workspace member,
+`xtask`, run through a Cargo alias. How the code is organized: [architecture.md](architecture.md).
 
 ```bash
 cargo run --release                         # build and run from source (reads .env and config/midir.toml)

@@ -192,11 +192,15 @@ pub struct Meta {
     pub client: String,
     pub client_version: String,
     pub session: String,
+    /// the session as a metric label: "-" when it was made up for this request alone (one series per request otherwise)
+    pub session_label: String,
     pub initiator: String,
     pub protocol: String,
     pub model: String,
     pub agent: String,
     pub backend: String,
+    /// the backend's type (`stackspot`): the GenAI provider, whatever the backend is called in the configuration
+    pub backend_type: String,
     pub stream: bool,
     pub tools_declared: i64,
     pub json_mode: bool,

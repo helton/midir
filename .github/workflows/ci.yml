@@ -25,8 +25,9 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
       release: ${{ steps.v.outputs.release }}
+      newest: ${{ steps.v.outputs.newest }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0   # the tags
       - id: v
@@ -35,11 +36,21 @@ jobs:
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"   # [package] comes first
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          # `latest` only moves forward: a patch for an older minor line does not take it
+          newest="$( (git tag -l 'v*'; echo "v$version") | sort -V | tail -1)"
+          echo "newest=$([ "$newest" = "v$version" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
             echo "release=false" >> "$GITHUB_OUTPUT"
           elif ! grep -q "^## $version " docs/CHANGELOG.md; then
-            echo "::error::version $version is not released and docs/CHANGELOG.md has no '## $version (date)' section"
-            exit 1
+            msg="version $version is not released and docs/CHANGELOG.md has no '## $version (date)' section"
+            if [ "$ON_MAIN" = true ]; then
+              # main still gets its dev and sha- images; only the release waits for the section
+              echo "::warning::$msg: nothing released"
+              echo "release=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::$msg"
+              exit 1
+            fi
           else
             echo "release=$ON_MAIN" >> "$GITHUB_OUTPUT"
             echo "::notice::v$version is not released yet: a push to main publishes it"
@@ -62,7 +73,7 @@ jobs:
         type=sha,prefix=sha-,format=short
         type=semver,pattern={{version}},value=v${{ needs.version.outputs.version }},enable=${{ needs.version.outputs.release == 'true' }}
         type=semver,pattern={{major}}.{{minor}},value=v${{ needs.version.outputs.version }},enable=${{ needs.version.outputs.release == 'true' }}
-        type=raw,value=latest,enable=${{ needs.version.outputs.release == 'true' }}
+        type=raw,value=latest,enable=${{ needs.version.outputs.release == 'true' && needs.version.outputs.newest == 'true' }}
 
   github-release:
     needs: [version, image]
@@ -71,11 +82,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Tag vX.Y.Z and publish the release notes from docs/CHANGELOG.md
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.version.outputs.version }}
+          NEWEST: ${{ needs.version.outputs.newest }}
         run: |
           awk -v v="$VERSION" '$0 ~ "^## "v" " {f=1; next} /^## / && f {exit} f' docs/CHANGELOG.md > notes.md
-          gh release create "v$VERSION" --target "$GITHUB_SHA" --title "v$VERSION" --notes-file notes.md --latest
+          # the CHANGELOG's links are relative to docs/; on the release page they would resolve under /releases/
+          sed -i -E "s#\]\(([^):]+\.md(\#[^)]*)?)\)#](https://github.com/${GITHUB_REPOSITORY}/blob/v${VERSION}/docs/\1)#g" notes.md
+          gh release create "v$VERSION" --target "$GITHUB_SHA" --title "v$VERSION" --notes-file notes.md --latest="$NEWEST"

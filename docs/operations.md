@@ -21,7 +21,10 @@ cargo xtask deploy standalone|full                                              
 ```
 
 Container data lives in `docker/data/`, one folder per service: `gateway` (the `previous_response_id` store), `mitm`
-(proxy CA) and `lgtm` (Grafana, Prometheus, Tempo). The Midir container runs as your user, never root.
+(proxy CA) and `lgtm` (Grafana, Prometheus, Tempo). The Midir container runs as your user, never root: compose reads
+`UID` and `GID` from `docker/.env` (`printf 'UID=%s\nGID=%s\n' "$(id -u)" "$(id -g)" > docker/.env`; `cargo xtask
+deploy` passes them itself), falling back to 1000:1000. When the data folder is not writable, Midir keeps responses in
+memory only, says so in the log, and `/ready` lists it under `warnings`.
 
 ## Images and versions
 
@@ -51,7 +54,9 @@ With `OTEL_EXPORTER_OTLP_ENDPOINT` set (the observability overlay does it), each
 span (kind SERVER, the child of the client's `traceparent` when it sends one) with a CLIENT child span per backend
 call, and a few metrics (`midir.*`): tokens, duration, time to first byte, model and backend, client (`claude-code`,
 `copilot`, `hermes`, `openclaw`, `deepseek-harness`, ...), session, tool calls, follow-ups, retries, queue waits,
-truncations. Series idle for an hour are dropped. Without a collector, `[telemetry] prometheus = true` serves the
+truncations. Metric labels are bounded: the session label is "-" for a request that carries no session of its own
+(a stateless Responses request), and the requested model name stays on the spans. Series idle for an hour are
+dropped. Without a collector, `[telemetry] prometheus = true` serves the
 metrics at `GET /metrics`. Prompt content is never exported. The Grafana dashboard is provisioned from
 [docker/grafana/](../docker/grafana/).
 

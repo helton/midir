@@ -87,7 +87,19 @@ fn deploy(kind: &str) -> Result<(), String> {
     let commit = sh("git", &["rev-parse", "--short=7", "HEAD"], &[])?;
     let dirty = !sh("git", &["status", "--porcelain", "--untracked-files=no"], &[])?.is_empty();
     let date = sh("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"], &[])?;
-    let env = [("MIDIR_BUILD_COMMIT", format!("{commit}{}", if dirty { "-dirty" } else { "" })), ("MIDIR_BUILD_DATE", date)];
+    // the container runs as the user who owns the checkout, so docker/data stays writable (compose reads UID and GID;
+    // shells do not export them)
+    let owner = std::fs::metadata(root()).map_err(|e| format!("{}: {e}", root().display()))?;
+    let (uid, gid) = {
+        use std::os::unix::fs::MetadataExt;
+        (owner.uid().to_string(), owner.gid().to_string())
+    };
+    let env = [
+        ("MIDIR_BUILD_COMMIT", format!("{commit}{}", if dirty { "-dirty" } else { "" })),
+        ("MIDIR_BUILD_DATE", date),
+        ("UID", uid),
+        ("GID", gid),
+    ];
     let mut dirs = vec!["docker/data/gateway"];
     if full {
         dirs.extend(["docker/data/mitm", "docker/data/lgtm"]);

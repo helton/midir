@@ -47,6 +47,17 @@ Fixes from the 2026-10-05 review (`.internal`, findings F-numbered):
   `tool_choice` without tools is a 400 (it was answered as plain text); `GET /v1/models/{id}` answers 404 for a name
   no model answers to; an empty reply is an empty content list for Anthropic clients; a request the client leaves is
   logged as cancelled.
+- **Operations**: metric labels no longer grow per request for stateless clients (a session made up for one request
+  is labeled "-", and the client-sent model name stays on the spans); spans carry the backend's type as
+  `gen_ai.provider.name` and its configured name as `midir.backend`, and the dashboard's traces panel no longer
+  depends on the backend being called `stackspot`; `cargo xtask deploy` runs the container as the checkout's owner,
+  the README shows how for compose, and `/ready` lists a store that fell back to memory under `warnings`; the
+  compose service runs with a read-only file system, no capabilities and `no-new-privileges`.
+- **Supply chain and releases**: GitHub Actions are pinned to commit SHAs, the build image by digest, Grafana LGTM
+  to a version, and Dependabot also watches the compose files; CI checks the pins and that the image builds with the
+  Rust of `rust-toolchain.toml`; `cargo xtask check-leaks` catches credentials in any case, JWT- and base64-shaped
+  values and random-looking quoted values in configuration files; release notes link to the docs of their version,
+  `latest` only moves to the highest version, and a missing CHANGELOG section no longer blocks the `dev` image.
 - **Responses store**: retention applies when a response is read from disk, not only at the hourly purge (an expired
   response was served until then); writes are flushed to disk before the rename, and a blob left empty by a crash is
   written again (it broke every chain that shared it); the size purge removes a response together with its

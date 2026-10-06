@@ -237,6 +237,9 @@ fn unwritable_store_directory_falls_back_to_memory() {
     std::fs::set_permissions(locked.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(second.status, 200);
     assert!(rig.server.logs().contains("kept in memory only"));
+    // review 2026-10-05 (F15): visible in /ready too, not only in the log
+    let ready = rig.http.get("/ready").json();
+    assert!(ready["warnings"][0].as_str().unwrap_or("").contains("memory only"), "{ready}");
 }
 
 // ---------------------------------------------------------------- operation

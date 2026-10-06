@@ -132,6 +132,8 @@ struct Cache {
 
 pub struct ResponseStore {
     pub dir: Option<PathBuf>,
+    /// why the configured folder could not be used (the store then keeps responses in memory only)
+    pub fallback: Option<String>,
     retention_s: f64,
     max_bytes: u64,
     memory_max: usize,
@@ -199,6 +201,7 @@ impl ResponseStore {
     pub fn new(directory: Option<PathBuf>, retention_days: f64, max_mb: f64, memory_mb: f64) -> Self {
         let mut store = ResponseStore {
             dir: None,
+            fallback: None,
             retention_s: retention_days * 86400.0,
             max_bytes: (max_mb * 1024.0 * 1024.0) as u64,
             memory_max: (memory_mb * 1024.0 * 1024.0) as usize,
@@ -214,10 +217,9 @@ impl ResponseStore {
             Ok(())
         };
         if let Err(e) = setup() {
-            tracing::warn!(
-                "responses store: cannot use {} ({e}); previous_response_id is kept in memory only (lost on restart)",
-                dir.display()
-            );
+            let why = format!("cannot use {} ({e}); previous_response_id is kept in memory only (lost on restart)", dir.display());
+            tracing::warn!("responses store: {why}");
+            store.fallback = Some(why);
             return store;
         }
         tracing::info!(

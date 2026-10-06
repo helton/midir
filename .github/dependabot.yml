@@ -20,3 +20,7 @@ updates:
     directory: /docker
     schedule:
       interval: weekly
+  - package-ecosystem: docker-compose
+    directory: /docker
+    schedule:
+      interval: weekly

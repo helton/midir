@@ -122,7 +122,7 @@ fn one_span_per_request_and_the_metrics() {
     assert_eq!(span["midir.request_id"], json!(rid));
     assert_eq!(span["name"], "gen_ai.chat chat");
     assert_eq!(span["gen_ai.provider.name"], "stackspot");
-    assert_eq!(span["gen_ai.system"], "stackspot");
+    assert_eq!(span["midir.backend"], "stackspot"); // the configured name; the provider is the backend's type
     assert_eq!(span["gen_ai.request.model"], "claude-haiku-4-5");
     assert_eq!(span["gen_ai.response.model"], "gpt-4.1");
     assert_eq!(span["client.name"], "claude-code");
@@ -166,4 +166,25 @@ fn no_endpoint_means_no_export_attempts() {
     rig.upstream.add("x");
     assert_eq!(rig.http.post("/v1/chat/completions", &json!({"model": "gpt-5.1", "messages": user("hi")})).status, 200);
     assert!(!rig.server.logs().to_lowercase().contains("otlp"), "{}", rig.server.logs());
+}
+
+#[test]
+fn stateless_requests_do_not_mint_a_metric_series_each() {
+    // review 2026-10-05 (F13): a Responses request with no session and no chain got its own session label, so a
+    // stateless client created a set of series per request
+    let rig = Rig::with(MIDIR_TOML, &[("MIDIR_PROMETHEUS", "1")]);
+    for i in 0..5 {
+        rig.upstream.add("ok");
+        let r = rig.http.post("/v1/responses", &json!({"model": "gpt-5.1", "input": format!("q{i}"), "store": false}));
+        assert_eq!(r.status, 200);
+    }
+    let text = rig.http.get("/metrics").text;
+    let sessions: std::collections::HashSet<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("midir_requests_total{"))
+        .filter_map(|l| l.split("session_id=\"").nth(1).and_then(|r| r.split('"').next()))
+        .collect();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    assert!(sessions.contains("-"));
+    assert!(!text.contains("gen_ai_request_model")); // client-sent text is not a metric label
 }

@@ -1020,7 +1020,7 @@
      },
      "refId": "A",
      "queryType": "traceql",
-     "query": "{span.gen_ai.system=\"stackspot\" && span.client.name=~\"$client\" && span.gen_ai.response.model=~\"$model\" && span.session.id=~\"$session\"}",
+     "query": "{kind=server && span.gen_ai.operation.name=\"chat\" && span.client.name=~\"$client\" && span.gen_ai.response.model=~\"$model\" && span.session.id=~\"$session\"}",
      "limit": 50,
      "tableType": "spans",
      "spss": 1
