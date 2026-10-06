@@ -23,6 +23,12 @@ Fixes from the 2026-10-05 review (`.internal`, findings F-numbered):
 - **Connections that never finish their request are closed**: headers must arrive within `[server] read_timeout_s`
   (30 s, `MIDIR_READ_TIMEOUT_S`) and a body may not stall longer between chunks; at most 4096 connections are open at
   once. Before, a half-sent request held its connection forever.
+- **Tool output is data**: tags that look like the tool protocol inside a tool result (a file or page that documents
+  it, Midir's own sources) are shown to the model with `‹` instead of `<`, and the protocol says so; such a result
+  could close itself early or pass for a call. **This changes the prompt** for results that hold those tags.
+- **Prompts fit the cap with large recent calls**: when the recent turns alone exceed the prompt cap, the largest
+  assistant texts and call arguments (a file's new content, a long command) are cut in the middle too, after tool
+  results and before user messages; a 200,000-character argument kept the prompt above the cap.
 - **Fewer and better follow-ups**: closings such as "vou ficar à disposição" and answers that open with "let me
   explain" no longer cost a hidden call; a reply that says a file does not exist (or that ran `cat`/`curl` itself) is
   taken as reporting a failure; a numbered plan without a header line is recognized as an announcement (the labeled

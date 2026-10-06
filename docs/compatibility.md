@@ -47,7 +47,8 @@ Search the code for `CAVEAT` to find each of these.
 - Whenever a stream is idle (the backend can take a minute to start, a follow-up runs after the text), an SSE
   keepalive goes out every 15 s (`[server] keepalive_s`) so clients and proxies with idle timeouts do not abort.
 - Above the prompt cap the oldest turns are dropped and the model is told; if the recent turns alone are still too
-  big, the largest tool results (then user messages) are cut in the middle, keeping head and tail. A backend refusal
+  big, the largest tool results (then assistant texts and call arguments, then user messages) are cut in the middle,
+  keeping head and tail. A backend refusal
   for input length is retried once with a proportionally smaller prompt.
 - Images, audio and files become a text placeholder; built-in provider tools (web search, ...) are omitted.
 - **Refused**: `logprobs`, `n > 1`, `/v1/embeddings`, Responses `conversation` (server-side conversation state), a
