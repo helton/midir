@@ -101,11 +101,12 @@ struct Refs {
     system: Option<String>,
     tools: Option<String>,
     echo_tools: Option<String>,
+    parent: Option<String>,
 }
 
 impl Refs {
-    fn hashes(self) -> impl Iterator<Item = String> {
-        [self.system, self.tools, self.echo_tools].into_iter().flatten()
+    fn hashes(&self) -> impl Iterator<Item = String> {
+        [self.system.clone(), self.tools.clone(), self.echo_tools.clone()].into_iter().flatten()
     }
 }
 
@@ -156,14 +157,16 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
     serde_json::from_slice(&raw).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Write a file whole or not at all: a temporary file of its own (two writers of the same blob never share one), then
-/// a rename over the target.
+/// Write a file whole or not at all: a temporary file of its own (two writers of the same blob never share one),
+/// flushed to disk, then a rename over the target. Without the flush, a crash right after the rename can leave an
+/// empty file under the final name.
 fn write_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
     let tmp = path.with_file_name(format!("{name}.{}.tmp", crate::canonical::hex_id(12)));
     {
         let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
         f.write_all(data)?;
+        f.sync_data()?;
     }
     fs::rename(&tmp, path)
 }
@@ -331,8 +334,10 @@ impl ResponseStore {
     fn put_blob(dir: &Path, key: &[u8], data: impl FnOnce() -> std::io::Result<Vec<u8>>) -> std::io::Result<String> {
         let h = hex(&Sha256::digest(key))[..32].to_string();
         let f = Self::blob_path(dir, &h);
-        match touch(&f) {
-            Ok(()) => {}
+        match fs::metadata(&f) {
+            // an empty blob is what a crash before the data reached the disk leaves: write it again
+            Ok(m) if m.len() > 0 => touch(&f)?,
+            Ok(_) => write_file(&f, &data()?)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => write_file(&f, &data()?)?,
             Err(e) => return Err(e),
         }
@@ -404,6 +409,9 @@ impl ResponseStore {
                 return Ok(None);
             }
             let rec: Record = read_json(&f)?;
+            if time_now() - rec.ts > self.retention_s {
+                return Ok(None); // expired, whether or not the hourly purge has removed it yet
+            }
             cur = rec.parent.clone();
             chain.push(rec);
             if chain.len() > MAX_CHAIN {
@@ -514,10 +522,15 @@ impl ResponseStore {
             // mark: which blobs each response uses
             let mut uses: HashMap<String, usize> = HashMap::new();
             let mut refs_of: HashMap<String, Vec<String>> = HashMap::new();
+            let mut children: HashMap<String, Vec<String>> = HashMap::new();
             for (_, _, f, stem) in &responses {
-                let hashes: Vec<String> = read_json::<Refs>(f).map(|r| r.hashes().collect()).unwrap_or_default();
+                let refs = read_json::<Refs>(f).ok();
+                let hashes: Vec<String> = refs.as_ref().map(|r| r.hashes().collect()).unwrap_or_default();
                 for h in &hashes {
                     *uses.entry(h.clone()).or_default() += 1;
+                }
+                if let Some(parent) = refs.and_then(|r| r.parent).filter(|p| !p.is_empty()) {
+                    children.entry(parent).or_default().push(stem.clone());
                 }
                 refs_of.insert(stem.clone(), hashes);
             }
@@ -535,24 +548,36 @@ impl ResponseStore {
                 removed += usize::from(sweep(&hash, &uses, &mut blobs, &mut total));
             }
             responses.sort_by(|a, b| a.0.total_cmp(&b.0));
-            for (_, size, f, stem) in responses {
+            let files: HashMap<String, (PathBuf, u64)> =
+                responses.iter().map(|(_, size, f, stem)| (stem.clone(), (f.clone(), *size))).collect();
+            let mut gone: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (_, _, _, oldest) in &responses {
                 if total <= target {
                     break;
                 }
-                let _ = fs::remove_file(&f);
-                {
-                    let mut m = self.mem();
-                    if let Some(e) = m.entries.shift_remove(&stem) {
-                        m.bytes -= e.bytes;
+                // a response goes with its continuations: without it they cannot be rebuilt, and would only hold space
+                let mut todo = vec![oldest.clone()];
+                while let Some(stem) = todo.pop() {
+                    if !gone.insert(stem.clone()) {
+                        continue;
                     }
-                }
-                total -= size;
-                removed += 1;
-                for h in refs_of.remove(&stem).unwrap_or_default() {
-                    if let Some(n) = uses.get_mut(&h) {
-                        *n = n.saturating_sub(1);
+                    todo.extend(children.get(&stem).cloned().unwrap_or_default());
+                    let Some((f, size)) = files.get(&stem) else { continue };
+                    let _ = fs::remove_file(f);
+                    {
+                        let mut m = self.mem();
+                        if let Some(e) = m.entries.shift_remove(&stem) {
+                            m.bytes -= e.bytes;
+                        }
                     }
-                    removed += usize::from(sweep(&h, &uses, &mut blobs, &mut total));
+                    total = total.saturating_sub(*size);
+                    removed += 1;
+                    for h in refs_of.remove(&stem).unwrap_or_default() {
+                        if let Some(n) = uses.get_mut(&h) {
+                            *n = n.saturating_sub(1);
+                        }
+                        removed += usize::from(sweep(&h, &uses, &mut blobs, &mut total));
+                    }
                 }
             }
             tracing::warn!("responses store: above {} MB, removed unused blobs and the oldest responses", self.max_bytes / (1024 * 1024));

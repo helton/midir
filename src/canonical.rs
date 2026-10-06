@@ -31,10 +31,17 @@ pub fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// `n` random hex digits (at most 32), for ids.
+/// `n` random hex digits (at most 32), for ids. Should the random source fail (a sandbox that blocks it), the time
+/// and a process-wide counter still make every id unique: all-zero ids would let responses overwrite each other.
 pub fn hex_id(n: usize) -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut buf = [0u8; 16];
-    let _ = getrandom::fill(&mut buf);
+    if getrandom::fill(&mut buf).is_err() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+        let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        buf[..8].copy_from_slice(&nanos.to_le_bytes());
+        buf[8..].copy_from_slice(&(count ^ u64::from(std::process::id()).rotate_left(32)).to_le_bytes());
+    }
     hex(&buf)[..n.min(32)].to_string()
 }
 
@@ -404,4 +411,16 @@ pub enum Event {
     Done(CanonicalResponse),
     /// nothing for a while: the transport should send a keepalive
     Keepalive,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_are_unique_lowercase_hex() {
+        let ids: std::collections::HashSet<String> = (0..10_000).map(|_| hex_id(24)).collect();
+        assert_eq!(ids.len(), 10_000);
+        assert!(ids.iter().all(|i| i.len() == 24 && i.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))));
+    }
 }

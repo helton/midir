@@ -23,6 +23,11 @@ Fixes from the 2026-10-05 review (`.internal`, findings F-numbered):
 - **Connections that never finish their request are closed**: headers must arrive within `[server] read_timeout_s`
   (30 s, `MIDIR_READ_TIMEOUT_S`) and a body may not stall longer between chunks; at most 4096 connections are open at
   once. Before, a half-sent request held its connection forever.
+- **Responses store**: retention applies when a response is read from disk, not only at the hourly purge (an expired
+  response was served until then); writes are flushed to disk before the rename, and a blob left empty by a crash is
+  written again (it broke every chain that shared it); the size purge removes a response together with its
+  continuations (it removed a chain's small first response and left the rest unreadable); ids stay unique even if
+  the system's random source fails.
 - **Token renewals are shared**: a wave of 401s renews the StackSpot token once, and a failed renewal is answered
   again for 5 s, so an open `/ready` polled in a loop no longer posts the client secret to idm on every hit.
 
