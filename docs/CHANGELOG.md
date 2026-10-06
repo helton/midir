@@ -55,7 +55,8 @@ Fixes from the 2026-10-05 review (`.internal`, findings F-numbered):
   the README shows how for compose, and `/ready` lists a store that fell back to memory under `warnings`; the
   compose service runs with a read-only file system, no capabilities and `no-new-privileges`.
 - **Supply chain and releases**: GitHub Actions are pinned to commit SHAs, the build image by digest, Grafana LGTM
-  to a version, and Dependabot also watches the compose files; CI checks the pins and that the image builds with the
+  to a version, the CI runners to Ubuntu 24.04 (`ubuntu-latest` moves to 26.04 on 2026-10-19), and Dependabot also
+  watches the compose files; CI checks the pins and that the image builds with the
   Rust of `rust-toolchain.toml`; `cargo xtask check-leaks` catches credentials in any case, JWT- and base64-shaped
   values and random-looking quoted values in configuration files; release notes link to the docs of their version,
   `latest` only moves to the highest version, and a missing CHANGELOG section no longer blocks the `dev` image.

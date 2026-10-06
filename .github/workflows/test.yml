@@ -14,15 +14,18 @@ env:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # installs the toolchain and components of rust-toolchain.toml, and caches the build
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
-      - name: Pins (actions by commit, the image's Rust is rust-toolchain.toml's)
+      - name: Pins (actions by commit, runners by version, the image's Rust is rust-toolchain.toml's)
         run: |
           if grep -rnE '^\s*(- )?uses: [^.][^@]*@' .github/workflows | grep -vE '@[0-9a-f]{40}( |$)'; then
             echo "::error::pin every action to a full commit SHA (the version goes in a comment)"; exit 1
+          fi
+          if grep -rnE 'ubuntu-lat[e]st' .github/workflows; then
+            echo "::error::name the runner's version (ubuntu-24.04): -latest moves to a new release on GitHub's schedule"; exit 1
           fi
           channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
           grep -qE "^FROM rust:${channel}-alpine[@ ]" docker/Dockerfile || {
@@ -36,7 +39,7 @@ jobs:
       - run: cargo xtask check-leaks
 
   dependencies:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2

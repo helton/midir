@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0686e5004103908504e3ca54e79293f3af82a3ef4b2e0c12db37c42f8a69636b # shrinks to pieces = ["</tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"s\"}}\n</tool_call>", "<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"a\nb\"}}\n</tool_call>", "</tool_call>", "</tool_call>", "</tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"s\"}}\n</tool_call>"], cuts = [176]
