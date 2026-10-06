@@ -36,7 +36,8 @@ Fixes from the 2026-10-05 review (`.internal`, findings F-numbered):
 - **Parser**: a `<tool_call>` tag quoted in the model's prose ("use the `<tool_call>` tag") stays text (the middle of
   the sentence was lost and a repair fired); text before a call is the same whatever the chunking (a trailing newline
   came through only when the text arrived in its own delta); a broken call whose arguments contain a "name" key is
-  salvaged under the call's own name.
+  salvaged under the call's own name; a call the model opened with `</tool_call>` instead of `<tool_call>` (seen
+  once in the battery: the call reached the user as text and the turn ended) is read as a call.
 - **Responses**: text that follows a tool call is its own message item in the stored response and in `GET`, with the
   ids it streamed with, so `item_reference` resolves it (it was merged into the first message, and referencing it was
   a 400); `conversation` (server-side state) is refused with a 400 instead of being ignored; `max_tool_calls` and

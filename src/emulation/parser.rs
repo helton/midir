@@ -49,6 +49,8 @@ pub struct ToolCallParser {
     lenient: bool,
     /// text went out since the last call (a paragraph break before the next call belongs to it)
     text_since_call: bool,
+    /// the block being read was opened with `</tool_call>` (a model's typo): if it is no call, it goes out as written
+    stray_open: bool,
 }
 
 /// The search for the `</tool_call>` that ends a block, kept between deltas so a long call is scanned once.
@@ -73,6 +75,7 @@ impl ToolCallParser {
             scan: Scan::default(),
             lenient: false,
             text_since_call: false,
+            stray_open: false,
         }
     }
 
@@ -81,7 +84,27 @@ impl ToolCallParser {
         let mut out = vec![];
         loop {
             if !self.in_call {
-                if let Some(i) = self.buf.find(OPEN_TAG) {
+                // `</tool_call>` where a call should open, followed by its JSON: the model wrote the wrong tag
+                let open_at = self.buf.find(OPEN_TAG);
+                let mut stray_hold = None;
+                let mut stray_call = None;
+                for (j, _) in self.buf.match_indices(CLOSE_TAG).take_while(|(j, _)| open_at.is_none_or(|i| *j < i)) {
+                    let after = self.buf[j + CLOSE_TAG.len()..].trim_start();
+                    if after.starts_with('{') {
+                        stray_call = Some(j);
+                        break;
+                    }
+                    if after.is_empty() {
+                        stray_hold = Some(j); // what follows decides: wait for it
+                    }
+                }
+                if let Some(j) = stray_call {
+                    self.buf.replace_range(j..j + CLOSE_TAG.len(), "<tool_call>");
+                    self.stray_open = true;
+                    self.errors.push("a call opened with </tool_call> instead of <tool_call>".into());
+                    continue;
+                }
+                if let Some(i) = open_at {
                     let before = &self.buf[..i];
                     if !before.trim().is_empty() {
                         let t = if before.ends_with("\n\n") { before.to_string() } else { before.trim_end().to_string() };
@@ -95,9 +118,10 @@ impl ToolCallParser {
                     continue;
                 }
                 let hold_from = match self.buf.rfind('<') {
-                    Some(k) if OPEN_TAG.starts_with(&self.buf[k..]) => k,
+                    Some(k) if OPEN_TAG.starts_with(&self.buf[k..]) || CLOSE_TAG.starts_with(&self.buf[k..]) => k,
                     _ => self.buf.len(),
                 };
+                let hold_from = stray_hold.map_or(hold_from, |j| j.min(hold_from));
                 if hold_from > 0 && self.buf[..hold_from].trim().is_empty() {
                     return out; // whitespace alone waits for real text: it never becomes a text block of its own
                 }
@@ -124,6 +148,7 @@ impl ToolCallParser {
             }
             self.saw_call = true;
             self.text_since_call = false;
+            self.stray_open = false;
             for call in self.parse_block(&block) {
                 out.push(Parsed::Call(call));
             }
@@ -186,7 +211,8 @@ impl ToolCallParser {
             let block = format!("{}{CLOSE_TAG}", self.buf);
             let calls = if is_prose(&block) { vec![] } else { self.parse_block(&block) }; // CAVEAT: block without </tool_call>; parsed anyway
             if calls.is_empty() {
-                out.push(Parsed::Text(self.buf.clone()));
+                let text = if self.stray_open { self.buf.replacen("<tool_call>", CLOSE_TAG, 1) } else { self.buf.clone() };
+                out.push(Parsed::Text(text));
             } else {
                 out.extend(calls.into_iter().map(Parsed::Call));
             }
@@ -448,6 +474,8 @@ mod tests {
                 "<tool_call id=\"call_1\">\n{{\"name\": \"read_file\", \"arguments\": {{\"path\": \"{v}\"}}}}\n</tool_call>"
             )),
             Just("<tool_cal".to_string()),
+            Just("</tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"s\"}}\n</tool_call>".to_string()),
+            Just("</tool_call>".to_string()),
             Just("<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"a\nb\"}}\n</tool_call>".to_string()),
             Just(
                 "<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"doc </tool_call> \\\"q\\\" end\"}}\n</tool_call>"
@@ -568,5 +596,23 @@ mod tests {
         assert_eq!(v["arguments"]["name"], "John");
         let v = salvage(r#"{"name": "read_file", "arguments": {"path": "a.py"}, "extra": [broken"#).unwrap();
         assert_eq!(v["name"], "read_file");
+    }
+
+    #[test]
+    fn a_call_opened_with_the_close_tag_is_still_a_call() {
+        // battery 2026-10-06 (dsh, flex): "Vou começar editando o CLI.\n\n</tool_call>\n{...}" reached the user as text
+        let reply = "Vou começar editando o CLI.\n\n</tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"calc/cli.py\"}}\n";
+        let expected = vec!["text:Vou começar editando o CLI.\n\n".to_string(), r#"call:read_file:{"path":"calc/cli.py"}"#.to_string()];
+        for cuts in [vec![], vec![30], vec![31, 33, 40], (0..90).collect()] {
+            assert_eq!(meaning(reply, &cuts), expected, "{cuts:?}");
+        }
+        // closed properly after all
+        assert_eq!(meaning(&format!("{reply}</tool_call>"), &[]), expected);
+        // the tag quoted in prose stays text, as written
+        assert_eq!(meaning("Close it with </tool_call> and stop.", &[20]), vec!["text:Close it with </tool_call> and stop."]);
+        assert_eq!(meaning("Ends with </tool_call>", &[]), vec!["text:Ends with </tool_call>"]);
+        // a stray tag before broken JSON goes out as written
+        let broken = meaning("x </tool_call> {oops", &[]);
+        assert!(broken.len() == 1 && broken[0].ends_with("</tool_call> {oops"), "{broken:?}");
     }
 }
