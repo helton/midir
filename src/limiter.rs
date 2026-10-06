@@ -53,6 +53,8 @@ const MAX_RETRY_AFTER_S: f64 = 300.0;
 pub struct UpstreamLimiter {
     pub max_concurrent: i64,
     pub rpm: i64,
+    /// requests that may wait for a slot at once
+    max_waiting: i64,
     pub timeout: f64,
     pub cooldown: f64,
     telemetry: Arc<Telemetry>,
@@ -84,6 +86,7 @@ impl UpstreamLimiter {
             rpm: limits.requests_per_minute,
             timeout: limits.queue_timeout_s,
             cooldown: limits.cooldown_on_429_s,
+            max_waiting: limits.max_waiting,
             telemetry,
             backend: backend.into(),
             slots: Arc::new(Semaphore::new(limits.max_concurrent.max(1) as usize)),
@@ -172,6 +175,10 @@ impl UpstreamLimiter {
                 self.0.telemetry.queue_depth(-1);
             }
         }
+        if self.slots.available_permits() == 0 && self.waiting.load(Ordering::SeqCst) >= self.max_waiting {
+            tracing::warn!("{}: {} requests waiting already; refusing a new one (limits.max_waiting)", self.backend, self.max_waiting);
+            return Err(BackendError::queue_full(self.max_waiting, &self.backend).into());
+        }
         self.waiting.fetch_add(1, Ordering::SeqCst);
         self.telemetry.queue_depth(1);
         let waiting = Waiting(self);
@@ -220,8 +227,13 @@ mod tests {
     use super::*;
 
     fn limiter(rpm: i64, concurrent: i64, timeout: f64, cooldown: f64) -> UpstreamLimiter {
-        let limits =
-            LimitSettings { max_concurrent: concurrent, requests_per_minute: rpm, queue_timeout_s: timeout, cooldown_on_429_s: cooldown };
+        let limits = LimitSettings {
+            max_concurrent: concurrent,
+            requests_per_minute: rpm,
+            queue_timeout_s: timeout,
+            cooldown_on_429_s: cooldown,
+            max_waiting: 64,
+        };
         UpstreamLimiter::new(&limits, Arc::new(Telemetry::disabled()), "test")
     }
 

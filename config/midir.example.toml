@@ -45,6 +45,7 @@ max_concurrent = 8          # open backend calls at once
 requests_per_minute = 90    # request starts in any 60 s window; keep a margin below 100 (halved after a 429, recovers 1/min)
 queue_timeout_s = 600       # longest wait for a slot before answering 429 (background agents tolerate long waits)
 cooldown_on_429_s = 15      # pause new starts after a backend 429 (other clients of the account use the quota too)
+max_waiting = 64            # requests waiting for a slot at once; beyond it a new one gets a 429 with Retry-After at once
 
 # ---- models: what clients see ----
 # Routing for a requested model, in order: exact name or alias (case-insensitive) > `match` regex (file order) > exact

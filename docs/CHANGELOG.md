@@ -58,6 +58,11 @@ Fixes from the 2026-10-05 review (`.internal`, findings F-numbered):
   Rust of `rust-toolchain.toml`; `cargo xtask check-leaks` catches credentials in any case, JWT- and base64-shaped
   values and random-looking quoted values in configuration files; release notes link to the docs of their version,
   `latest` only moves to the highest version, and a missing CHANGELOG section no longer blocks the `dev` image.
+- **Hardening**: settings outside their range stop startup with a message that names them (a negative retention
+  deleted every stored response; a zero prompt cap dropped every history turn); at most `limits.max_waiting` requests
+  (64) wait for a slot, beyond which a new one gets a 429 with `Retry-After` at once; an SSE body with no line break
+  for 8 MB ends the request with a 502 (it was buffered whole); StackSpot's 401 and 403 reach clients as a 502
+  `upstream_401`/`upstream_403` instead of a 401, which SDKs read as their own key being wrong.
 - **Responses store**: retention applies when a response is read from disk, not only at the hourly purge (an expired
   response was served until then); writes are flushed to disk before the rename, and a blob left empty by a crash is
   written again (it broke every chain that shared it); the size purge removes a response together with its

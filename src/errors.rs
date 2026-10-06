@@ -33,13 +33,22 @@ impl BackendError {
         BackendError { status: 429, body: json!({"message": msg}), stage: "queue".into(), backend: backend.into(), queue_timeout: true }
     }
 
+    /// Our queue already holds `limits.max_waiting` requests: a new one is refused at once.
+    pub fn queue_full(max_waiting: i64, backend: &str) -> Self {
+        let msg = format!("queue: {max_waiting} requests are already waiting for a slot (limits.max_waiting); retry later");
+        BackendError { status: 429, body: json!({"message": msg}), stage: "queue".into(), backend: backend.into(), queue_timeout: true }
+    }
+
     pub fn retryable(&self) -> bool {
         !self.queue_timeout && (self.status == 429 || self.status >= 500)
     }
 
     /// The status the client gets: the backend's own for the ones clients handle, 502 for everything else.
+    /// The status the client gets. The backend's own 401 and 403 (Midir's credentials for it, its access to an agent)
+    /// are a gateway problem, not the client's key: a 502 with the backend's message, so SDKs do not ask the user to
+    /// log in again or disable the provider. 401 stays for Midir's own API key.
     pub fn http_status(&self) -> u16 {
-        if matches!(self.status, 400 | 401 | 403 | 404 | 429) { self.status } else { 502 }
+        if matches!(self.status, 400 | 404 | 429) { self.status } else { 502 }
     }
 
     fn body_text(&self) -> String {

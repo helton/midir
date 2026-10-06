@@ -375,7 +375,15 @@ struct Lines {
     buf: Vec<u8>,
 }
 
+/// The longest SSE line taken from the backend (an event carries a few tokens; a whole long answer is far below this).
+const MAX_SSE_LINE: usize = 8 * 1024 * 1024;
+
 impl Lines {
+    /// Bytes held waiting for the end of their line.
+    fn pending(&self) -> usize {
+        self.buf.len()
+    }
+
     fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
         self.buf.extend_from_slice(chunk);
         self.take(false)
@@ -483,6 +491,14 @@ fn read_sse(r: reqwest::Response, slot: crate::limiter::SlotGuard) -> ItemStream
                 Some(Err(e)) => Err(Error::Net(NetError::from_reqwest(&e, true)))?,
                 None => break,
             };
+            if lines.pending() > MAX_SSE_LINE {
+                // a body that is not SSE (an HTML page from a proxy, a broken stream): not held in memory whole
+                Err(Error::Net(NetError {
+                    kind: crate::errors::NetErrorKind::Read,
+                    detail: format!("the backend sent more than {} MB without a line break: not an event stream", MAX_SSE_LINE / (1024 * 1024)),
+                    retryable: false,
+                }))?;
+            }
             for line in lines.feed(&chunk) {
                 match parse_line(&line) {
                     Line::Item(i) => yield i,

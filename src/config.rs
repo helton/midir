@@ -22,6 +22,8 @@ pub struct LimitSettings {
     pub requests_per_minute: i64,
     pub queue_timeout_s: f64,
     pub cooldown_on_429_s: f64,
+    /// requests that may wait for a slot at once; beyond it a new one is a 429 at once (each waiter holds its body)
+    pub max_waiting: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -236,6 +238,8 @@ struct LimitsFile {
     queue_timeout_s: Option<f64>,
     #[serde(deserialize_with = "num")]
     cooldown_on_429_s: Option<f64>,
+    #[serde(deserialize_with = "num")]
+    max_waiting: Option<i64>,
 }
 
 /// `type`, `limits`, and the backend's own options (whatever other keys the table has).
@@ -541,7 +545,7 @@ fn server_settings(f: &ServerFile, env: &EnvLookup, root: &Path) -> R<ServerSett
         d if Path::new(d).is_absolute() => Some(PathBuf::from(d)),
         d => Some(root.join(d)),
     };
-    Ok(ServerSettings {
+    let settings = ServerSettings {
         port: env.parse("MIDIR_PORT")?.or(f.port).unwrap_or(18880),
         max_prompt_chars: env.parse("MIDIR_MAX_PROMPT_CHARS")?.or(f.max_prompt_chars).unwrap_or(1_000_000),
         tail_reminder: env.flag("MIDIR_TAIL_REMINDER")?.or(f.tail_reminder).unwrap_or(true),
@@ -556,7 +560,32 @@ fn server_settings(f: &ServerFile, env: &EnvLookup, root: &Path) -> R<ServerSett
         responses_memory_mb: env.parse("MIDIR_RESPONSES_MEMORY_MB")?.or(f.responses_memory_mb).unwrap_or(64.0),
         shutdown_grace_s: env.parse("MIDIR_SHUTDOWN_GRACE_S")?.or(f.shutdown_grace_s).unwrap_or(25.0),
         api_key: env.str("MIDIR_API_KEY").or_else(|| f.api_key.clone()).map(|k| k.trim().to_string()).filter(|k| !k.is_empty()),
-    })
+    };
+    let s = &settings;
+    in_range("[server] port", f64::from(s.port), 1.0, "at least 1")?;
+    in_range("[server] max_prompt_chars", s.max_prompt_chars as f64, 1.0, "at least 1")?;
+    in_range("[server] responses_retention_days", s.responses_retention_days, f64::MIN_POSITIVE, "above 0")?;
+    for (name, v) in [
+        ("[server] responses_max_mb", s.responses_max_mb),
+        ("[server] responses_memory_mb", s.responses_memory_mb),
+        ("[server] keepalive_s", s.keepalive_s),
+        ("[server] retry_backoff_s", s.retry_backoff_s),
+        ("[server] shutdown_grace_s", s.shutdown_grace_s),
+        ("[server] tool_desc_max", s.tool_desc_max as f64),
+    ] {
+        in_range(name, v, 0.0, "0 or more")?;
+    }
+    in_range("[server] read_timeout_s", s.read_timeout_s, f64::MIN_POSITIVE, "above 0")?;
+    Ok(settings)
+}
+
+/// A setting outside its range is a startup error, not a surprise later (a negative retention deleted every stored
+/// response; a zero prompt cap dropped every history turn).
+fn in_range(name: &str, value: f64, min: f64, rule: &str) -> R<()> {
+    if value.is_nan() || value < min {
+        return Err(ConfigError(format!("{name} must be {rule} (got {value})")));
+    }
+    Ok(())
 }
 
 /// The backends. CAVEAT: the MIDIR_MAX_CONCURRENT / MIDIR_REQUESTS_PER_MINUTE / MIDIR_QUEUE_TIMEOUT /
@@ -570,8 +599,15 @@ fn backend_settings(raw: IndexMap<String, BackendFile>, env: &EnvLookup) -> R<In
             requests_per_minute: env.parse("MIDIR_REQUESTS_PER_MINUTE")?.or(b.limits.requests_per_minute).unwrap_or(90),
             queue_timeout_s: env.parse("MIDIR_QUEUE_TIMEOUT")?.or(b.limits.queue_timeout_s).unwrap_or(600.0),
             cooldown_on_429_s: env.parse("MIDIR_COOLDOWN_ON_429")?.or(b.limits.cooldown_on_429_s).unwrap_or(15.0),
+            max_waiting: env.parse("MIDIR_MAX_WAITING")?.or(b.limits.max_waiting).unwrap_or(64),
         };
         let type_ = b.type_.filter(|t| !t.is_empty()).unwrap_or_else(|| name.clone());
+        let section = format!("[backends.{name}.limits]");
+        in_range(&format!("{section} max_concurrent"), limits.max_concurrent as f64, 1.0, "at least 1")?;
+        in_range(&format!("{section} requests_per_minute"), limits.requests_per_minute as f64, 0.0, "0 (no limit) or more")?;
+        in_range(&format!("{section} queue_timeout_s"), limits.queue_timeout_s, 0.0, "0 or more")?;
+        in_range(&format!("{section} cooldown_on_429_s"), limits.cooldown_on_429_s, 0.0, "0 or more")?;
+        in_range(&format!("{section} max_waiting"), limits.max_waiting as f64, 0.0, "0 or more")?;
         out.insert(name.clone(), BackendSettings { name, type_, options: b.options, limits });
     }
     Ok(out)

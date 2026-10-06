@@ -75,6 +75,10 @@ appear. Containers log in UTC: set `TZ` in `.env` (for example `TZ=America/Sao_P
   which target each model maps to.
 - **429**: the account's 100 requests per minute were exceeded (several clients or Midir instances on one account).
 - **401 from Midir**: `MIDIR_API_KEY` is set and the client sent another key (or none).
+- **502 with code `upstream_401` or `upstream_403`**: StackSpot refused Midir's own credentials or access to an
+  agent (check the client id, secret and agent sharing); the client's key is not the problem.
+- **A setting "must be ..." at startup**: a value outside its range (a negative retention, a zero prompt cap); the
+  message names the setting.
 - **Client says the model does not support tools or images**: declare tool calling on and vision off (see the client
   examples); images become placeholders on purpose.
 - **A setting is "unknown ... ignored"**: a typo, or the running build is older than the setting; check the version in

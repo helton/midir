@@ -92,12 +92,49 @@ fn a_401_wave_renews_the_token_once() {
 }
 
 #[test]
-fn idm_failure_is_401_to_the_client() {
+fn upstream_credential_failures_are_a_502_not_the_clients_401() {
+    // review 2026-10-05 (F22): an expired StackSpot secret answered every client with 401 authentication_error, which
+    // SDKs read as their own key being wrong
     let rig = Rig::new();
     rig.upstream.set_token_status(401);
     let r = chat(&rig);
-    assert_eq!(r.status, 401);
+    assert_eq!(r.status, 502);
     assert!(s(&r.json()["error"]["message"]).contains("idm"));
+    assert_eq!(r.json()["error"]["code"], "upstream_401");
+    let rig = Rig::new();
+    rig.upstream.set_default(Reply::status(403, json!({"message": "forbidden"})));
+    assert_eq!(chat(&rig).status, 502);
+}
+
+#[test]
+fn a_full_queue_refuses_at_once() {
+    // review 2026-10-05 (F21): waiters were unbounded, each holding its body for up to queue_timeout_s
+    let rig = Rig::with(&MIDIR_TOML.replace("max_concurrent = 4", "max_concurrent = 1\nmax_waiting = 1"), &[]);
+    rig.upstream.set_default(Reply::text("ok").delay(1.0));
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let http = Http::new(&rig.server.url);
+            std::thread::spawn(move || {
+                let t0 = std::time::Instant::now();
+                let r = http.post("/v1/chat/completions", &json!({"model": "gpt-5.1", "messages": user("hi")}));
+                (r.status, t0.elapsed(), r.header("retry-after").is_some())
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let refused: Vec<_> = results.iter().filter(|(s, _, _)| *s == 429).collect();
+    assert_eq!(refused.len(), 2, "{results:?}"); // one in flight, one waiting, two refused
+    assert!(refused.iter().all(|(_, t, retry)| t.as_millis() < 500 && *retry), "{results:?}");
+}
+
+#[test]
+fn an_sse_body_without_line_breaks_is_an_error() {
+    // review 2026-10-05 (F20): a body that is not SSE was buffered whole
+    let rig = Rig::new();
+    rig.upstream.add(Reply::raw(&format!("data: {{\"message\": \"{}", "x".repeat(9 * 1024 * 1024))));
+    let r = chat(&rig);
+    assert_eq!(r.status, 502, "{}", &r.text[..r.text.len().min(200)]);
+    assert!(r.text.contains("without a line break"));
 }
 
 // ---------------------------------------------------------------- retries

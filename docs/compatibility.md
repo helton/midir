@@ -63,7 +63,9 @@ Search the code for `CAVEAT` to find each of these.
   the cooldown, or the backend's `Retry-After` when longer, up to 5 minutes) and halves the local budget once per
   episode (requests in flight that hit the same limit only extend the pause); the budget recovers by one request per
   minute, so a second Midir or StackSpot's own chat on the
-  same account is absorbed. Midir's own 429s carry `Retry-After`.
+  same account is absorbed. Midir's own 429s carry `Retry-After`, including when 64 requests already wait for a slot
+  (`limits.max_waiting`, refused at once instead of holding their bodies). StackSpot's own 401 and 403 reach clients
+  as a 502 (`upstream_401`): Midir's credentials, not the client's key.
 - GPT 5.x counts its reasoning as output tokens; time to first byte is 1.5-8 s depending on prompt size and model.
 
 More in [backends/stackspot.md](backends/stackspot.md).

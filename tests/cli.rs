@@ -139,6 +139,11 @@ fn invalid_configuration_is_a_clear_error() {
         (MIDIR_TOML.replace("default_model = \"gpt-5.1\"", "default_model = \"nope\""), "not one of the configured models"),
         ("this is = = not toml".to_string(), "cannot read"),
         (MIDIR_TOML.replace("type = \"stackspot\"", "type = \"nope\""), "unknown type \"nope\""),
+        // review 2026-10-05 (F19): values outside their range
+        (toml_with_server("responses_retention_days = -1"), "responses_retention_days must be above 0"),
+        (toml_with_server("max_prompt_chars = 0"), "max_prompt_chars must be at least 1"),
+        (toml_with_server("keepalive_s = -1"), "keepalive_s must be 0 or more"),
+        (MIDIR_TOML.replace("max_concurrent = 4", "max_concurrent = 0"), "max_concurrent must be at least 1"),
     ];
     for (toml, message) in cases {
         let o = run(&["--port", "1"], Some(&toml), &[]);
