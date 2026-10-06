@@ -357,7 +357,8 @@ pub fn tool_input(c: &ToolCall) -> Value {
 
 pub fn content_blocks(r: &CanonicalResponse) -> Value {
     let mut blocks = vec![];
-    if !r.text.is_empty() || r.tool_calls.is_empty() {
+    // an empty reply is an empty content list, as Anthropic's API answers it (never an empty text block)
+    if !r.text.is_empty() {
         blocks.push(json!({"type": "text", "text": r.text}));
     }
     blocks

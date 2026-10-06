@@ -451,28 +451,37 @@ impl Config {
 
     /// The model spec for a requested model name: exact name or alias > `match` regex in file order > exact after
     /// stripping a provider prefix > longest configured name contained in the requested one > default.
+    /// The model a requested name routes to (see `find`), or the default model.
     pub fn resolve(&self, model: &str) -> Arc<ModelSpec> {
+        self.find(model).unwrap_or_else(|| self.default.clone())
+    }
+
+    /// The model a requested name matches: exact name or alias, a `match` regex, exact after a provider prefix, or the
+    /// longest configured name it contains; None when it matches none (POST requests then go to the default model).
+    pub fn find(&self, model: &str) -> Option<Arc<ModelSpec>> {
         let m = model.trim().to_lowercase();
         let exact = |name: &str| self.models.iter().find(|s| s.name == name || s.aliases.iter().any(|a| a == name)).cloned();
         if let Some(s) = exact(&m) {
-            return s;
+            return Some(s);
         }
         if let Some(s) = self.models.iter().find(|s| s.match_re.as_ref().is_some_and(|re| re.is_match(&m))) {
-            return s.clone();
+            return Some(s.clone());
         }
         let prefixes: Vec<String> = self.backends.keys().map(|b| format!("{b}-")).chain(["midir-".to_string()]).collect();
         let without_provider = m.split_once('/').filter(|(p, _)| !p.is_empty()).map_or(m.as_str(), |(_, rest)| rest);
         let bare = prefixes.iter().find_map(|p| without_provider.strip_prefix(p.as_str())).unwrap_or(without_provider);
         if let Some(s) = exact(bare) {
-            return s;
+            return Some(s);
         }
-        self.models
+        let contained = self
+            .models
             .iter()
             .filter(|s| m.contains(s.name.as_str()))
             .rev() // among equally long names, the first in the file wins
             .max_by_key(|s| char_len(&s.name))
-            .cloned()
-            .unwrap_or_else(|| self.default.clone())
+            .cloned();
+        // without [[models]], the default is the one model and answers to its own name
+        contained.or_else(|| (self.models.is_empty() && m == self.default.name).then(|| self.default.clone()))
     }
 
     pub fn exposed_models(&self) -> Vec<Arc<ModelSpec>> {

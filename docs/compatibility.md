@@ -50,7 +50,8 @@ Search the code for `CAVEAT` to find each of these.
   big, the largest tool results (then user messages) are cut in the middle, keeping head and tail. A backend refusal
   for input length is retried once with a proportionally smaller prompt.
 - Images, audio and files become a text placeholder; built-in provider tools (web search, ...) are omitted.
-- **Refused**: `logprobs`, `n > 1`, `/v1/embeddings`. **Accepted and ignored** (logged once per client):
+- **Refused**: `logprobs`, `n > 1`, `/v1/embeddings`, Responses `conversation` (server-side conversation state), a
+  forced `tool_choice` with no tools. **Accepted and ignored** (logged once per client):
   `temperature`, `top_p`, `seed`, `reasoning`, `reasoning_effort`, `thinking`, `cache_control`, `metadata`.
 
 ## Backend limits (StackSpot)

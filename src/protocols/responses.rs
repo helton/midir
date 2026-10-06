@@ -66,6 +66,10 @@ pub struct Request {
     prompt_cache_key: Option<Box<RawValue>>,
     safety_identifier: Option<Box<RawValue>>,
     background: Option<Box<RawValue>>,
+    max_tool_calls: Option<Box<RawValue>>,
+    prompt: Option<Box<RawValue>>,
+    /// server-side history: refused, it would silently answer without that history
+    conversation: Option<Box<RawValue>>,
 }
 
 impl Request {
@@ -82,6 +86,8 @@ impl Request {
             ("prompt_cache_key", self.prompt_cache_key.as_deref()),
             ("safety_identifier", self.safety_identifier.as_deref()),
             ("background", self.background.as_deref()),
+            ("max_tool_calls", self.max_tool_calls.as_deref()),
+            ("prompt", self.prompt.as_deref()),
         ])
     }
 
@@ -221,6 +227,12 @@ pub async fn to_canonical(mut r: Request, store: &Arc<ResponseStore>) -> Result<
     let parallel: Option<bool> = field(r.parallel_tool_calls.as_deref(), "parallel_tool_calls")?;
     let previous: Option<String> = field::<Option<String>>(r.previous_response_id.as_deref(), "previous_response_id")?.flatten();
     let previous = previous.filter(|p| !p.is_empty());
+    if r.conversation.as_deref().is_some_and(json::is_meaningful) {
+        return Err(ClientError::new(
+            "'conversation' (server-side conversation state) is not supported: send the history in 'input' or use previous_response_id",
+            "unsupported_parameter",
+        ));
+    }
     let mut req = CanonicalRequest { ignored: r.ignored(), ..Default::default() };
     let info = RequestInfo {
         model: r.model.take().unwrap_or_default(),
@@ -379,6 +391,7 @@ async fn resolve_reference(id: &str, store: &Arc<ResponseStore>) -> Option<Refer
     let (prefix, rid, n) = parse_item_id(id)?;
     let stored = store.load(&rid).await?;
     match prefix {
+        "msg" if !stored.resp.segments.is_empty() => stored.resp.segments.get(n).map(|(_, t)| Referenced::Text(t.clone())),
         "msg" if n == 0 && has_message(&stored.resp) => Some(Referenced::Text(stored.resp.text.clone())),
         "fc" | "ctc" => stored.resp.tool_calls.get(n).cloned().map(Referenced::Call),
         _ => None,
@@ -413,8 +426,23 @@ pub fn message_item(msg_id: &str, text: &str, status: &str) -> Value {
 
 /// The output of a stored or non-streamed response: its message (all its text), then its calls.
 pub fn output_items(r: &CanonicalResponse, rid: &str, custom_names: &[String]) -> Vec<Value> {
-    let message = has_message(r).then(|| message_item(&item_id("msg", rid, 0), &r.text, "completed"));
-    message.into_iter().chain(r.tool_calls.iter().enumerate().map(|(n, c)| call_item(c, rid, n, custom_names, "completed"))).collect()
+    let call = |n: usize| call_item(&r.tool_calls[n], rid, n, custom_names, "completed");
+    if r.segments.is_empty() {
+        let message = has_message(r).then(|| message_item(&item_id("msg", rid, 0), &r.text, "completed"));
+        return message.into_iter().chain((0..r.tool_calls.len()).map(call)).collect();
+    }
+    // text after a call: the items in the order they were streamed, with the same ids
+    let mut out = vec![];
+    let mut next = 0;
+    for (n, (before, text)) in r.segments.iter().enumerate() {
+        while next < (*before).min(r.tool_calls.len()) {
+            out.push(call(next));
+            next += 1;
+        }
+        out.push(message_item(&item_id("msg", rid, n), text, "completed"));
+    }
+    out.extend((next..r.tool_calls.len()).map(call));
+    out
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -577,6 +605,7 @@ pub fn stream(
         let mut msg_id = String::new();
         let mut msg_text = String::new();
         let mut all_text = String::new();
+        let mut segments = vec![];
         let mut done: Option<CanonicalResponse> = None;
         let mut events = events;
         while let Some(e) = events.next().await {
@@ -590,6 +619,7 @@ pub fn stream(
                         yield seq.ev("response.content_part.added", json!({"item_id": msg_id, "output_index": items.len(), "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}));
                     }
                     msg_text.push_str(&t);
+                    crate::canonical::add_segment(&mut segments, n_calls, &t);
                     all_text.push_str(&t);
                     yield seq.ev("response.output_text.delta", json!({"item_id": msg_id, "output_index": items.len(), "content_index": 0, "delta": t, "logprobs": []}));
                 }
@@ -633,6 +663,7 @@ pub fn stream(
         }
         let mut r = done.unwrap_or_default();
         r.text = if r.tool_calls.is_empty() { all_text } else { all_text.trim().to_string() };
+        r.segments = crate::canonical::keep_segments(segments);
         if items.is_empty() {
             items.push(message_item(&item_id("msg", &rid, 0), "", "completed"));
         }

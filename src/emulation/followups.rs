@@ -27,8 +27,8 @@ static TRAILER_RE: LazyLock<Regex> =
     LazyLock::new(|| re(r"(?im)^[ \t]*(co-authored-by|signed-off-by|reviewed-by|acked-by|tested-by|reported-by|helped-by)[ \t]*:.*$"));
 static OFFER_RE: LazyLock<Regex> = LazyLock::new(|| {
     re(concat!(
-        r"(?i)\b(se (quiser|preferir|precisar|desejar)|caso (queira|precise|deseje)|quer que eu|deseja que eu|posso (também |ainda )?(detalhar|ajudar|explicar|fazer|ajustar|mostrar|revisar|seguir)|é só (avisar|pedir|falar|me dizer)|me (avise|diga|fale)|fico à disposição|",
-        r"let me know|if you('d)? (want|like|need|prefer)|would you like|do you want|feel free|happy to help|just ask)\b"
+        r"(?i)\b(se (quiser|preferir|precisar|desejar)|caso (queira|precise|deseje)|quer que eu|deseja que eu|posso (também |ainda )?(detalhar|ajudar|explicar|fazer|ajustar|mostrar|revisar|seguir)|é só (avisar|pedir|falar|me dizer)|me (avise|diga|fale)|(fico|ficar|estar|estou|permane[çc]o) à disposição|à disposição para|",
+        r"let me know|if you('d)? (want|like|need|prefer)|would you like|do you want|feel free|happy to help|just ask|at your disposal|i('ll| will) be (here|around|available))\b"
     ))
 });
 static WAIT_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -56,6 +56,22 @@ pub static INTENT_RE: LazyLock<Regex> = LazyLock::new(|| {
         r"i'll|i will|i'm going to|i am going to|let me|let's|let us|i need to (first )?(read|check|look|inspect|run|open|see|review|verify|understand|examine|update|fix|create|edit|confirm)|",
         r"next,? i|now i('ll| will| need)|i('ll| will) (now|then|next|first|start|proceed)|proceeding (to|with)|i'll proceed|starting (with|by)|first,? i|going to (read|check|run|edit|create|update|fix|look|inspect)|",
         r"voy a|vamos a|déjame|procederé|necesito (leer|revisar|ver|verificar))\b"
+    ))
+});
+/// An intent verb followed by explaining, summarizing or answering: what follows is the answer, not an action that needs
+/// a tool ("Let me explain how it works.", "Vou explicar o que pstdev calcula.").
+static EXPLAIN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    re(concat!(
+        r"(?i)\b(let me|i'?ll|i will|vou|irei|deix[ae]-me|deix[ae] me|voy a)\s+(explain|summarize|describe|clarify|outline|answer|walk you through|break (this|it) down|show you how|",
+        r"explicar|resumir|descrever|detalhar|esclarecer|responder|mostrar como|explicarte|resumirte)\b"
+    ))
+});
+/// A numbered plan with no header line ("1. Ler os arquivos…", "1. Implement median…"): its first step starts with an
+/// infinitive or imperative verb.
+static FIRST_STEP_RE: LazyLock<Regex> = LazyLock::new(|| {
+    re(concat!(
+        r"(?i)^\s*1[.)]\s+(\*\*)?(ler|implementar|criar|rodar|executar|adicionar|atualizar|verificar|planejar|ajustar|corrigir|escrever|analisar|revisar|testar|",
+        r"read|implement|create|run|add|update|check|plan|write|ensure|fix|review|analy[sz]e|inspect|test|leer|crear|ejecutar|agregar|revisar)\b"
     ))
 });
 static GERUND_OPEN_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -226,7 +242,8 @@ static ACCESS_FAILURE_RE: LazyLock<Regex> = LazyLock::new(|| {
     re(concat!(
         r"(?i)(\b[45]\d\d\b|forbidden|proibid|bloque|blocked|negad[oa]|denied|recusad|refused|time-?out|timed out|tempo (limite|esgotado)|",
         r"unauthori[sz]ed|n[ãa]o autorizad|not found|n[ãa]o encontrad|indispon[íi]ve|unavailable|rate.?limit|captcha|",
-        r"\bfalh(ou|aram|ando)\b|\bfailed\b|\b(deu|retorn\w*|devolve\w*|returned|returning|gave)( um| o| an?)? (erro|error))"
+        r"\bfalh(ou|aram|ando)\b|\bfailed\b|\b(deu|retorn\w*|devolve\w*|returned|returning|gave)( um| o| an?)? (erro|error)|",
+        r"no such file|does not exist|doesn'?t exist|n[ãa]o existe|inexistente|is missing|est[áa] faltando|permission denied|permiss[ãa]o negada)"
     ))
 });
 
@@ -320,13 +337,24 @@ fn turn_start(req: &CanonicalRequest) -> usize {
     instructions(req).next().map_or(0, |(i, _)| i)
 }
 
-/// Whether a call in the current turn already used one of these abilities: a tool of that kind, or arguments about
-/// it (a terminal's `curl https://...`).
+/// Commands that use an ability from a terminal: reading files, reaching the web.
+static ABILITY_COMMANDS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
+    vec![
+        ("files", re(r"\b(cat|ls|head|tail|find|grep|rg|sed|awk|stat|tree|less|more|wc|file)\b")),
+        ("web", re(r"\b(curl|wget|http|https)\b")),
+    ]
+});
+
+/// Whether a call in the current turn already used one of these abilities: a tool of that kind, arguments about it,
+/// or a terminal command that does it (`cat config.yaml`, `curl https://...`).
 fn tried(req: &CanonicalRequest, abilities: &[&(&str, Regex, Regex)]) -> bool {
     req.turns[turn_start(req)..].iter().flat_map(|t| &t.tool_calls).any(|c| {
         let about = req.tools.iter().find(|t| t.name == c.name).map_or_else(|| c.name.clone(), |t| format!("{} {}", t.name, t.description));
         let args = c.arguments.to_string();
-        abilities.iter().any(|(_, words, tools)| tools.is_match(&about) || words.is_match(&args))
+        let command = ["command", "cmd"].iter().find_map(|k| c.arguments.get(*k)).map(|v| v.to_string()).unwrap_or_default();
+        abilities.iter().any(|(kind, words, tools)| {
+            tools.is_match(&about) || words.is_match(&args) || ABILITY_COMMANDS.iter().any(|(k, cmd)| k == kind && cmd.is_match(&command))
+        })
     })
 }
 
@@ -539,8 +567,9 @@ pub fn announces_without_acting(text_: &str) -> bool {
     if USER_GATE_RE.is_match(&last4) {
         return false; // it leaves the action to the user's approval
     }
+    let intent = |x: &str| INTENT_RE.is_match(x) && !EXPLAIN_RE.is_match(x);
     let last2 = &sents[sents.len().saturating_sub(2)..];
-    if (INTENT_RE.is_match(&last2.join(" ")) || last2.iter().any(|x| GERUND_OPEN_RE.is_match(x))) && !PAST_RE.is_match(last) {
+    if (last2.iter().any(|x| intent(x)) || last2.iter().any(|x| GERUND_OPEN_RE.is_match(x))) && !PAST_RE.is_match(last) {
         return true; // the last thing it says is an action it is about to do
     }
     if prose.trim_end().ends_with(':') && !t.ends_with("```") {
@@ -549,10 +578,13 @@ pub fn announces_without_acting(text_: &str) -> bool {
     if DONE_RE.is_match(&prose) {
         return false;
     }
-    if INTENT_RE.is_match(sents[0]) || GERUND_OPEN_RE.is_match(sents[0]) {
+    if intent(sents[0]) || GERUND_OPEN_RE.is_match(sents[0]) {
         return true; // opens with an announcement and never acts
     }
     let lines: Vec<&str> = prose.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.iter().take(3).any(|l| FIRST_STEP_RE.is_match(l)) && lines.iter().filter(|l| STEP_RE.is_match(l)).count() >= 3 {
+        return true; // a numbered plan of steps to do, without a header (a title line may come first)
+    }
     let Some(plan_at) = lines.iter().position(|l| PLAN_RE.is_match(l)) else { return false };
     lines[plan_at + 1..].iter().filter(|l| STEP_RE.is_match(l)).count() >= 2
 }
@@ -867,5 +899,54 @@ mod tests {
         ran(&mut r, "c3", "write_file", serde_json::json!({"path": "a.py", "content": "v3"}), "File written");
         ran(&mut r, "c4", "write_file", serde_json::json!({"path": "a.py", "content": "v3"}), "File written");
         assert!(repeats_itself(&r, &write("c9", "v3"))); // the very same write twice, same result: a loop
+    }
+
+    #[test]
+    fn a_closing_offer_is_not_an_announcement() {
+        // review 2026-10-05 (F11): "vou ficar à disposição" fired a follow-up
+        for text in [
+            "Pronto, tudo implementado e testado. Vou ficar à disposição para dúvidas.",
+            "Implementation complete. I'll be here if you need anything else.",
+            "Tudo certo. Se precisar de mais alguma coisa, vou estar por aqui.",
+            "Feito. Vou resumir: adicionei median e pstdev, testes passando.",
+            "Done. Let me know if you want me to proceed with the deployment.",
+            "Tudo pronto. Fico à disposição.",
+        ] {
+            assert!(!announces_without_acting(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn explaining_is_not_announcing() {
+        // review 2026-10-05 (F35): an answer that opens with "let me explain" is the answer
+        assert!(!announces_without_acting("Let me explain how the parser works. It reads deltas and holds back a possible tag."));
+        assert!(!announces_without_acting("Vou explicar o que pstdev calcula. É o desvio padrão populacional."));
+        assert!(!announces_without_acting("I'll summarize the changes: median and pstdev, with tests."));
+        assert!(announces_without_acting("Let me read the parser first."));
+        assert!(announces_without_acting("Vou ler o arquivo e depois explicar."));
+    }
+
+    #[test]
+    fn a_numbered_plan_without_a_header_is_an_announcement() {
+        // review 2026-10-05 (F29): four of the nine corpus misses
+        assert!(announces_without_acting("1. Ler os arquivos relevantes.\n2. Implementar median em calc/stats.py.\n3. Rodar os testes."));
+        assert!(announces_without_acting("1. Implement `median` in calc.stats\n2. Add tests\n3. Run the full suite"));
+        assert!(announces_without_acting("Evoluir a calculadora\n1. Implementar median\n2. Implementar pstdev\n3. Rodar os testes"));
+        // a numbered report of what was done is not a plan
+        assert!(!announces_without_acting("1. Implementei median.\n2. Adicionei testes.\n3. Rodei a suíte: 14 passed."));
+        assert!(!announces_without_acting("1. Read the file\n2. Fix it")); // two steps: not enough to call it a plan
+    }
+
+    #[test]
+    fn a_missing_file_is_a_cited_failure() {
+        // review 2026-10-05 (F40): the ability follow-up re-ran a `cat` of a file that does not exist
+        let resp = CanonicalResponse::default();
+        let r = req(&["show me config.yaml"]);
+        assert!(false_incapacity(&r, &resp, "I cannot read the file config.yaml because it does not exist.", &[]).is_empty());
+        assert!(false_incapacity(&r, &resp, "Não consigo abrir o arquivo config.yaml, ele não existe no projeto.", &[]).is_empty());
+        let mut t = req(&["show me config.yaml"]);
+        ran(&mut t, "c1", "run_command", serde_json::json!({"command": "cat config.yaml"}), "No such file");
+        assert!(false_incapacity(&t, &resp, "Não consigo abrir o arquivo.", &[]).is_empty()); // a `cat` tried the files
+        assert_eq!(false_incapacity(&r, &resp, "Não consigo ler arquivos do seu projeto.", &[]).len(), 1); // never tried
     }
 }

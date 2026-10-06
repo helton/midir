@@ -13,7 +13,7 @@ use midir::emulation::followups::announces_without_acting;
 use serde_json::Value;
 
 /// Promises the rules catch today (out of 64), and false alarms allowed (none).
-const MIN_CAUGHT: usize = 55;
+const MIN_CAUGHT: usize = 59;
 
 fn read(path: &std::path::Path) -> Vec<Value> {
     std::fs::read_to_string(path).unwrap().lines().filter(|l| !l.trim().is_empty()).map(|l| serde_json::from_str(l).unwrap()).collect()

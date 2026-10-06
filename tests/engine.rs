@@ -487,6 +487,42 @@ fn json_mode_does_not_repair_a_reply_cut_by_max_tokens() {
 }
 
 #[test]
+fn answers_that_end_with_an_offer_or_an_explanation_get_no_follow_up() {
+    // review 2026-10-05 (F11, F35): each of these cost a hidden backend call
+    for reply in [
+        "Pronto, tudo implementado e testado. Vou ficar à disposição para dúvidas.",
+        "Let me explain how the parser works. It reads deltas and holds back a possible tag. Each block is decoded as JSON.",
+        "Vou explicar o que pstdev calcula. É o desvio padrão populacional: raiz da média dos quadrados dos desvios.",
+    ] {
+        let rig = Rig::new();
+        rig.upstream.add(reply).add("unused");
+        let r = chat(&rig, json!({"tools": chat_tools(), "messages": user("explique")}));
+        assert_eq!(rig.upstream.calls().len(), 1, "{reply}");
+        assert_eq!(r["choices"][0]["finish_reason"], "stop");
+    }
+}
+
+#[test]
+fn a_missing_file_is_not_read_again_by_a_follow_up() {
+    // review 2026-10-05 (F40): "the file does not exist" got an ability follow-up that re-ran the same `cat`
+    for reply in [
+        "I cannot read the file config.yaml because it does not exist.",
+        "Não consigo abrir o arquivo config.yaml, ele não existe no projeto.",
+    ] {
+        let rig = Rig::new();
+        let messages = json!([
+            {"role": "user", "content": "show me config.yaml"},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "run_command", "arguments": "{\"command\": \"cat config.yaml\"}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "cat: config.yaml: No such file or directory"}
+        ]);
+        rig.upstream.add(reply).add(tool_call_text("run_command", json!({"command": "cat config.yaml"})));
+        let r = chat(&rig, json!({"tools": chat_tools(), "messages": messages}));
+        assert_eq!(rig.upstream.calls().len(), 1, "{reply}");
+        assert_eq!(appended_calls(&r), 0);
+    }
+}
+
+#[test]
 fn a_second_announcement_gets_a_second_follow_up() {
     let rig = Rig::new();
     rig.upstream
@@ -657,4 +693,30 @@ fn a_final_report_that_forgets_the_ordered_commit_gets_a_follow_up() {
     done.push(json!({"role": "tool", "tool_call_id": "c2", "content": "1 file changed"}));
     chat(&rig, json!({"tools": chat_tools(), "messages": done}));
     assert_eq!(rig.upstream.calls().len(), 1);
+}
+
+#[test]
+fn a_client_that_goes_away_is_logged() {
+    // review 2026-10-05 (F12): a request cancelled by its client left no line saying how it ended
+    use std::io::{Read, Write};
+    let rig = Rig::new();
+    rig.upstream.set_default(Reply::text(&"word ".repeat(2000)).chunk(5).delay(1.0));
+    let body = json!({"model": "gpt-5.1", "messages": user("hi"), "stream": true}).to_string();
+    let addr = rig.server.url.trim_start_matches("http://").to_string();
+    let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+    write!(
+        sock,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    sock.set_read_timeout(Some(std::time::Duration::from_millis(300))).unwrap();
+    let mut buf = [0u8; 256];
+    let _ = sock.read(&mut buf);
+    drop(sock);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !rig.server.logs().contains("cancelled: the client went away") && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(rig.server.logs().contains("cancelled: the client went away"), "{}", rig.server.logs());
 }

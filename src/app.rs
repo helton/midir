@@ -76,26 +76,45 @@ fn json_response<T: Serialize + ?Sized>(status: u16, body: &T) -> Response {
 }
 
 fn error_body(flavor: Flavor, status: u16, message: &str, typ: &str, code: Option<&str>) -> Response {
+    error_body_for(flavor, status, message, typ, code, None)
+}
+
+/// An error in the protocol's format; Anthropic's body also carries the request id.
+fn error_body_for(flavor: Flavor, status: u16, message: &str, typ: &str, code: Option<&str>, rid: Option<&str>) -> Response {
     match flavor {
-        Flavor::Anthropic => json_response(status, &json!({"type": "error", "error": {"type": typ, "message": message}})),
+        Flavor::Anthropic => {
+            let mut body = json!({"type": "error", "error": {"type": typ, "message": message}});
+            if let Some(rid) = rid {
+                body["request_id"] = json!(rid);
+            }
+            json_response(status, &body)
+        }
         _ => json_response(status, &json!({"error": {"message": message, "type": typ, "code": code, "param": null}})),
     }
 }
 
-/// An error in the middle of a stream becomes an error event in the protocol's format.
-fn stream_error(flavor: Flavor, message: &str, typ: &str) -> String {
+/// An error in the middle of a stream becomes an error event in the protocol's format: the error's type (a 429 is a
+/// `rate_limit_error`), its code, and for Responses the next sequence number of the stream.
+fn stream_error(flavor: Flavor, message: &str, typ: &str, code: Option<&str>, seq: u64) -> String {
     match flavor {
         Flavor::Anthropic => format!("event: error\ndata: {}\n\n", json!({"type": "error", "error": {"type": typ, "message": message}})),
         Flavor::Responses => {
             format!(
                 "event: error\ndata: {}\n\n",
-                json!({"type": "error", "code": typ, "message": message, "param": null, "sequence_number": 0})
+                json!({"type": "error", "code": code.unwrap_or(typ), "message": message, "param": null, "sequence_number": seq})
             )
         }
         Flavor::OpenAi => {
-            format!("data: {}\n\ndata: [DONE]\n\n", json!({"error": {"message": message, "type": typ, "code": null, "param": null}}))
+            format!("data: {}\n\ndata: [DONE]\n\n", json!({"error": {"message": message, "type": typ, "code": code, "param": null}}))
         }
     }
+}
+
+/// The sequence number in a Responses event, if the chunk is one.
+fn sequence_of(chunk: &str) -> Option<u64> {
+    let at = chunk.rfind("\"sequence_number\":")? + "\"sequence_number\":".len();
+    let digits: String = chunk[at..].chars().skip_while(|c| c.is_whitespace()).take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 /// Pass `events` through, adding a keepalive event whenever nothing was forwarded for `interval` seconds: while the
@@ -142,6 +161,28 @@ async fn first_answer(mut events: EventStream, wait: Duration) -> Result<EventSt
     Ok(Box::pin(futures::stream::iter(seen).chain(events)))
 }
 
+/// Logs a request the client left before its answer was complete: dropped with the request's future or stream, it
+/// says so unless the request finished (with an answer or an error).
+struct ClientGone {
+    rid: String,
+    started: std::time::Instant,
+    finished: bool,
+}
+
+impl ClientGone {
+    fn new(rid: &str) -> Self {
+        ClientGone { rid: rid.to_string(), started: std::time::Instant::now(), finished: false }
+    }
+}
+
+impl Drop for ClientGone {
+    fn drop(&mut self) {
+        if !self.finished {
+            tracing::info!("{} cancelled: the client went away after {:.1}s", self.rid, self.started.elapsed().as_secs_f64());
+        }
+    }
+}
+
 /// What a panic says, for the log.
 fn panic_text(err: &(dyn std::any::Any + Send)) -> &str {
     err.downcast_ref::<String>().map(String::as_str).or_else(|| err.downcast_ref::<&str>().copied()).unwrap_or("unknown")
@@ -155,36 +196,47 @@ fn guarded(
     flavor: Flavor,
 ) -> BoxStream<'static, Result<Bytes, std::io::Error>> {
     Box::pin(async_stream::stream! {
+        let mut gone = ClientGone::new(&rid);
         let mut inner = AssertUnwindSafe(inner).catch_unwind();
+        let mut seq = 0;
         while let Some(chunk) = inner.next().await {
             let ev = match chunk {
                 Ok(Ok(s)) => {
+                    if flavor == Flavor::Responses
+                        && let Some(n) = sequence_of(&s)
+                    {
+                        seq = n + 1;
+                    }
                     yield Ok(Bytes::from(s));
                     continue;
                 }
                 Ok(Err(e)) => match &e {
                     Error::Backend(b) => {
                         tracing::error!("{rid} backend error mid-stream: {b}");
-                        stream_error(flavor, &b.message(), "api_error")
+                        let code = format!("upstream_{}", b.status);
+                        stream_error(flavor, &b.message(), error_type(b.http_status(), "api_error"), Some(&code), seq)
                     }
-                    Error::Client(c) => stream_error(flavor, &c.message, "invalid_request_error"),
+                    Error::Client(c) => stream_error(flavor, &c.message, error_type(c.status, "invalid_request_error"), Some(&c.code), seq),
                     Error::Net(n) => {
                         tracing::error!("{rid} network error mid-stream: {n}");
-                        stream_error(flavor, &format!("error talking to the backend: {n}"), "api_error")
+                        stream_error(flavor, &format!("error talking to the backend: {n}"), "api_error", Some("upstream_network"), seq)
                     }
                     Error::Internal(m) => {
                         tracing::error!("{rid} internal error mid-stream: {m}");
-                        stream_error(flavor, &format!("midir internal error: {m}"), "api_error")
+                        stream_error(flavor, &format!("midir internal error: {m}"), "api_error", Some("internal_error"), seq)
                     }
                 },
                 Err(panic) => {
                     tracing::error!("{rid} internal error mid-stream (panic): {}", panic_text(&*panic));
-                    stream_error(flavor, "midir internal error (a bug): this response was cut; other requests are not affected", "api_error")
+                    let message = "midir internal error (a bug): this response was cut; other requests are not affected";
+                    stream_error(flavor, message, "api_error", Some("internal_error"), seq)
                 }
             };
+            gone.finished = true;
             yield Ok(Bytes::from(ev));
             break;
         }
+        gone.finished = true;
     })
 }
 
@@ -240,7 +292,8 @@ pub struct App {
 }
 
 impl App {
-    fn error_response(&self, flavor: Flavor, e: Error) -> Response {
+    fn error_response(&self, flavor: Flavor, e: Error, rid: Option<&str>) -> Response {
+        let error_body = |flavor, status, message: &str, typ, code: Option<&str>| error_body_for(flavor, status, message, typ, code, rid);
         match e {
             Error::Client(c) => {
                 tracing::warn!("{} {}: {}", c.status, c.code, prefix(&c.message, 300));
@@ -287,6 +340,9 @@ impl App {
     ) -> Result<Prepared, Error> {
         if info.model.trim().is_empty() {
             info.model = DEFAULT_MODEL_NAME.to_string();
+        }
+        if req.tool_choice.forced() && req.tools.is_empty() {
+            return Err(ClientError::new("tool_choice requires a call, but the request declares no tools", "invalid_tool_choice").into());
         }
         let (route, runner) = self.gateway.route(&info.model);
         req.route = Some(route.clone());
@@ -379,7 +435,16 @@ impl App {
     }
 
     fn model(&self, headers: &HeaderMap, model_id: &str) -> Response {
-        let spec = self.gateway.config.resolve(model_id);
+        let Some(spec) = self.gateway.config.find(model_id) else {
+            let flavor = if headers.contains_key("anthropic-version") { Flavor::Anthropic } else { Flavor::OpenAi };
+            return error_body(
+                flavor,
+                404,
+                &format!("model '{model_id}' not found (GET /v1/models lists them)"),
+                "not_found_error",
+                Some("model_not_found"),
+            );
+        };
         if headers.contains_key("anthropic-version") {
             return json_response(200, &self.anthropic_model(model_id, &spec.description, now_s()));
         }
@@ -455,7 +520,7 @@ type AppState = State<Arc<App>>;
 
 /// The answer, or the error in the protocol's format; either way with the request id in the protocol's header.
 fn answer(app: &App, flavor: Flavor, rid: &str, r: Result<Response, Error>) -> Response {
-    let mut resp = r.unwrap_or_else(|e| app.error_response(flavor, e));
+    let mut resp = r.unwrap_or_else(|e| app.error_response(flavor, e, Some(rid)));
     if let Ok(v) = HeaderValue::from_str(rid) {
         resp.headers_mut().insert(flavor.request_id_header(), v);
     }
@@ -501,18 +566,22 @@ async fn embeddings(State(app): AppState) -> Response {
         "unsupported_endpoint",
         404,
     );
-    app.error_response(Flavor::OpenAi, e.into())
+    app.error_response(Flavor::OpenAi, e.into(), None)
 }
 
 async fn chat(State(app): AppState, headers: HeaderMap, raw: Bytes) -> Response {
     let cid = format!("chatcmpl-{}", hex_id(24));
+    let mut gone = ClientGone::new(&cid);
     let r = app.chat(&headers, &raw, &cid).await;
+    gone.finished = true;
     answer(&app, Flavor::OpenAi, &cid, r)
 }
 
 async fn create_response(State(app): AppState, headers: HeaderMap, raw: Bytes) -> Response {
     let rid = format!("resp_{}", hex_id(24));
+    let mut gone = ClientGone::new(&rid);
     let r = app.responses(&headers, &raw, &rid).await;
+    gone.finished = true;
     answer(&app, Flavor::Responses, &rid, r)
 }
 
@@ -523,13 +592,28 @@ async fn get_response(State(app): AppState, Path(id): Path<String>) -> Response 
 
 async fn create_message(State(app): AppState, headers: HeaderMap, raw: Bytes) -> Response {
     let mid = format!("msg_{}", hex_id(24));
+    let mut gone = ClientGone::new(&mid);
     let r = app.messages(&headers, &raw, &mid).await;
+    gone.finished = true;
     answer(&app, Flavor::Anthropic, &mid, r)
 }
 
 async fn count_tokens(State(app): AppState, raw: Bytes) -> Response {
     let rid = format!("req_{}", hex_id(24));
     answer(&app, Flavor::Anthropic, &rid, app.count_tokens(&raw))
+}
+
+/// A body over the limit: axum answers a plain-text 413; clients get it in their protocol's format instead.
+async fn body_too_large(request: Request, next: Next) -> Response {
+    let flavor = flavor_of(request.uri().path());
+    let resp = next.run(request).await;
+    if resp.status() != StatusCode::PAYLOAD_TOO_LARGE
+        || resp.headers().get("content-type").is_some_and(|c| c.as_bytes().starts_with(b"application/json"))
+    {
+        return resp;
+    }
+    let message = format!("request body too large: at most {} MB", MAX_BODY_BYTES / (1024 * 1024));
+    error_body(flavor, 413, &message, "request_too_large", Some("request_too_large"))
 }
 
 fn flavor_of(path: &str) -> Flavor {
@@ -590,6 +674,7 @@ pub fn router(app: Arc<App>) -> Router {
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(app.clone(), authorize))
+        .layer(middleware::from_fn(body_too_large))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(CatchPanicLayer::custom(panic_response))
         .with_state(app)
@@ -632,5 +717,47 @@ mod tests {
         let request = Request::get("/x").body(Body::empty()).unwrap();
         let response = tower::ServiceExt::oneshot(router, request).await.unwrap();
         assert_eq!(response.status(), 500);
+    }
+
+    #[tokio::test]
+    async fn a_backend_error_mid_stream_keeps_its_type_and_the_sequence() {
+        // review 2026-10-05 (F42): every mid-stream backend error was an api_error; Responses' event had no type
+        let err = || Error::from(crate::errors::BackendError::new(429, json!({"message": "slow down"}), "agent", "stackspot"));
+        let inner: BoxStream<'static, Result<String, Error>> =
+            Box::pin(futures::stream::iter(vec![Ok("event: message_start\ndata: {}\n\n".to_string()), Err(err())]));
+        let out: Vec<_> = guarded(inner, "msg_1".into(), Flavor::Anthropic).collect().await;
+        let last = String::from_utf8(out[1].as_ref().unwrap().to_vec()).unwrap();
+        assert!(last.contains("\"rate_limit_error\""), "{last}");
+        let first = "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":7}\n\n".to_string();
+        let inner: BoxStream<'static, Result<String, Error>> = Box::pin(futures::stream::iter(vec![Ok(first), Err(err())]));
+        let out: Vec<_> = guarded(inner, "resp_1".into(), Flavor::Responses).collect().await;
+        let last = String::from_utf8(out[1].as_ref().unwrap().to_vec()).unwrap();
+        let data: Value = serde_json::from_str(last.lines().nth(1).unwrap().trim_start_matches("data: ")).unwrap();
+        assert_eq!(
+            (data["type"].clone(), data["code"].clone(), data["sequence_number"].clone()),
+            (json!("error"), json!("upstream_429"), json!(8))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_body_is_a_413_in_the_protocols_format() {
+        // review 2026-10-05 (F44): axum's rejection was plain text
+        async fn echo(raw: Bytes) -> String {
+            format!("{}", raw.len())
+        }
+        let router = Router::new()
+            .route("/v1/messages", post(echo))
+            .route("/v1/chat/completions", post(echo))
+            .layer(middleware::from_fn(body_too_large))
+            .layer(DefaultBodyLimit::max(16));
+        for (path, flavor_key) in [("/v1/messages", "type"), ("/v1/chat/completions", "error")] {
+            let request = Request::post(path).body(Body::from("x".repeat(64))).unwrap();
+            let response = tower::ServiceExt::oneshot(router.clone(), request).await.unwrap();
+            assert_eq!(response.status(), 413);
+            assert_eq!(response.headers()["content-type"], "application/json");
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            assert!(v.get(flavor_key).is_some(), "{v}");
+        }
     }
 }

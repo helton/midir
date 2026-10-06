@@ -93,6 +93,9 @@ struct StoredResponse {
     tool_calls: Vec<ToolCall>,
     finish: String,
     usage: Usage,
+    /// text after tool calls, as separate messages (absent in records written before it existed)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    segments: Vec<(usize, String)>,
 }
 
 /// The blobs a record uses (what the size purge needs to know, without decoding the turns into memory).
@@ -385,6 +388,7 @@ impl ResponseStore {
             resp: StoredResponse {
                 text: s.resp.text.clone(),
                 tool_calls: s.resp.tool_calls.clone(),
+                segments: s.resp.segments.clone(),
                 finish: s.resp.finish.to_string(),
                 usage: s.resp.usage,
             },
@@ -451,6 +455,7 @@ impl ResponseStore {
             tool_calls: rec.resp.tool_calls,
             finish: Finish::parse(&rec.resp.finish),
             usage: rec.resp.usage,
+            segments: rec.resp.segments,
             ..Default::default()
         };
         Ok(Some(Stored {

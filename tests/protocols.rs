@@ -435,3 +435,74 @@ fn a_call_keeps_its_id_whatever_text_comes_around_it() {
     let input = json!([{"type": "item_reference", "id": streamed_call["id"]}, {"type": "function_call_output", "call_id": streamed_call["call_id"], "output": "print(1)"}]);
     assert_eq!(rig.http.post("/v1/responses", &json!({"model": "gpt-5.1", "input": input, "tools": resp_tools()})).status, 200);
 }
+
+#[test]
+fn text_after_a_call_gives_the_same_items_streamed_and_stored() {
+    // review 2026-10-05 (F10): the stream had msg 0, call 0, msg 1; the stored response one merged message, and an
+    // item_reference to msg 1 was a 400
+    let mut rig = Rig::new();
+    let reply = format!("Reading.\n{}\nThen I will summarize the result.", tool_call_text("read_file", json!({"path": "a.py"})));
+    rig.upstream.add(Reply::text(&reply).chunk(6));
+    let evs = rig.http.post("/v1/responses", &json!({"model": "gpt-5.1", "input": "x", "tools": resp_tools(), "stream": true})).events();
+    let done = evs.last().unwrap().1["response"].clone();
+    let streamed: Vec<(String, String)> =
+        done["output"].as_array().unwrap().iter().map(|o| (s(&o["type"]).to_string(), s(&o["id"]).to_string())).collect();
+    assert_eq!(streamed.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(), ["message", "function_call", "message"]);
+    let id = s(&done["id"]).to_string();
+    for restart in [false, true] {
+        if restart {
+            rig.restart(); // the same from disk
+        }
+        let got = rig.http.get(&format!("/v1/responses/{id}")).json();
+        let stored: Vec<(String, String)> =
+            got["output"].as_array().unwrap().iter().map(|o| (s(&o["type"]).to_string(), s(&o["id"]).to_string())).collect();
+        assert_eq!(stored, streamed, "restart={restart}");
+        assert_eq!(got["output"][2]["content"][0]["text"], "Then I will summarize the result.");
+    }
+    rig.upstream.add("ok");
+    let r = rig.http.post(
+        "/v1/responses",
+        &json!({"model": "gpt-5.1", "input": [{"type": "item_reference", "id": streamed[2].1}, {"role": "user", "content": "go on"}]}),
+    );
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert!(rig.upstream.prompt(1).contains("Then I will summarize the result."));
+    // non-streaming: the same item order
+    rig.upstream.add(reply.clone());
+    let r = rig.http.post("/v1/responses", &json!({"model": "gpt-5.1", "input": "x", "tools": resp_tools()})).json();
+    let types: Vec<&str> = r["output"].as_array().unwrap().iter().map(|o| s(&o["type"])).collect();
+    assert_eq!(types, ["message", "function_call", "message"]);
+}
+
+#[test]
+fn protocol_gaps_from_the_review() {
+    let rig = Rig::new();
+    // F43: Anthropic error bodies carry request_id
+    let r = rig.http.post("/v1/messages", &json!({"model": "claude-opus-4-5", "max_tokens": 9, "messages": 5}));
+    assert_eq!(r.status, 400);
+    assert_eq!(r.json()["request_id"], json!(r.header("request-id").unwrap()));
+    // F45: a forced tool choice with no tools is a 400, on every protocol, without a backend call
+    for (path, body) in [
+        ("/v1/chat/completions", json!({"model": "gpt-5.1", "messages": user("x"), "tool_choice": "required"})),
+        ("/v1/responses", json!({"model": "gpt-5.1", "input": "x", "tool_choice": "required"})),
+        ("/v1/messages", json!({"model": "claude-opus-4-5", "max_tokens": 9, "messages": user("x"), "tool_choice": {"type": "any"}})),
+    ] {
+        let r = rig.http.post(path, &body);
+        assert_eq!(r.status, 400, "{path}: {}", r.text);
+    }
+    assert!(rig.upstream.calls().is_empty());
+    // F46: `conversation` is refused (it would silently drop the server-side history); max_tool_calls is logged
+    let r = rig.http.post("/v1/responses", &json!({"model": "gpt-5.1", "input": "x", "conversation": "conv_1"}));
+    assert_eq!(r.status, 400);
+    assert!(r.text.contains("conversation"));
+    rig.upstream.add("ok");
+    assert_eq!(rig.http.post("/v1/responses", &json!({"model": "gpt-5.1", "input": "x", "max_tool_calls": 3})).status, 200);
+    assert!(rig.server.logs().contains("max_tool_calls"));
+    // F47: GET /v1/models/{id} knows which ids exist
+    assert_eq!(rig.http.get("/v1/models/definitely-not-a-model").status, 404);
+    assert_eq!(rig.http.get("/v1/models/gpt-5.1").status, 200);
+    assert_eq!(rig.http.get("/v1/models/claude-opus-4-5").status, 200); // an alias
+    // F23: an empty reply is an empty content list for Anthropic clients
+    rig.upstream.add("");
+    let r = rig.http.post("/v1/messages", &json!({"model": "claude-opus-4-5", "max_tokens": 50, "messages": user("hi")})).json();
+    assert_eq!(r["content"], json!([]));
+}

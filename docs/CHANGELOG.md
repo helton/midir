@@ -23,6 +23,24 @@ Fixes from the 2026-10-05 review (`.internal`, findings F-numbered):
 - **Connections that never finish their request are closed**: headers must arrive within `[server] read_timeout_s`
   (30 s, `MIDIR_READ_TIMEOUT_S`) and a body may not stall longer between chunks; at most 4096 connections are open at
   once. Before, a half-sent request held its connection forever.
+- **Fewer and better follow-ups**: closings such as "vou ficar à disposição" and answers that open with "let me
+  explain" no longer cost a hidden call; a reply that says a file does not exist (or that ran `cat`/`curl` itself) is
+  taken as reporting a failure; a numbered plan without a header line is recognized as an announcement (the labeled
+  corpus: 59 of 64 promises caught, from 55, still no false alarm).
+- **Parser**: a `<tool_call>` tag quoted in the model's prose ("use the `<tool_call>` tag") stays text (the middle of
+  the sentence was lost and a repair fired); text before a call is the same whatever the chunking (a trailing newline
+  came through only when the text arrived in its own delta); a broken call whose arguments contain a "name" key is
+  salvaged under the call's own name.
+- **Responses**: text that follows a tool call is its own message item in the stored response and in `GET`, with the
+  ids it streamed with, so `item_reference` resolves it (it was merged into the first message, and referencing it was
+  a 400); `conversation` (server-side state) is refused with a 400 instead of being ignored; `max_tool_calls` and
+  `prompt` are logged as ignored.
+- **Errors**: an error in the middle of a stream keeps its type (a 429 is a `rate_limit_error`, not an `api_error`)
+  and its code, and Responses' error event continues the stream's sequence numbers; Anthropic error bodies carry
+  `request_id`; a body over the size limit is a 413 in the protocol's format (it was plain text); a forced
+  `tool_choice` without tools is a 400 (it was answered as plain text); `GET /v1/models/{id}` answers 404 for a name
+  no model answers to; an empty reply is an empty content list for Anthropic clients; a request the client leaves is
+  logged as cancelled.
 - **Responses store**: retention applies when a response is read from disk, not only at the hourly purge (an expired
   response was served until then); writes are flushed to disk before the rename, and a blob left empty by a crash is
   written again (it broke every chain that shared it); the size purge removes a response together with its

@@ -644,6 +644,7 @@ impl EmulationEngine {
                 usage,
                 message_id: final_.message_id.clone(),
                 rejected_calls: parser.rejected.clone(),
+                segments: vec![],
             };
             tracing::info!("{rid} ok in {:.1}s, {emitted} chars, {} tool calls, finish={finish}, usage={}", t0.elapsed().as_secs_f64(), calls.len(), resp.usage);
             yield Event::Done(resp);
@@ -656,10 +657,14 @@ impl EmulationEngine {
 pub async fn collect(mut events: EventStream) -> Result<CanonicalResponse, Error> {
     let mut text_ = String::new();
     let mut calls: Vec<ToolCall> = vec![];
+    let mut segments = vec![];
     let mut final_: Option<CanonicalResponse> = None;
     while let Some(ev) = events.next().await {
         match ev? {
-            Event::Text(t) => text_.push_str(&t),
+            Event::Text(t) => {
+                crate::canonical::add_segment(&mut segments, calls.len(), &t);
+                text_.push_str(&t);
+            }
             Event::ToolCall(c) => calls.push(c),
             Event::Done(r) => final_ = Some(r),
             Event::Keepalive | Event::Prompt { .. } => {}
@@ -668,5 +673,6 @@ pub async fn collect(mut events: EventStream) -> Result<CanonicalResponse, Error
     let mut resp = final_.unwrap_or_default();
     resp.text = if calls.is_empty() { text_ } else { text_.trim().to_string() };
     resp.tool_calls = calls;
+    resp.segments = crate::canonical::keep_segments(segments);
     Ok(resp)
 }

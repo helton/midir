@@ -47,6 +47,8 @@ pub struct ToolCallParser {
     scan: Scan,
     /// at the end of the stream: a block ends at its first `</tool_call>`, inside a string or not
     lenient: bool,
+    /// text went out since the last call (a paragraph break before the next call belongs to it)
+    text_since_call: bool,
 }
 
 /// The search for the `</tool_call>` that ends a block, kept between deltas so a long call is scanned once.
@@ -70,6 +72,7 @@ impl ToolCallParser {
             saw_call: false,
             scan: Scan::default(),
             lenient: false,
+            text_since_call: false,
         }
     }
 
@@ -83,6 +86,9 @@ impl ToolCallParser {
                     if !before.trim().is_empty() {
                         let t = if before.ends_with("\n\n") { before.to_string() } else { before.trim_end().to_string() };
                         out.push(Parsed::Text(t));
+                    } else if before.ends_with("\n\n") && self.text_since_call {
+                        // the paragraph break after text already sent (held back as trailing whitespace)
+                        out.push(Parsed::Text(before.to_string()));
                     }
                     self.buf = self.buf[i..].to_string();
                     self.in_call = true;
@@ -96,8 +102,12 @@ impl ToolCallParser {
                     return out; // whitespace alone waits for real text: it never becomes a text block of its own
                 }
                 if hold_from > 0 {
-                    out.push(Parsed::Text(self.buf[..hold_from].to_string()));
-                    self.buf = self.buf[hold_from..].to_string();
+                    // trailing whitespace waits: if a call follows, it is trimmed as when text and call come together
+                    let text = self.buf[..hold_from].trim_end();
+                    let sent = text.len();
+                    out.push(Parsed::Text(text.to_string()));
+                    self.text_since_call = true;
+                    self.buf = self.buf[sent..].to_string();
                 }
                 return out;
             }
@@ -106,7 +116,14 @@ impl ToolCallParser {
             self.buf = self.buf[end..].to_string();
             self.in_call = false;
             self.scan = Scan::default();
+            if is_prose(&block) {
+                // the tag quoted in the model's text ("use the `<tool_call>` tag"): text, not a broken call
+                out.push(Parsed::Text(block));
+                self.text_since_call = true;
+                continue;
+            }
             self.saw_call = true;
+            self.text_since_call = false;
             for call in self.parse_block(&block) {
                 out.push(Parsed::Call(call));
             }
@@ -167,7 +184,7 @@ impl ToolCallParser {
         }
         if self.in_call && !self.buf.trim().is_empty() {
             let block = format!("{}{CLOSE_TAG}", self.buf);
-            let calls = self.parse_block(&block); // CAVEAT: block without </tool_call>; parsed anyway
+            let calls = if is_prose(&block) { vec![] } else { self.parse_block(&block) }; // CAVEAT: block without </tool_call>; parsed anyway
             if calls.is_empty() {
                 out.push(Parsed::Text(self.buf.clone()));
             } else {
@@ -359,14 +376,28 @@ fn decode_prefix(s: &str) -> Option<(Value, usize)> {
 
 /// Last resort for one broken object: the "name" string and the "arguments" value decoded on their own.
 fn salvage(s: &str) -> Option<Value> {
-    let name = SALVAGE_NAME_RE.captures(s)?.get(1)?.as_str().to_string();
     let Some(args) = SALVAGE_ARGS_RE.find(s) else {
+        let name = SALVAGE_NAME_RE.captures(s)?.get(1)?.as_str().to_string();
         return Some(json!({"name": name, "arguments": {}}));
     };
-    match decode_prefix(&s[args.end()..]) {
-        Some((v @ Value::Object(_), _)) => Some(json!({"name": name, "arguments": v})),
-        _ => None,
-    }
+    let (v, used) = match decode_prefix(&s[args.end()..]) {
+        Some((v @ Value::Object(_), used)) => (v, used),
+        _ => return None,
+    };
+    // the call's name is the "name" outside its arguments (an argument may be called "name" too)
+    let span = args.start()..args.end() + used;
+    let name = SALVAGE_NAME_RE.captures_iter(s).filter_map(|c| c.get(1)).find(|m| !span.contains(&m.start()))?.as_str().to_string();
+    Some(json!({"name": name, "arguments": v}))
+}
+
+/// A block that does not look like a call attempt: no JSON object or array, no call keys. The model quoted the tag in
+/// its text; the block is text.
+fn is_prose(block: &str) -> bool {
+    let start = OPEN_RE.find(block).map_or(OPEN_TAG.len(), |m| m.end());
+    let end = block.len().saturating_sub(CLOSE_TAG.len()).max(start.min(block.len()));
+    let inner = strip_fences(block.get(start..end).unwrap_or("").trim());
+    let inner = inner.trim_start();
+    !inner.is_empty() && !inner.starts_with(['{', '[']) && !LOOKS_LIKE_CALL_RE.is_match(inner)
 }
 
 #[cfg(test)]
@@ -389,9 +420,11 @@ mod tests {
         events.extend(p.finish());
         let mut out: Vec<String> = vec![];
         let mut text_run = String::new();
+        // text is compared as sent, whitespace included (review 2026-10-05, F38): only a run of nothing but
+        // whitespace after a call may be dropped, whatever the chunking
         let flush = |run: &mut String, out: &mut Vec<String>| {
             if !run.trim().is_empty() {
-                out.push(format!("text:{}", run.trim()));
+                out.push(format!("text:{run}"));
             }
             run.clear();
         };
@@ -476,5 +509,64 @@ mod tests {
         p.finish();
         assert!(!p.errors.is_empty() && !p.errors.join(" ").contains("abc123"), "{:?}", p.errors);
         assert_eq!(p.rejected.len(), 1); // the repair follow-up still gets it
+    }
+
+    #[test]
+    fn a_tag_quoted_in_prose_is_text() {
+        // review 2026-10-05 (F34): the middle of the sentence was lost and a repair fired
+        let reply = "Use the `<tool_call>` tag and close it with `</tool_call>`. That is all.";
+        for step in [1, 3, reply.len()] {
+            let mut p = ToolCallParser::new(Arc::new([]));
+            let chars: Vec<char> = reply.chars().collect();
+            let mut events = vec![];
+            for piece in chars.chunks(step) {
+                events.extend(p.feed(&piece.iter().collect::<String>()));
+            }
+            events.extend(p.finish());
+            let text: String = events.iter().filter_map(|e| if let Parsed::Text(t) = e { Some(t.as_str()) } else { None }).collect();
+            assert!(text.contains("tag and close it with") && text.contains("That is all."), "step {step}: {text:?}");
+            assert!(p.rejected.is_empty() && events.iter().all(|e| matches!(e, Parsed::Text(_))), "step {step}");
+        }
+        // an unclosed quoted tag at the end of the reply is text too
+        let mut p = ToolCallParser::new(Arc::new([]));
+        let mut events = p.feed("Wrap calls in <tool_call> tags.");
+        events.extend(p.finish());
+        assert!(p.rejected.is_empty());
+        assert!(matches!(events.last(), Some(Parsed::Text(t)) if t.contains("tags.")), "{events:?}");
+    }
+
+    #[test]
+    fn text_before_a_call_is_the_same_whatever_the_chunking() {
+        // review 2026-10-05 (F38): "Reading now.\n" or "Reading now." depending on where the deltas were cut
+        for reply in [
+            "Reading now.\n<tool_call>{\"name\": \"read_file\", \"arguments\": {}}</tool_call>",
+            "Plan.\n\n<tool_call>{\"name\": \"read_file\", \"arguments\": {}}</tool_call>",
+            "Hello there.\n",
+        ] {
+            let texts: Vec<String> = [1, 5, 13, reply.len()]
+                .iter()
+                .map(|step| {
+                    let mut p = ToolCallParser::new(vec![ToolSpec::new("read_file", "", None, false)].into());
+                    let chars: Vec<char> = reply.chars().collect();
+                    let mut events = vec![];
+                    for piece in chars.chunks(*step) {
+                        events.extend(p.feed(&piece.iter().collect::<String>()));
+                    }
+                    events.extend(p.finish());
+                    events.iter().filter_map(|e| if let Parsed::Text(t) = e { Some(t.as_str()) } else { None }).collect()
+                })
+                .collect();
+            assert!(texts.windows(2).all(|w| w[0] == w[1]), "{reply:?}: {texts:?}");
+        }
+    }
+
+    #[test]
+    fn salvage_prefers_the_name_outside_the_arguments() {
+        // review 2026-10-05 (F39)
+        let v = salvage(r#"{"arguments": {"name": "John", "title": "x"}, "name": "create_issue", "labels": [broken"#).unwrap();
+        assert_eq!(v["name"], "create_issue");
+        assert_eq!(v["arguments"]["name"], "John");
+        let v = salvage(r#"{"name": "read_file", "arguments": {"path": "a.py"}, "extra": [broken"#).unwrap();
+        assert_eq!(v["name"], "read_file");
     }
 }

@@ -48,6 +48,7 @@ struct Request {
     audio: Option<Box<RawValue>>,
     modalities: Option<Box<RawValue>>,
     verbosity: Option<Box<RawValue>>,
+    web_search_options: Option<Box<RawValue>>,
 }
 
 impl Request {
@@ -67,6 +68,7 @@ impl Request {
             ("audio", self.audio.as_deref()),
             ("modalities", self.modalities.as_deref()),
             ("verbosity", self.verbosity.as_deref()),
+            ("web_search_options", self.web_search_options.as_deref()),
         ])
     }
 }

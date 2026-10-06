@@ -382,6 +382,25 @@ pub struct CanonicalResponse {
     pub message_id: Option<String>,
     /// raw <tool_call> content dropped as invalid JSON
     pub rejected_calls: Vec<String>,
+    /// the reply's text as separate messages, each with how many tool calls came before it; only when text follows a
+    /// call (otherwise `text` is the one message). Responses numbers its message items by these.
+    pub segments: Vec<(usize, String)>,
+}
+
+/// Add streamed text to the reply's segments: a new segment when tool calls came since the last one.
+pub fn add_segment(segments: &mut Vec<(usize, String)>, calls_before: usize, text: &str) {
+    match segments.last_mut() {
+        Some((before, s)) if *before == calls_before => s.push_str(text),
+        _ => segments.push((calls_before, text.to_string())),
+    }
+}
+
+/// The segments worth keeping: only when some text follows a call; each trimmed.
+pub fn keep_segments(segments: Vec<(usize, String)>) -> Vec<(usize, String)> {
+    if segments.iter().all(|(before, _)| *before == 0) {
+        return vec![];
+    }
+    segments.into_iter().map(|(before, s)| (before, s.trim().to_string())).collect()
 }
 
 impl Default for CanonicalResponse {
@@ -394,6 +413,7 @@ impl Default for CanonicalResponse {
             usage: Usage::default(),
             message_id: None,
             rejected_calls: vec![],
+            segments: vec![],
         }
     }
 }
