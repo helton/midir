@@ -28,6 +28,7 @@ aliases = ["claude-opus-4-5"]             # extra exact names some clients send
 # match = "^(openai/)?gpt-5"              # optional regex
 # tail_reminder = true                    # per-model knobs override [server]
 # followups = false                       # e.g. no hidden follow-ups for this model
+# tool_schema = "compact"                 # this model gets the compact tool listing
 ```
 
 Each model points to a backend and a target (for StackSpot, an agent), so several LLMs are served side by side and the
@@ -42,6 +43,16 @@ request's `model` picks one. Backend-specific setup: [backends/stackspot.md](bac
 5. `default_model`.
 
 `GET /v1/models` lists the models; `GET /health` shows the mapping, the loaded file and each backend's queue.
+
+## Tool listing
+
+Clients send their tools as JSON Schemas, and the prompt lists them for the model. `tool_schema = "json"` (the
+default) lists each tool as one line of JSON with its schema. `tool_schema = "compact"` writes each tool as a
+`### name` heading, its description and one line per parameter (`- path (string, required): description`, nested
+fields indented); what that form cannot say (`$ref`, `allOf`, ...) stays JSON Schema. The descriptions are the same in
+both forms, so the gain is the schema syntax: about 10% fewer tokens in the tool listing of Copilot's 75 tools (5-8%
+of the whole prompt). Set it in `[server]`, per model, or with `MIDIR_TOOL_SCHEMA`. `tool_desc_max` cuts
+descriptions in both forms.
 
 ## Environment variables
 

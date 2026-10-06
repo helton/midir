@@ -74,3 +74,60 @@ fn captured_requests_replay_cleanly() {
     }
     assert!(failures.is_empty(), "{} of {} captures failed:\n{}", failures.len(), paths.len(), failures.join("\n"));
 }
+
+/// The tools block of a prompt: from the listing's header to the end of the system part.
+fn tools_block(prompt: &str) -> usize {
+    let start = prompt.find("Available tools").unwrap_or(prompt.len());
+    let end = prompt[start..].find("</system>").map_or(prompt.len(), |e| start + e);
+    end - start
+}
+
+#[test]
+#[ignore = "needs the local captures: MIDIR_CAPTURES=<dir> cargo test --profile ci --test replay -- --ignored"]
+fn the_compact_tool_listing_is_shorter() {
+    // review 2026-10-05 (N01): the raw JSON Schemas of Copilot's 75 tools were ~113k characters on every turn
+    let dir = std::env::var("MIDIR_CAPTURES").expect("MIDIR_CAPTURES=<folder with the captures>");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
+    let mut paths: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    paths.sort();
+    let json_rig = Rig::new();
+    let compact_rig = Rig::with(MIDIR_TOML, &[("MIDIR_TOOL_SCHEMA", "compact")]);
+    let (mut json_total, mut compact_total, mut largest) = (0, 0, (0, 0, String::new()));
+    for path in paths.iter().filter(|p| p.extension().is_some_and(|x| x == "json")) {
+        let cap: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let mut body = cap["body"].clone();
+        if body["tools"].as_array().is_none_or(|t| t.is_empty()) || body["tool_choice"] == "none" {
+            continue;
+        }
+        let endpoint = match s(&cap["protocol"]) {
+            "chat" => "/v1/chat/completions",
+            "responses" => "/v1/responses",
+            _ => "/v1/messages",
+        };
+        body.as_object_mut().unwrap().remove("previous_response_id");
+        body["stream"] = json!(false);
+        let mut sizes = vec![];
+        for rig in [&json_rig, &compact_rig] {
+            rig.upstream.add("plain answer");
+            let before = rig.upstream.calls().len();
+            assert_eq!(rig.http.post(endpoint, &body).status, 200, "{}", path.display());
+            sizes.push(tools_block(&rig.upstream.prompt(before)));
+        }
+        json_total += sizes[0];
+        compact_total += sizes[1];
+        if sizes[0] > largest.0 {
+            largest = (sizes[0], sizes[1], path.file_name().unwrap().to_string_lossy().into_owned());
+        }
+    }
+    let saved = |a: usize, b: usize| 100.0 * (a as f64 - b as f64) / a as f64;
+    println!(
+        "tool listings: json {json_total} chars, compact {compact_total} ({:.1}% fewer); largest {}: {} -> {} ({:.1}% fewer)",
+        saved(json_total, compact_total),
+        largest.2,
+        largest.0,
+        largest.1,
+        saved(largest.0, largest.1)
+    );
+    assert!(compact_total < json_total);
+    assert!(saved(largest.0, largest.1) >= 12.0, "the largest tool set should shrink by an eighth at least");
+}

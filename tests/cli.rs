@@ -144,6 +144,7 @@ fn invalid_configuration_is_a_clear_error() {
         (toml_with_server("max_prompt_chars = 0"), "max_prompt_chars must be at least 1"),
         (toml_with_server("keepalive_s = -1"), "keepalive_s must be 0 or more"),
         (MIDIR_TOML.replace("max_concurrent = 4", "max_concurrent = 0"), "max_concurrent must be at least 1"),
+        (toml_with_server("tool_schema = \"yaml\""), "\"yaml\" is not json or compact"),
     ];
     for (toml, message) in cases {
         let o = run(&["--port", "1"], Some(&toml), &[]);

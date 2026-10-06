@@ -753,3 +753,27 @@ fn an_oversized_recent_call_argument_fits_the_cap() {
     chat(&rig, json!({"tools": chat_tools(), "messages": msgs}));
     assert!(rig.upstream.prompt(0).chars().count() <= 50_000);
 }
+
+// ---------------------------------------------------------------- tool listing
+
+#[test]
+fn the_compact_tool_listing_is_a_setting_per_model() {
+    // review 2026-10-05 (N01): a line per parameter instead of the raw JSON Schema; json stays the default
+    let toml = MIDIR_TOML.replace("aliases = [\"claude-haiku-4-5\"]", "aliases = [\"claude-haiku-4-5\"]\ntool_schema = \"compact\"");
+    let rig = Rig::with(&toml, &[]);
+    let tools = json!([read_tool()]);
+    for model in ["gpt-5.1", "gpt-4.1"] {
+        rig.upstream.add("ok");
+        let r = rig.http.post("/v1/chat/completions", &json!({"model": model, "messages": task(), "tools": tools}));
+        assert_eq!(r.status, 200, "{}", r.text);
+    }
+    let (json_prompt, compact_prompt) = (rig.upstream.prompt(0), rig.upstream.prompt(1));
+    assert!(json_prompt.contains("one JSON object per line") && json_prompt.contains(r#"{"name":"read_file""#), "{json_prompt}");
+    assert!(compact_prompt.contains("### read_file\n") && compact_prompt.contains("- path (string, required)"), "{compact_prompt}");
+    assert!(!compact_prompt.contains(r#""properties""#), "{compact_prompt}");
+
+    let rig = Rig::with(MIDIR_TOML, &[("MIDIR_TOOL_SCHEMA", "compact")]);
+    rig.upstream.add("ok");
+    rig.http.post("/v1/chat/completions", &json!({"model": "gpt-5.1", "messages": task(), "tools": tools}));
+    assert!(rig.upstream.prompt(0).contains("### read_file\n"));
+}

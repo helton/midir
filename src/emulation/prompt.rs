@@ -8,6 +8,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::canonical::{CanonicalRequest, ToolChoice, ToolSpec, Turn};
+use crate::config::ToolSchema;
+use crate::emulation::schema::compact_tool;
 use crate::json;
 use crate::text::{byte_offset_from_end, char_len, ellipsize, prefix};
 
@@ -30,6 +32,11 @@ Before you end a reply without a <tool_call>, check its last paragraph: if it is
 Your capabilities are exactly the tools listed below. If a listed tool fetches web pages, searches, reads files or runs commands, then you DO have that access: never say you cannot access the internet, files or a terminal when a matching tool exists. When the user asks for current, external or verifiable information (a URL, a latest version, today's data), call the matching tool instead of answering from memory or declining. If the user names a page, site or repository without giving its URL, infer the most likely URL (e.g. the project's official site or GitHub repository) and fetch it.
 Available tools (one JSON object per line: name, description, parameters as JSON Schema):
 "#;
+const JSON_TOOLS_HEADER: &str = "Available tools (one JSON object per line: name, description, parameters as JSON Schema):\n";
+const COMPACT_TOOLS_HEADER: &str = "Available tools: each starts with a `### <tool name>` line, then its description (indented) and its parameters, one per line as `- name (type, required, limits): description`; the fields of an object, or of an array's objects, are indented under it. \"arguments\" is a JSON object whose keys are these parameter names.\n";
+/// The tool protocol for the compact listing: the same rules, another header for the list.
+static COMPACT_TOOL_PROTOCOL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| TOOL_PROTOCOL.replace(JSON_TOOLS_HEADER, COMPACT_TOOLS_HEADER));
 const TOOL_CHOICE_REQUIRED: &str = "\nIn this response you MUST call at least one tool; a plain-text answer is not acceptable.";
 const ONE_CALL: &str = "\nIn this response call at most one tool: write a single <tool_call> block.";
 pub const ASSISTANT_PREFILL_NUDGE: &str = "(continue your previous message exactly from where it stopped, without repeating it)";
@@ -369,16 +376,28 @@ fn shrink(turns: &mut [Cow<'_, Turn>], excess: usize) -> usize {
 /// reminder. Above `max_chars` the oldest history turns are dropped (never the system parts, the last turn or the last
 /// KEEP_RECENT_TURNS history turns); if that is not enough, the largest tool results and then user messages of what
 /// is left are cut in the middle.
-pub fn render_prompt(req: &CanonicalRequest, max_chars: i64, tail_reminder: bool, tool_desc_max: i64) -> (String, PromptInfo) {
+pub fn render_prompt(
+    req: &CanonicalRequest,
+    max_chars: i64,
+    tail_reminder: bool,
+    tool_desc_max: i64,
+    tool_schema: ToolSchema,
+) -> (String, PromptInfo) {
     let mut system_parts: Vec<String> = req.system.iter().filter(|s| !s.trim().is_empty()).cloned().collect();
     let tools_on = req.tools_on();
     if tools_on {
-        let mut block = TOOL_PROTOCOL.to_string();
+        let mut block = match tool_schema {
+            ToolSchema::Json => TOOL_PROTOCOL.to_string(),
+            ToolSchema::Compact => COMPACT_TOOL_PROTOCOL.clone(),
+        };
         for (i, t) in req.tools.iter().enumerate() {
             if i > 0 {
                 block.push('\n');
             }
-            block.push_str(&tool_line(t, tool_desc_max));
+            match tool_schema {
+                ToolSchema::Json => block.push_str(&tool_line(t, tool_desc_max)),
+                ToolSchema::Compact => block.push_str(&compact_tool(t, tool_desc_max)),
+            }
         }
         match &req.tool_choice {
             ToolChoice::Required => block.push_str(TOOL_CHOICE_REQUIRED),
@@ -512,7 +531,7 @@ mod tests {
     fn linear_truncation_matches_the_reference() {
         for (turns, size, max) in [(3, 10, 50), (30, 100, 1000), (31, 100, 1500), (250, 40, 2000), (40, 50, 1_000_000), (12, 5, 0)] {
             let req = conversation(turns, size);
-            let (prompt, info) = render_prompt(&req, max as i64, false, 0);
+            let (prompt, info) = render_prompt(&req, max as i64, false, 0, ToolSchema::Json);
             assert_eq!(prompt, reference(&req, max), "{turns} turns of {size}, cap {max}");
             assert_eq!(info.chars, char_len(&prompt));
         }
@@ -521,7 +540,7 @@ mod tests {
     #[test]
     fn truncation_keeps_the_system_part_and_recent_turns_and_says_so() {
         let req = conversation(30, 100);
-        let (p, info) = render_prompt(&req, 1500, false, 0);
+        let (p, info) = render_prompt(&req, 1500, false, 0, ToolSchema::Json);
         assert!(info.dropped_turns > 0 && p.starts_with("<system>\nS\n</system>"));
         assert!(p.contains(&format!("[{} earlier turns were omitted", info.dropped_turns)));
         assert!(p.contains("t29 ") && p.ends_with("[user]: final question"));
@@ -533,11 +552,11 @@ mod tests {
         req.add_text("user", "read the log");
         let content = format!("HEAD{}TAIL", "x".repeat(200_000));
         req.add("user", "", vec![], vec![ToolResult { call_id: "c1".into(), content, name: "read".into(), is_error: false }]);
-        let (p, info) = render_prompt(&req, 50_000, false, 0);
+        let (p, info) = render_prompt(&req, 50_000, false, 0, ToolSchema::Json);
         assert!(info.chars <= 50_000 && info.shrunk == 1, "{} chars", info.chars);
         assert!(p.starts_with("<system>\nS\n</system>") && p.contains("HEAD") && p.contains("TAIL\n</tool_result>"));
         assert!(p.contains("characters omitted by the gateway"));
-        let (small, info) = render_prompt(&req, 1_000_000, false, 0);
+        let (small, info) = render_prompt(&req, 1_000_000, false, 0, ToolSchema::Json);
         assert!(info.shrunk == 0 && small.contains(&"x".repeat(200_000)));
     }
 
@@ -555,9 +574,9 @@ mod tests {
         let tools: std::sync::Arc<[ToolSpec]> = vec![ToolSpec::new("f", "", None, false)].into();
         let mut req = CanonicalRequest { tools, parallel_tool_calls: false, ..Default::default() };
         req.add_text("user", "x");
-        assert!(render_prompt(&req, 1_000_000, false, 0).0.contains("at most one tool"));
+        assert!(render_prompt(&req, 1_000_000, false, 0, ToolSchema::Json).0.contains("at most one tool"));
         req.parallel_tool_calls = true;
-        assert!(!render_prompt(&req, 1_000_000, false, 0).0.contains("at most one tool"));
+        assert!(!render_prompt(&req, 1_000_000, false, 0, ToolSchema::Json).0.contains("at most one tool"));
     }
 
     #[test]
@@ -588,7 +607,7 @@ mod tests {
             vec![crate::canonical::ToolResult { call_id: "c1".into(), content: "ok".into(), name: String::new(), is_error: false }],
         );
         req.add_text("user", "next");
-        let (p, info) = render_prompt(&req, 50_000, false, 0);
+        let (p, info) = render_prompt(&req, 50_000, false, 0, ToolSchema::Json);
         assert!(char_len(&p) <= 50_000, "{} chars", char_len(&p));
         assert!(info.shrunk >= 1 && p.contains("characters omitted by the gateway") && p.contains("big.md"));
     }

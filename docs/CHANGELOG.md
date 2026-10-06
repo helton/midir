@@ -76,6 +76,11 @@ Fixes from the 2026-10-05 review (`.internal`, findings F-numbered):
   `OTEL_SERVICE_NAME` is set; an `OTEL_EXPORTER_OTLP_PROTOCOL` other than `http/protobuf` is logged as unsupported;
   new histograms `gen_ai.server.request.duration` and `gen_ai.server.time_to_first_token` (seconds, few labels) sit
   next to the `midir.*` ones the dashboard reads.
+- **Compact tool listing** (`tool_schema = "compact"`, per model or `MIDIR_TOOL_SCHEMA`; default `json`): each tool
+  as a `### name` heading, its description and one line per parameter (`- path (string, required): ...`) instead of
+  its JSON Schema; what that form cannot say stays JSON Schema. Descriptions are kept whole, so the gain is the schema
+  syntax: Copilot's 75 tools take 11.5% fewer tokens (about 2,700 per turn, 8% of the prompt), Claude Code's 10%.
+  `count_tokens` estimates with the requested model's settings.
 - **Tests**: black-box tests for the queue timeout and the rate window, 405 and trailing slashes, `/metrics` behind
   the API key, escaped metric labels and the `/ready` failure body; the shutdown test waits for its request instead
   of sleeping. The docs and `--help` match the code again (the OTEL variables, metric names, `retry_backoff_s`).

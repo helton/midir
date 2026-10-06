@@ -47,6 +47,7 @@ pub struct ModelSpec {
     pub max_prompt_chars: Option<i64>,
     pub tail_reminder: Option<bool>,
     pub tool_desc_max: Option<i64>,
+    pub tool_schema: Option<ToolSchema>,
     pub followups: Option<bool>,
 }
 
@@ -63,7 +64,29 @@ impl ModelSpec {
             max_prompt_chars: None,
             tail_reminder: None,
             tool_desc_max: None,
+            tool_schema: None,
             followups: None,
+        }
+    }
+}
+
+/// How tools are listed in the prompt: raw JSON Schema, one line per tool, or the compact form (a heading per tool and
+/// a line per parameter), which is shorter for large tool sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolSchema {
+    #[default]
+    Json,
+    Compact,
+}
+
+impl FromStr for ToolSchema {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "json" => Ok(ToolSchema::Json),
+            "compact" => Ok(ToolSchema::Compact),
+            other => Err(format!("{other:?} is not json or compact")),
         }
     }
 }
@@ -74,6 +97,7 @@ pub struct Knobs {
     pub max_prompt_chars: i64,
     pub tail_reminder: bool,
     pub tool_desc_max: i64,
+    pub tool_schema: ToolSchema,
     pub followups: bool,
 }
 
@@ -83,6 +107,7 @@ pub struct ServerSettings {
     pub max_prompt_chars: i64,
     pub tail_reminder: bool,
     pub tool_desc_max: i64,
+    pub tool_schema: ToolSchema,
     /// the automatic follow-ups for replies that announce without acting, deny a tool's ability or forget an
     /// ordered commit (`MIDIR_FOLLOWUPS`; a model can override it)
     pub followups: bool,
@@ -158,6 +183,15 @@ where
     text.parse().map(Some).map_err(|e| de::Error::custom(format!("{text:?} is not a valid number here ({e})")))
 }
 
+/// A word from a fixed set (`tool_schema = "compact"`).
+fn word<'de, D: Deserializer<'de>, T: FromStr<Err = String>>(d: D) -> Result<Option<T>, D::Error> {
+    match Option::<String>::deserialize(d)? {
+        None => Ok(None),
+        Some(s) if s.trim().is_empty() => Ok(None),
+        Some(s) => s.parse().map(Some).map_err(de::Error::custom),
+    }
+}
+
 /// A boolean, or a string holding one (true/false, 1/0, yes/no, on/off).
 fn flag<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
     match Option::<Value>::deserialize(d)? {
@@ -198,6 +232,8 @@ struct ServerFile {
     tail_reminder: Option<bool>,
     #[serde(deserialize_with = "num")]
     tool_desc_max: Option<i64>,
+    #[serde(deserialize_with = "word")]
+    tool_schema: Option<ToolSchema>,
     #[serde(deserialize_with = "flag")]
     followups: Option<bool>,
     responses_dir: Option<String>,
@@ -293,6 +329,8 @@ struct ModelFile {
     tail_reminder: Option<bool>,
     #[serde(deserialize_with = "num")]
     tool_desc_max: Option<i64>,
+    #[serde(deserialize_with = "word")]
+    tool_schema: Option<ToolSchema>,
     #[serde(deserialize_with = "flag")]
     followups: Option<bool>,
 }
@@ -406,6 +444,7 @@ impl Config {
                 max_prompt_chars: m.max_prompt_chars,
                 tail_reminder: m.tail_reminder,
                 tool_desc_max: m.tool_desc_max,
+                tool_schema: m.tool_schema,
                 followups: m.followups,
             }));
         }
@@ -499,6 +538,7 @@ impl Config {
             max_prompt_chars: s.max_prompt_chars,
             tail_reminder: s.tail_reminder,
             tool_desc_max: s.tool_desc_max,
+            tool_schema: s.tool_schema,
             followups: s.followups,
         };
         let Some(spec) = spec else { return server };
@@ -506,6 +546,7 @@ impl Config {
             max_prompt_chars: spec.max_prompt_chars.filter(|n| *n > 0).unwrap_or(s.max_prompt_chars),
             tail_reminder: spec.tail_reminder.unwrap_or(s.tail_reminder),
             tool_desc_max: spec.tool_desc_max.unwrap_or(s.tool_desc_max),
+            tool_schema: spec.tool_schema.unwrap_or(s.tool_schema),
             followups: spec.followups.unwrap_or(s.followups),
         }
     }
@@ -550,6 +591,7 @@ fn server_settings(f: &ServerFile, env: &EnvLookup, root: &Path) -> R<ServerSett
         max_prompt_chars: env.parse("MIDIR_MAX_PROMPT_CHARS")?.or(f.max_prompt_chars).unwrap_or(1_000_000),
         tail_reminder: env.flag("MIDIR_TAIL_REMINDER")?.or(f.tail_reminder).unwrap_or(true),
         tool_desc_max: env.parse("MIDIR_TOOL_DESC_MAX")?.or(f.tool_desc_max).unwrap_or(0),
+        tool_schema: env.parse("MIDIR_TOOL_SCHEMA")?.or(f.tool_schema).unwrap_or_default(),
         followups: env.flag("MIDIR_FOLLOWUPS")?.or(f.followups).unwrap_or(true),
         responses_dir,
         responses_retention_days: env.parse("MIDIR_RESPONSES_RETENTION_DAYS")?.or(f.responses_retention_days).unwrap_or(30.0),
@@ -735,7 +777,13 @@ mod tests {
         let file = dir.path().join("midir.toml");
         let toml = "[server]\nmax_prompt_chars = 5000\ntool_desc_max = 80\n[backends.stackspot]\n[[models]]\nname = \"a\"\ntarget = \"A\"\nmax_prompt_chars = 100\ntail_reminder = false\nfollowups = false\n[[models]]\nname = \"b\"\ntarget = \"B\"\nmax_prompt_chars = 0\n";
         std::fs::write(&file, toml).unwrap();
-        let knobs = |max_prompt_chars, tail_reminder, followups| Knobs { max_prompt_chars, tail_reminder, tool_desc_max: 80, followups };
+        let knobs = |max_prompt_chars, tail_reminder, followups| Knobs {
+            max_prompt_chars,
+            tail_reminder,
+            tool_desc_max: 80,
+            tool_schema: ToolSchema::Json,
+            followups,
+        };
         let cfg = Config::load_file(IndexMap::new(), file.clone(), dir.path().into()).unwrap();
         assert_eq!(cfg.knobs(Some(&cfg.resolve("a"))), knobs(100, false, false));
         assert_eq!(cfg.knobs(Some(&cfg.resolve("b"))), knobs(5000, true, true)); // 0 means the server's cap

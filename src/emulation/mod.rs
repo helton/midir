@@ -7,3 +7,4 @@ pub mod jsonmode;
 pub mod output;
 pub mod parser;
 pub mod prompt;
+pub mod schema;

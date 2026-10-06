@@ -517,8 +517,10 @@ impl App {
     }
 
     fn count_tokens(&self, raw: &[u8]) -> Result<Response, Error> {
-        let (req, _) = messages::to_canonical(&Self::body(raw))?;
-        let (prompt, _) = render_prompt(&req, i64::MAX, true, 0);
+        let (req, info) = messages::to_canonical(&Self::body(raw))?;
+        // the prompt as this model gets it (its tool listing and description cap), uncut
+        let knobs = self.gateway.config.knobs(self.gateway.config.find(&info.model).as_deref());
+        let (prompt, _) = render_prompt(&req, i64::MAX, knobs.tail_reminder, knobs.tool_desc_max, knobs.tool_schema);
         Ok(json_response(200, &json!({"input_tokens": estimate_tokens(&prompt)})))
     }
 }

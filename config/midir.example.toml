@@ -9,6 +9,8 @@ port = 18880
 max_prompt_chars = 1000000   # above this, oldest turns are dropped, then the largest tool results cut (StackSpot: 272k tokens max)
 tail_reminder = true         # one-line tool-protocol reminder after the last turn (fewer "announce and stop" replies)
 tool_desc_max = 0            # truncate tool descriptions to N chars (0 = off): ~12% fewer input tokens, alters what clients send
+tool_schema = "json"         # how tools are listed: "json" (their JSON Schemas) or "compact" (a line per parameter; same
+                             # descriptions, ~10% fewer tokens in a large tool listing such as Copilot's)
 followups = true             # hidden follow-ups for replies that announce an action without its call, deny an ability a
                              # tool provides, or forget an ordered commit (false = the reply is returned as the model wrote it)
 keepalive_s = 15             # an idle stream gets an SSE keepalive this often (0 = off)
@@ -64,6 +66,7 @@ aliases = ["claude-opus-4-1", "claude-opus-4-5"]   # Claude model names some cli
 # max_prompt_chars = 1000000
 # tail_reminder = true
 # tool_desc_max = 0
+# tool_schema = "json"
 # followups = true
 
 [[models]]

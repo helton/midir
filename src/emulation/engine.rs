@@ -492,7 +492,7 @@ impl EmulationEngine {
             let mut opened = None;
             let mut prompt = String::new();
             for attempt in 1..=2 {
-                let (p, info) = render_prompt(&req, max_chars, knobs.tail_reminder, knobs.tool_desc_max);
+                let (p, info) = render_prompt(&req, max_chars, knobs.tail_reminder, knobs.tool_desc_max, knobs.tool_schema);
                 prompt = p;
                 let mut cut = String::new();
                 if info.dropped_turns > 0 {
