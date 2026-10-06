@@ -23,6 +23,17 @@ pub struct Gateway {
 
 impl Gateway {
     pub fn new(config: Arc<Config>, telemetry: Arc<Telemetry>) -> Result<Self, ConfigError> {
+        let dir = config.server.responses_dir.clone();
+        Self::build(config, telemetry, dir)
+    }
+
+    /// For `midir check`: everything but the responses store, which stays in memory (opening the directory purges it,
+    /// and a server may be using it).
+    pub fn without_store(config: Arc<Config>, telemetry: Arc<Telemetry>) -> Result<Self, ConfigError> {
+        Self::build(config, telemetry, None)
+    }
+
+    fn build(config: Arc<Config>, telemetry: Arc<Telemetry>, responses_dir: Option<std::path::PathBuf>) -> Result<Self, ConfigError> {
         let mut backends = IndexMap::new();
         for (name, s) in &config.backends {
             backends.insert(name.clone(), create_backend(s, &config.env, telemetry.clone(), config.server.retry_backoff_s)?);
@@ -32,8 +43,7 @@ impl Gateway {
             .map(|(n, b)| (n.clone(), Arc::new(EmulationEngine::new(b.clone(), telemetry.clone(), config.clone()))))
             .collect();
         let s = &config.server;
-        let store =
-            Arc::new(ResponseStore::new(s.responses_dir.clone(), s.responses_retention_days, s.responses_max_mb, s.responses_memory_mb));
+        let store = Arc::new(ResponseStore::new(responses_dir, s.responses_retention_days, s.responses_max_mb, s.responses_memory_mb));
         Ok(Gateway { config, telemetry, backends, runners, store })
     }
 

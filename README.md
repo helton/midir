@@ -100,7 +100,7 @@ cp config/midir.example.toml config/midir.toml      # backends and models
 mkdir -p docker/data/gateway
 printf 'UID=%s\nGID=%s\n' "$(id -u)" "$(id -g)" > docker/.env   # the container runs as you
 docker compose -f docker/compose.yml up -d          # pulls ghcr.io/helton/midir
-curl -s http://127.0.0.1:18880/ready                # {"ok": true, ...} once the credentials work
+docker exec midir midir check                       # every setting and its source; credentials, TLS and proxy
 ```
 
 Point your client at `http://127.0.0.1:18880/v1` (Anthropic clients: `http://127.0.0.1:18880`). Any API key works,

@@ -43,6 +43,8 @@ request's `model` picks one. Backend-specific setup: [backends/stackspot.md](bac
 5. `default_model`.
 
 `GET /v1/models` lists the models; `GET /health` shows the mapping, the loaded file and each backend's queue.
+`midir check` shows the same without serving, with every setting and where its value came from (see
+[operations.md](operations.md#troubleshooting)).
 
 ## Tool listing
 

@@ -9,7 +9,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use clap::Parser;
-use midir::{app, buildinfo, config, gateway, log, telemetry};
+use midir::{app, buildinfo, check, config, gateway, log, telemetry};
 use tower::Layer;
 use tower_http::normalize_path::NormalizePathLayer;
 
@@ -84,6 +84,22 @@ struct Args {
     /// GET http://127.0.0.1:<port>/health and exit 0 (healthy) or 1, for images without a shell
     #[arg(long)]
     healthcheck: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Check the configuration without serving: each setting and where its value comes from, the models, unknown
+    /// settings, credentials, and the backend's token (TLS, proxy). Exits 1 when a check fails.
+    Check {
+        /// Do not contact the backends
+        #[arg(long)]
+        no_network: bool,
+        /// Also send each model's agent one short prompt (one request per model, from the account's quota)
+        #[arg(long)]
+        agents: bool,
+    },
 }
 
 /// The startup banner: the name, a vertical rule, and the version (with the kind of build when it is not a release).
@@ -113,13 +129,31 @@ fn print_banner() {
 }
 
 /// Variables from `.env` in the working directory; the environment wins over the file.
-fn load_dotenv(dir: &Path) {
+/// Loads `.env` from `dir`; its path when there was one.
+fn load_dotenv(dir: &Path) -> Option<PathBuf> {
     let path = dir.join(".env");
-    if path.is_file()
-        && let Err(e) = dotenvy::from_path(&path)
-    {
+    if !path.is_file() {
+        return None;
+    }
+    if let Err(e) = dotenvy::from_path(&path) {
         eprintln!("warning: {}: {e}", path.display());
     }
+    Some(path)
+}
+
+/// `midir check`: the report on stdout; exit 1 when a check failed.
+fn check(cwd: &Path, opts: check::Options) -> ExitCode {
+    let dotenv = load_dotenv(cwd);
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("cannot start the async runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (report, ok) = runtime.block_on(check::run(config::environment(), cwd, dotenv.as_deref(), &opts));
+    print!("{report}");
+    if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 /// `--healthcheck`: GET /health on the configured port (for images without a shell or curl).
@@ -216,6 +250,9 @@ fn main() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     if args.healthcheck {
         return healthcheck(&args, &cwd);
+    }
+    if let Some(Command::Check { no_network, agents }) = args.command {
+        return check(&cwd, check::Options { no_network, agents });
     }
     load_dotenv(&cwd); // before the banner and the log, which read MIDIR_NO_BANNER, MIDIR_LOG and MIDIR_LOG_FORMAT
     print_banner();

@@ -234,6 +234,29 @@ impl ResponseStore {
         store
     }
 
+    /// Whether a store could live in `dir`, without opening it (no purge, nothing created): None when it can, else why.
+    pub fn probe(dir: &Path) -> Option<String> {
+        let mut at = dir;
+        // the nearest existing folder decides: the store creates the missing ones
+        while !at.exists() {
+            match at.parent() {
+                Some(p) if !p.as_os_str().is_empty() => at = p,
+                _ => return None,
+            }
+        }
+        if !at.is_dir() {
+            return Some(format!("{} is not a folder", at.display()));
+        }
+        let probe = at.join(format!(".midir-check-{}", std::process::id()));
+        match fs::write(&probe, b"") {
+            Ok(()) => {
+                let _ = fs::remove_file(&probe);
+                None
+            }
+            Err(e) => Some(format!("cannot write in {} ({e})", at.display())),
+        }
+    }
+
     fn mem(&self) -> std::sync::MutexGuard<'_, Cache> {
         self.memory.lock().unwrap_or_else(|e| e.into_inner())
     }

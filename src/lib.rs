@@ -8,6 +8,7 @@ pub mod app;
 pub mod backends;
 pub mod buildinfo;
 pub mod canonical;
+pub mod check;
 pub mod config;
 pub mod emulation;
 pub mod errors;

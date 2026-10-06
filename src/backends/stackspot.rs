@@ -47,6 +47,7 @@ pub struct StackSpotBackend {
     client_secret: String,
     idm_base: String,
     agent_base: String,
+    ca_bundle: Option<String>,
     http: reqwest::Client,
     http_error: Option<String>,
     token: tokio::sync::Mutex<Token>,
@@ -139,6 +140,7 @@ impl StackSpotBackend {
             client_secret: s("client_secret", "STACKSPOT_CLIENT_SECRET", "").trim().to_string(),
             idm_base: s("idm_base_url", "STACKSPOT_IDM_BASE_URL", DEFAULT_IDM_BASE).trim_end_matches('/').to_string(),
             agent_base: s("agent_base_url", "STACKSPOT_AGENT_BASE_URL", DEFAULT_AGENT_BASE).trim_end_matches('/').to_string(),
+            ca_bundle,
             http,
             http_error,
             token: tokio::sync::Mutex::new(Token { value: String::new(), expires_at: 0.0, failed: None }),
@@ -354,6 +356,27 @@ impl TextBackend for StackSpotBackend {
 
     fn stream<'a>(&'a self, prompt: &'a str, target: &'a str, meta: Option<SharedMeta>) -> BoxFuture<'a, Result<ItemStream, Error>> {
         Box::pin(self.open(prompt, target, meta))
+    }
+
+    fn options(&self) -> Vec<(&'static str, &'static str, String)> {
+        let secret = if self.client_secret.is_empty() {
+            "missing".to_string()
+        } else {
+            format!("set ({} chars)", self.client_secret.chars().count())
+        };
+        let or_missing = |v: &str| if v.is_empty() { "missing".to_string() } else { v.to_string() };
+        vec![
+            ("realm", "STACKSPOT_REALM", or_missing(&self.realm)),
+            (
+                "client_id",
+                "STACKSPOT_CLIENT_ID",
+                if self.client_id.is_empty() { "missing".into() } else { self.describe_target(&self.client_id) },
+            ),
+            ("client_secret", "STACKSPOT_CLIENT_SECRET", secret),
+            ("idm_base_url", "STACKSPOT_IDM_BASE_URL", self.idm_base.clone()),
+            ("agent_base_url", "STACKSPOT_AGENT_BASE_URL", self.agent_base.clone()),
+            ("ca_bundle", "STACKSPOT_CA_BUNDLE", self.ca_bundle.clone().unwrap_or_else(|| "-".into())),
+        ]
     }
 
     fn input_limit_exceeded(&self, error: &BackendError) -> Option<(i64, i64)> {

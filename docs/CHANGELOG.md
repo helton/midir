@@ -81,6 +81,11 @@ Fixes from the 2026-10-05 review (`.internal`, findings F-numbered):
   its JSON Schema; what that form cannot say stays JSON Schema. Descriptions are kept whole, so the gain is the schema
   syntax: Copilot's 75 tools take 11.5% fewer tokens (about 2,700 per turn, 8% of the prompt), Claude Code's 10%.
   `count_tokens` estimates with the requested model's settings.
+- **`midir check`**: the configuration as Midir reads it, each setting with where its value came from (environment,
+  file or default), the models and their agents, unknown settings, missing credentials, and a token fetch that
+  checks the credentials, TLS and proxy; `--agents` also sends each model one short prompt (finds an agent id that is
+  wrong or not shared), `--no-network` contacts nothing. It serves nothing and does not open the responses store, so
+  it runs next to a live server (`docker exec midir midir check`); exit 1 when a check fails.
 - **Tests**: black-box tests for the queue timeout and the rate window, 405 and trailing slashes, `/metrics` behind
   the API key, escaped metric labels and the `/ready` failure body; the shutdown test waits for its request instead
   of sleeping. The docs and `--help` match the code again (the OTEL variables, metric names, `retry_backoff_s`).

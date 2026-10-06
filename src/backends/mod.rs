@@ -48,6 +48,9 @@ pub trait TextBackend: Send + Sync {
     fn ready(&self) -> BoxFuture<'_, Result<(), Error>>;
     /// Text deltas for one prompt, then one Completion. Waits in the queue first.
     fn stream<'a>(&'a self, prompt: &'a str, target: &'a str, meta: Option<SharedMeta>) -> BoxFuture<'a, Result<ItemStream, Error>>;
+    /// The effective options, for `midir check`: (option, environment variable that overrides it, value), secrets
+    /// masked.
+    fn options(&self) -> Vec<(&'static str, &'static str, String)>;
     /// (limit, actual) input tokens when `error` is the backend refusing a prompt for its size.
     fn input_limit_exceeded(&self, error: &BackendError) -> Option<(i64, i64)>;
 }

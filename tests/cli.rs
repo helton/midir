@@ -354,3 +354,74 @@ fn a_half_sent_request_is_closed_after_the_read_timeout() {
     assert!(n == 0 || head.starts_with("HTTP/1.1 4"), "{head}");
     assert_eq!(rig.http.get("/health").status, 200);
 }
+
+// ---------------------------------------------------------------- midir check
+
+#[test]
+fn check_reports_the_effective_configuration() {
+    // review 2026-10-05 (N05): the configuration, where each value comes from, and the backend checks, without serving
+    let upstream = Upstream::new();
+    let toml = toml_with_server("keepalive_s = 5\nportt = 1").replace("{upstream}", &upstream.url);
+    let o = run(&["check"], Some(&toml), &[("MIDIR_FOLLOWUPS", "false"), ("HTTPS_PROXY", "http://me:pw@proxy:3128")]);
+    let report = String::from_utf8_lossy(&o.stdout).to_string();
+    assert!(o.status.success(), "{}", out(&o));
+    let row = |name: &str| report.lines().find(|l| l.trim_start().starts_with(&format!("{name} "))).unwrap_or("").to_string();
+    assert!(row("keepalive_s").ends_with("file"), "{report}");
+    assert!(row("followups").contains("false") && row("followups").ends_with("env MIDIR_FOLLOWUPS"), "{report}");
+    assert!(row("read_timeout_s").ends_with("default"), "{report}");
+    assert!(row("client_secret").contains("set (6 chars)") && !report.contains("secret\""), "{report}"); // never the value
+    assert!(row("HTTPS_PROXY").contains("http://***@proxy:3128"), "{report}");
+    assert!(row("gpt-4.1").contains("stackspot:AGENT4...") && row("gpt-4.1").contains("claude-haiku-4-5"), "{report}");
+    assert!(report.contains("WARN") && report.contains("\"server.portt\""), "{report}");
+    assert!(report.contains("ok    backend stackspot: credentials accepted"), "{report}");
+    assert!(report.contains("Result: OK, with 1 warning(s)"), "{report}");
+    assert_eq!(upstream.token_calls(), 1);
+    assert!(upstream.calls().is_empty()); // no agent was asked
+
+    upstream.add_all(["OK", "OK", "OK"]);
+    let o = run(&["check", "--agents"], Some(&toml), &[]);
+    assert!(o.status.success(), "{}", out(&o));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("ok    model flex: the agent answered \"OK\""), "{}", out(&o));
+    assert_eq!(upstream.calls().len(), 3);
+}
+
+#[test]
+fn check_fails_on_what_would_stop_the_server() {
+    let upstream = Upstream::new();
+    upstream.set_token_status(401);
+    let toml = MIDIR_TOML.replace("{upstream}", &upstream.url);
+    let o = run(&["check"], Some(&toml), &[]);
+    let report = String::from_utf8_lossy(&o.stdout).to_string();
+    assert!(!o.status.success(), "{report}");
+    assert!(report.contains("FAIL  backend stackspot:") && report.contains("Result: 1 problem(s)"), "{report}");
+
+    let o = run(&["check", "--no-network"], Some(&toml), &[("MIDIR_TOOL_SCHEMA", "yaml")]);
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stdout).contains("FAIL  MIDIR_TOOL_SCHEMA=\"yaml\""), "{}", out(&o));
+    assert_eq!(upstream.token_calls(), 1); // --no-network contacts nothing
+
+    upstream.set_token_status(200);
+    upstream.add(Reply::status(403, json!({"message": "forbidden"})));
+    upstream.add_all(["OK", "OK"]);
+    let o = run(&["check", "--agents"], Some(&toml), &[]);
+    let report = String::from_utf8_lossy(&o.stdout).to_string();
+    assert!(!o.status.success() && report.contains("shared with this client"), "{report}");
+}
+
+#[test]
+fn check_leaves_the_responses_store_alone() {
+    // a check may run next to a live server (docker exec): it opens no store, so nothing is created or purged
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("not/yet");
+    let toml = MIDIR_TOML.replace("{responses_dir}", &store.to_string_lossy());
+    let o = run(&["check", "--no-network"], Some(&toml), &[]);
+    assert!(o.status.success(), "{}", out(&o));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("ok    responses store:"), "{}", out(&o));
+    assert!(!store.exists() && std::fs::read_dir(dir.path()).unwrap().next().is_none());
+
+    let locked = dir.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o500)).unwrap();
+    let toml = MIDIR_TOML.replace("{responses_dir}", &locked.join("responses").to_string_lossy());
+    let o = run(&["check", "--no-network"], Some(&toml), &[]);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("WARN  responses store: cannot write in"), "{}", out(&o));
+}

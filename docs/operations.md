@@ -75,6 +75,13 @@ container after changing it.
 
 ## Troubleshooting
 
+Start with **`midir check`** (in Docker: `docker exec midir midir check`). It prints every setting with where its value
+came from (environment, file or default), the models and their agents, unknown settings, and checks the credentials,
+TLS and proxy by fetching a backend token. It serves nothing and leaves the responses store alone, so it is safe next
+to a running server. `--no-network` skips the token; `--agents` also sends each model one short prompt (one request
+per model from the account's quota), which finds an agent id that is wrong or not shared with the client. It exits 1
+when a check fails.
+
 - **`/ready` answers 503**: a backend's readiness check failed; the message says why (StackSpot: realm, client id or
   secret, network, CA).
 - **403 with an empty body on requests**: an agent id is wrong or not shared with the client key; `GET /health` shows
