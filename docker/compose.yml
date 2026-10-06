@@ -16,7 +16,7 @@ name: midir
 services:
   midir:
     container_name: midir
-    image: ${MIDIR_IMAGE:-ghcr.io/helton/midir:0.1.1}
+    image: ${MIDIR_IMAGE:-ghcr.io/helton/midir:0.2.0}
     user: "${UID:-1000}:${GID:-1000}"   # run as your user: files in docker/data/gateway stay yours (no root-owned files)
     env_file: ../.env
     environment:

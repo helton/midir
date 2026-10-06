@@ -3,9 +3,9 @@
 All notable changes are listed here. Versions follow [Semantic Versioning](https://semver.org/); before 1.0.0 a minor
 release may change configuration or behavior.
 
-## Unreleased
+## 0.2.0 (2026-10-06)
 
-Fixes from the 2026-10-05 review (`.internal`, findings F-numbered):
+Fixes from a full review of the project (2026-10-05), a compact tool listing and `midir check`:
 - **Follow-ups never act for the user**: an announcement that leaves the action to the user's approval ("I'll push as
   soon as you confirm", "assim que você confirmar"), or that names push, merge, deploy, install or an action the
   user's latest message forbids, no longer gets a follow-up that appends the call (it appended a `git push`). The
