@@ -8,7 +8,6 @@ use std::process::ExitCode;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use axum::serve::ListenerExt;
 use clap::Parser;
 use midir::{app, buildinfo, config, gateway, log, telemetry};
 use tower::Layer;
@@ -51,7 +50,7 @@ Configuration: config/midir.toml under the working directory (or MIDIR_CONFIG=<p
 config/midir.example.toml. Secrets live in .env (working directory) and are referenced as ${NAME}. Environment
 variables win over the file: MIDIR_PORT, MIDIR_API_KEY, MIDIR_MAX_PROMPT_CHARS, MIDIR_TAIL_REMINDER,
 MIDIR_TOOL_DESC_MAX, MIDIR_FOLLOWUPS, MIDIR_RESPONSES_DIR, MIDIR_RESPONSES_RETENTION_DAYS, MIDIR_RESPONSES_MAX_MB,
-MIDIR_RESPONSES_MEMORY_MB, MIDIR_KEEPALIVE_S, MIDIR_RETRY_BACKOFF_S, MIDIR_SHUTDOWN_GRACE_S, MIDIR_PROMETHEUS,
+MIDIR_RESPONSES_MEMORY_MB, MIDIR_KEEPALIVE_S, MIDIR_READ_TIMEOUT_S, MIDIR_RETRY_BACKOFF_S, MIDIR_SHUTDOWN_GRACE_S, MIDIR_PROMETHEUS,
 OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME; for every backend, MIDIR_MAX_CONCURRENT, MIDIR_REQUESTS_PER_MINUTE,
 MIDIR_QUEUE_TIMEOUT and MIDIR_COOLDOWN_ON_429; for every StackSpot backend, STACKSPOT_REALM, STACKSPOT_CLIENT_ID,
 STACKSPOT_CLIENT_SECRET, STACKSPOT_CA_BUNDLE, STACKSPOT_IDM_BASE_URL and STACKSPOT_AGENT_BASE_URL (a second StackSpot
@@ -152,6 +151,53 @@ fn healthcheck(args: &Args, cwd: &Path) -> ExitCode {
     if probe().unwrap_or(false) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
+/// Connections a single Midir serves at once; beyond it new ones are closed until one ends.
+const MAX_CONNECTIONS: usize = 4096;
+
+/// Accept connections and serve them (HTTP/1 and HTTP/2) until `stop`, then let the open ones finish. Unlike
+/// `axum::serve`, the connection builder gets a timer, so a request whose headers do not arrive within `read_timeout`
+/// is closed instead of holding the connection forever.
+type Service = tower_http::timeout::RequestBodyTimeout<tower_http::normalize_path::NormalizePath<axum::Router>>;
+
+async fn serve(listener: tokio::net::TcpListener, service: Service, read_timeout: Duration, stop: tokio::sync::oneshot::Receiver<()>) {
+    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let mut stop = stop;
+    loop {
+        let accepted = tokio::select! {
+            a = listener.accept() => a,
+            _ = &mut stop => break,
+        };
+        let tcp = match accepted {
+            Ok((tcp, _)) => tcp,
+            Err(e) => {
+                // out of file descriptors and the like: wait a moment instead of spinning
+                tracing::warn!("accept failed: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
+            tracing::warn!("{MAX_CONNECTIONS} connections open: closing a new one");
+            continue;
+        };
+        let _ = tcp.set_nodelay(true);
+        let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+        builder.http1().timer(TokioTimer::new()).header_read_timeout(read_timeout);
+        builder.http2().timer(TokioTimer::new());
+        let conn = builder
+            .serve_connection_with_upgrades(TokioIo::new(tcp), hyper_util::service::TowerToHyperService::new(service.clone()))
+            .into_owned();
+        let conn = graceful.watch(conn);
+        tokio::spawn(async move {
+            let _ = conn.await;
+            drop(slot);
+        });
+    }
+    graceful.shutdown().await;
+}
+
 async fn shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
     let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
@@ -243,18 +289,11 @@ async fn run(args: Args, cwd: PathBuf) -> ExitCode {
     }
     // "/v1/chat/completions/" is "/v1/chat/completions"
     let service = NormalizePathLayer::trim_trailing_slash().layer(app::router(Arc::new(app::App { gateway: gw.clone() })));
+    let read_timeout = Duration::from_secs_f64(cfg.server.read_timeout_s.max(0.1));
+    // a body that stalls longer than the read timeout between chunks ends the request
+    let service = tower_http::timeout::RequestBodyTimeoutLayer::new(read_timeout).layer(service);
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(async move {
-        let make = axum::ServiceExt::<axum::extract::Request>::into_make_service(service);
-        let listener = listener.tap_io(|tcp| {
-            let _ = tcp.set_nodelay(true);
-        });
-        let _ = axum::serve(listener, make)
-            .with_graceful_shutdown(async move {
-                let _ = stop_rx.await;
-            })
-            .await;
-    });
+    let server = tokio::spawn(serve(listener, service, read_timeout, stop_rx));
     if cfg.server.api_key.is_none() && !args.host.starts_with("127.") && args.host != "localhost" && args.host != "::1" {
         // in a container this is the usual case (compose publishes the port on 127.0.0.1 only): information, not alarm
         tracing::info!(

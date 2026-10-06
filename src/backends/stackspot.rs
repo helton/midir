@@ -29,11 +29,15 @@ const DEFAULT_IDM_BASE: &str = "https://idm.stackspot.com";
 const OPTIONS: [&str; 7] = ["type", "realm", "client_id", "client_secret", "idm_base_url", "agent_base_url", "ca_bundle"];
 /// The token call as a whole (connect, send, answer): a hung idm must not hold every request for minutes.
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a failed token renewal is answered again before idm is asked anew.
+const TOKEN_FAILURE_TTL: Duration = Duration::from_secs(5);
 static TOO_LONG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)limit of (\d+) tokens.*?resulted in (\d+) tokens").unwrap());
 
 struct Token {
     value: String,
     expires_at: f64,
+    /// the last failed renewal, answered again for a few seconds instead of asking idm once per caller
+    failed: Option<(std::time::Instant, Error)>,
 }
 
 pub struct StackSpotBackend {
@@ -137,7 +141,7 @@ impl StackSpotBackend {
             agent_base: s("agent_base_url", "STACKSPOT_AGENT_BASE_URL", DEFAULT_AGENT_BASE).trim_end_matches('/').to_string(),
             http,
             http_error,
-            token: tokio::sync::Mutex::new(Token { value: String::new(), expires_at: 0.0 }),
+            token: tokio::sync::Mutex::new(Token { value: String::new(), expires_at: 0.0, failed: None }),
             token_cache: std::sync::Mutex::new((String::new(), 0.0)),
             limiter,
             telemetry,
@@ -177,15 +181,31 @@ impl StackSpotBackend {
         (!c.0.is_empty() && c.1 - 60.0 > time_now()).then(|| c.0.clone())
     }
 
-    /// Client-credentials token, cached and renewed 60 s before expiry (tokens last 20 min).
-    pub async fn token(&self, force: bool) -> Result<String, Error> {
-        if !force && let Some(t) = self.cached_token() {
+    /// Client-credentials token, cached and renewed 60 s before expiry (tokens last 20 min). `stale` is a token the
+    /// agent refused (401): it is renewed unless another caller already did. A failed renewal is answered again for
+    /// `TOKEN_FAILURE_TTL` instead of asking idm once per caller (an open `/ready` polled in a loop, a wave of 401s).
+    pub async fn token(&self, stale: Option<&str>) -> Result<String, Error> {
+        if stale.is_none()
+            && let Some(t) = self.cached_token()
+        {
             return Ok(t);
         }
         let mut tok = self.token.lock().await;
-        if !force && !tok.value.is_empty() && tok.expires_at - 60.0 > time_now() {
-            return Ok(tok.value.clone());
+        let fresh = !tok.value.is_empty() && tok.expires_at - 60.0 > time_now();
+        if fresh && stale.is_none_or(|s| s != tok.value) {
+            return Ok(tok.value.clone()); // still valid, or renewed by another caller since `stale` was handed out
         }
+        if let Some((at, e)) = &tok.failed
+            && at.elapsed() < TOKEN_FAILURE_TTL
+        {
+            return Err(e.clone());
+        }
+        let renewed = self.renew_token(&mut tok).await;
+        tok.failed = renewed.as_ref().err().map(|e| (std::time::Instant::now(), e.clone()));
+        renewed
+    }
+
+    async fn renew_token(&self, tok: &mut Token) -> Result<String, Error> {
         let form =
             [("grant_type", "client_credentials"), ("client_id", self.client_id.as_str()), ("client_secret", self.client_secret.as_str())];
         let r = self
@@ -216,8 +236,9 @@ impl StackSpotBackend {
 
     async fn open_once(&self, target: &str, body: &Bytes, deadline: tokio::time::Instant) -> Result<reqwest::Response, Error> {
         let mut resp = None;
+        let mut refused: Option<String> = None;
         for attempt in 1..=2 {
-            let token = self.token(attempt == 2).await?;
+            let token = self.token(refused.as_deref()).await?;
             self.limiter.start(deadline).await?;
             let r = self
                 .http
@@ -231,6 +252,7 @@ impl StackSpotBackend {
                 .map_err(|e| NetError::from_reqwest(&e, false))?;
             if r.status().as_u16() == 401 && attempt == 1 {
                 drop(r);
+                refused = Some(token);
                 tracing::warn!("{}: 401 from the agent; renewing the token", self.name);
                 continue;
             }
@@ -241,7 +263,10 @@ impl StackSpotBackend {
         let status = r.status().as_u16();
         if status != 200 {
             if status == 429 {
-                self.limiter.on_429();
+                // Retry-After in seconds (an HTTP date is rare from APIs and ignored)
+                let retry_after =
+                    r.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<f64>().ok());
+                self.limiter.on_429(retry_after);
             }
             return Err(BackendError::new(status, body_of(r).await, "agent", &self.name).into());
         }
@@ -324,7 +349,7 @@ impl TextBackend for StackSpotBackend {
     }
 
     fn ready(&self) -> BoxFuture<'_, Result<(), Error>> {
-        Box::pin(async move { self.token(false).await.map(|_| ()) })
+        Box::pin(async move { self.token(None).await.map(|_| ()) })
     }
 
     fn stream<'a>(&'a self, prompt: &'a str, target: &'a str, meta: Option<SharedMeta>) -> BoxFuture<'a, Result<ItemStream, Error>> {

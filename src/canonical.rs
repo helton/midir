@@ -196,6 +196,8 @@ pub struct Meta {
     pub prev_id: Option<String>,
     pub prev_turns: usize,
     pub followups: i64,
+    /// follow-ups whose backend call failed (the reply they followed stands)
+    pub followup_errors: i64,
     pub parse_errors: i64,
     pub repairs: i64,
     pub upstream_calls: i64,

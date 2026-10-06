@@ -394,6 +394,98 @@ fn followups_off_return_the_reply_as_written() {
     assert_eq!(rig.upstream.calls().len(), 2);
 }
 
+fn appended_calls(r: &Value) -> usize {
+    r["choices"][0]["message"]["tool_calls"].as_array().map_or(0, |a| a.len())
+}
+
+#[test]
+fn an_announcement_left_to_the_user_gets_no_follow_up() {
+    // review 2026-10-05 (F30): each of these made the gateway append a `git push` the user never approved
+    for (order, reply) in [
+        ("fix the bug and push", "I'll push as soon as you confirm."),
+        ("corrija o bug", "Vou fazer o push assim que você confirmar."),
+        ("Corrija o bug e faça commit, mas NÃO faça push.", "Vou fazer o commit e o push agora."),
+        ("corrija o bug", "Vou fazer o push agora."),
+    ] {
+        let rig = Rig::new();
+        rig.upstream.add(reply).add(tool_call_text("run_command", json!({"command": "git push origin main"})));
+        let r = chat(&rig, json!({"tools": chat_tools(), "messages": user(order)}));
+        assert_eq!(rig.upstream.calls().len(), 1, "{reply}");
+        assert_eq!(r["choices"][0]["finish_reason"], "stop", "{reply}");
+        assert_eq!(appended_calls(&r), 0, "{reply}");
+    }
+}
+
+#[test]
+fn a_failing_follow_up_does_not_fail_the_reply() {
+    // review 2026-10-05 (F31): the reply was delivered; the follow-up's failure must not turn it into an error
+    let rig = Rig::new();
+    rig.upstream.add("Vou ler o arquivo a.py agora.").add(Reply::status(400, json!({"message": "boom"})));
+    let r = chat(&rig, json!({"tools": chat_tools()}));
+    assert_eq!(r["choices"][0]["finish_reason"], "stop");
+    assert!(content(&r).contains("Vou ler"), "{r}");
+    assert_eq!(rig.upstream.calls().len(), 2);
+    rig.upstream.add("Vou ler o arquivo a.py agora.").add(Reply::status(400, json!({"message": "boom"})));
+    let objs = chat(&rig, json!({"tools": chat_tools(), "stream": true}));
+    let objs = objs.as_array().unwrap();
+    assert_eq!(chat_stream_finish(objs), vec!["stop".to_string()]);
+    assert!(objs.iter().all(|o| o.get("error").is_none()), "{objs:?}");
+    // JSON mode: a repair that fails returns the model's text, as a repair that stays invalid does
+    rig.upstream.add("not json").add(Reply::status(400, json!({"message": "boom"})));
+    let r = chat(&rig, json!({"response_format": {"type": "json_object"}}));
+    assert_eq!(content(&r), "not json");
+}
+
+#[test]
+fn a_write_with_new_content_is_not_dropped_as_a_loop() {
+    // review 2026-10-05 (F32): two writes to a.py answered "File written"; the third, with new content, is progress
+    let rig = Rig::new();
+    let call = |id: &str, content: &str| json!({"id": id, "type": "function", "function": {"name": "write_file", "arguments": json!({"path": "a.py", "content": content}).to_string()}});
+    let messages = json!([
+        {"role": "user", "content": "write a.py until it is right"},
+        {"role": "assistant", "content": null, "tool_calls": [call("c1", "v1")]},
+        {"role": "tool", "tool_call_id": "c1", "content": "File written"},
+        {"role": "assistant", "content": null, "tool_calls": [call("c2", "v2")]},
+        {"role": "tool", "tool_call_id": "c2", "content": "File written"}
+    ]);
+    let tools = json!([{"type": "function", "function": {"name": "write_file", "description": "Write a file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}}}]);
+    rig.upstream
+        .add("Vou atualizar a.py com a correção final.")
+        .add(tool_call_text("write_file", json!({"path": "a.py", "content": "v3"})));
+    let r = chat(&rig, json!({"tools": tools, "messages": messages}));
+    assert_eq!(r["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(appended_calls(&r), 1);
+}
+
+#[test]
+fn an_old_commit_order_does_not_follow_a_new_question() {
+    // review 2026-10-05 (F33): an earlier task ordered a commit and ended without one; a later explanation must not commit
+    let rig = Rig::new();
+    let messages = json!([
+        {"role": "user", "content": "Adicione median e faça commit ao final."},
+        {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "run_command", "arguments": "{\"command\": \"uv run pytest -q\"}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "14 passed"},
+        {"role": "assistant", "content": "Feito."},
+        {"role": "user", "content": "Agora explique o que pstdev calcula."}
+    ]);
+    rig.upstream
+        .add("Pronto: pstdev é o desvio padrão populacional. Tudo concluído.")
+        .add(tool_call_text("run_command", json!({"command": "git commit -am x"})));
+    let r = chat(&rig, json!({"tools": chat_tools(), "messages": messages}));
+    assert_eq!(rig.upstream.calls().len(), 1);
+    assert_eq!(appended_calls(&r), 0);
+}
+
+#[test]
+fn json_mode_does_not_repair_a_reply_cut_by_max_tokens() {
+    // review 2026-10-05 (F36): the client's max_tokens cut the JSON; a repair under the same cap is cut again
+    let rig = Rig::new();
+    rig.upstream.add("{\"a\": \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}");
+    let r = chat(&rig, json!({"response_format": {"type": "json_object"}, "max_tokens": 2}));
+    assert_eq!(r["choices"][0]["finish_reason"], "length");
+    assert_eq!(rig.upstream.calls().len(), 1);
+}
+
 #[test]
 fn a_second_announcement_gets_a_second_follow_up() {
     let rig = Rig::new();

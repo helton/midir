@@ -37,7 +37,8 @@ StackSpot has no native tools, so the gateway puts your tool list in the prompt 
   (two at most) and appends the missing tool calls to the same reply. It only answers for a commit or a test run the
   user explicitly ordered; push, merge, deploy and install are never confirmed for the user. Saying you cannot do
   something you have a tool for (web, files, shell) also gets a follow-up asking for the call, unless a call in this
-  turn already tried it or you cite the failure (e.g. "the fetch returned 403"): then your reply stands.
+  turn already tried it or you cite the failure (e.g. "the fetch returned 403"): then your reply stands. A reply that
+  leaves an action to the user's approval, or announces a push, merge, deploy or install, is never completed for you.
   Best behavior: emit the tool call in the same reply you announce it; do not ask to confirm actions the user already
   asked for.
 - Every tool schema is resent on every turn and the prompt has no cache: keep the active tool list small.

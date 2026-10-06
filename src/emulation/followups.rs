@@ -37,6 +37,17 @@ static WAIT_RE: LazyLock<Regex> = LazyLock::new(|| {
         r"when (it|they|the \w+) (finish|finishes|complete|completes)|waiting for|once (it|they|the \w+) (finish|finishes|complete|completes))\b"
     ))
 });
+/// The reply leaves the action to the user's approval ("assim que você confirmar", "once you approve"): not an
+/// announcement of something it is about to do.
+static USER_GATE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    re(concat!(
+        r"(?i)\b(assim que|quando|depois que|se|caso|ap[óo]s|com)( voc[êe]| vc| tu)?( me)? (confirmar|autorizar|aprovar|concordar|disser|der (o )?ok)\b|",
+        r"\b(aguardo|aguardando|espero|vou esperar|vou aguardar) (a |o |sua |seu |pela |pelo )?(sua |seu )?(confirma|autoriza|aprova|ok|sinal|decis)|",
+        r"\b(once|when|after|if|as soon as) you (confirm|approve|authorize|agree|say so|give the go-ahead|are ready|decide)\b|",
+        r"\b(wait|waiting) for (your|the user'?s) (approval|confirmation|go-ahead|ok|decision|permission)\b|\bwith your (approval|permission|go-ahead)\b|",
+        r"\bcuando (me )?confirmes\b|\bsi (me )?autorizas\b"
+    ))
+});
 pub static INTENT_RE: LazyLock<Regex> = LazyLock::new(|| {
     re(concat!(
         r"(?i)\b(vou|vamos|irei|iremos|farei|faremos|seguirei|prosseguirei|começarei|lerei|rodarei|executarei|criarei|editarei|ajustarei|corrigirei|verificarei|",
@@ -319,17 +330,19 @@ fn tried(req: &CanonicalRequest, abilities: &[&(&str, Regex, Regex)]) -> bool {
     })
 }
 
-/// Whether the current turn already made this call (same tool, same target) and its last two runs returned the same
-/// result: a follow-up that makes it again only repeats that result, and the client loops on it.
+/// Whether the current turn already made this exact call (same tool, same arguments) and its last two runs returned
+/// the same result: a follow-up that makes it again only repeats that result, and the client loops on it. A write with
+/// new content to the same file is another call.
 pub fn repeats_itself(req: &CanonicalRequest, call: &ToolCall) -> bool {
     let turns = &req.turns[turn_start(req)..];
     let results: HashMap<&str, &str> =
         turns.iter().flat_map(|t| &t.tool_results).map(|r| (r.call_id.as_str(), r.content.as_str())).collect();
-    let key = call_key(call);
+    let signature = |c: &ToolCall| (c.name.clone(), json::sorted(&c.arguments));
+    let key = signature(call);
     let outcomes: Vec<&str> = turns
         .iter()
         .flat_map(|t| &t.tool_calls)
-        .filter(|c| call_key(c) == key)
+        .filter(|c| signature(c) == key)
         .filter_map(|c| results.get(c.id.as_str()).copied())
         .collect();
     matches!(outcomes.as_slice(), [.., a, b] if a == b)
@@ -383,6 +396,28 @@ fn stance(text: &str, action: &str) -> Option<bool> {
     let question = scope.trim_end().ends_with('?');
     let order = ORDERS.iter().find(|(name, _)| *name == action).is_some_and(|(_, form)| form.is_match(scope));
     Some(order && !negated && !question && !CONDITION_RE.is_match(scope))
+}
+
+/// Whether a text forbids `action` at its last mention: a negation before or right after it ("não faça push",
+/// "push não"), outside a question.
+fn forbids(text: &str, action: &str) -> bool {
+    let Some((_, mention)) = ACTIONS.iter().find(|(name, _)| *name == action) else { return false };
+    let Some(m) = mention.find_iter(text).last() else { return false };
+    let (start, end) = scope_around(text, m.start());
+    let before: Vec<&str> = text[start..m.start()].split_whitespace().collect();
+    let window = before[before.len().saturating_sub(8)..].join(" ");
+    let negated = NEGATION_RE.is_match(&ASKS_ANYWAY_RE.replace_all(&window, " ")) || NEGATION_AFTER_RE.is_match(&text[m.end()..end]);
+    negated && !text[start..end].trim_end().ends_with('?')
+}
+
+/// The action an announcement names that a follow-up must not make for it: an irreversible one (push, merge, deploy,
+/// install), or one the user's latest instruction forbids. The announcement then stays the model's answer.
+pub fn announces_guarded(req: &CanonicalRequest, text_: &str) -> Option<&'static str> {
+    let prose = prose_of(text_.trim());
+    let sents: Vec<&str> = sent_split(&prose).into_iter().map(str::trim).filter(|x| !x.is_empty()).collect();
+    let last2 = sents[sents.len().saturating_sub(2)..].join(" ").to_lowercase();
+    let latest = instructions(req).next().map(|(_, t)| t).unwrap_or_default();
+    ACTIONS.iter().filter(|(_, pat)| pat.is_match(&last2)).map(|(name, _)| *name).find(|a| IRREVERSIBLE.contains(a) || forbids(&latest, a))
 }
 
 /// The turn whose instruction orders `action`: the most recent mention decides. Irreversible actions are never
@@ -470,8 +505,9 @@ pub fn redundant_confirmation(req: &CanonicalRequest, text_: &str) -> Option<&'s
     Some(named[0])
 }
 
-/// Whether a final report leaves out the commit the user ordered: the reply says the work is done, mentions no
-/// commit made, and no tool call made one since the order. (Models forget the last step of a long task.)
+/// Whether a final report leaves out the commit the user's current instruction orders: the reply says the work is
+/// done, mentions no commit made, and no tool call made one since the order. (Models forget the last step of a long
+/// task.)
 pub fn forgotten_commit(req: &CanonicalRequest, resp: &CanonicalResponse, text_: &str, calls: &[ToolCall]) -> bool {
     if !calls.is_empty() || !req.tools_on() || resp.finish != Finish::Stop {
         return false;
@@ -479,7 +515,9 @@ pub fn forgotten_commit(req: &CanonicalRequest, resp: &CanonicalResponse, text_:
     let prose = prose_of(text_.trim());
     let reported = ACTION_DONE[0].1.is_match(&prose.to_lowercase());
     let asks = prose.trim_end().ends_with('?');
-    DONE_RE.is_match(&prose) && !reported && !asks && !FAILURE_RE.is_match(&prose) && ordered_and_not_done(req, "commit")
+    // the order must be in the current instruction: a later, unrelated question does not bring an old order back
+    let current = order_turn(req, "commit") == Some(turn_start(req));
+    DONE_RE.is_match(&prose) && !reported && !asks && !FAILURE_RE.is_match(&prose) && current && ordered_and_not_done(req, "commit")
 }
 
 pub fn announces_without_acting(text_: &str) -> bool {
@@ -497,6 +535,9 @@ pub fn announces_without_acting(text_: &str) -> bool {
     let last4 = sents[sents.len().saturating_sub(4)..].join(" ");
     if WAIT_RE.is_match(&last4) {
         return false; // waiting for background work it already started
+    }
+    if USER_GATE_RE.is_match(&last4) {
+        return false; // it leaves the action to the user's approval
     }
     let last2 = &sents[sents.len().saturating_sub(2)..];
     if (INTENT_RE.is_match(&last2.join(" ")) || last2.iter().any(|x| GERUND_OPEN_RE.is_match(x))) && !PAST_RE.is_match(last) {
@@ -678,6 +719,11 @@ mod tests {
         // problems reported, a question asked, a condition the gateway cannot check
         assert!(!forgotten_commit(&ordered, &resp, "Implementado. Porém 2 testes falharam.", &[]));
         assert!(!forgotten_commit(&ordered, &resp, "Tudo pronto! Quer que eu revise algo?", &[]));
+        // an order from an earlier task never committed: a later, unrelated answer gets no commit follow-up
+        let mut later_uncommitted = ordered.clone();
+        later_uncommitted.add_text("assistant", "Feito.");
+        later_uncommitted.add_text("user", "Agora explique o que pstdev calcula.");
+        assert!(!forgotten_commit(&later_uncommitted, &resp, "Pronto: pstdev é o desvio padrão populacional. Tudo concluído.", &[]));
         let conditional = with_call(req(&["Faça commit só se todos os testes passarem."]), "uv run pytest -q");
         assert!(!forgotten_commit(&conditional, &resp, "Tudo pronto, mas 1 teste ainda falha.", &[]));
         // nor a summary of commits the user asked for
@@ -773,5 +819,53 @@ mod tests {
         r.add_text("assistant", "Os testes falham.");
         r.add_text("user", "rode de novo");
         assert!(!repeats_itself(&r, &call("c9")));
+    }
+
+    #[test]
+    fn an_action_pending_the_users_approval_is_not_an_announcement() {
+        for text in [
+            "I'll push as soon as you confirm.",
+            "Vou fazer o push assim que você confirmar.",
+            "I'll wait for your approval before pushing.",
+            "Vou aguardar seu ok para o push.",
+            "Posso seguir com o deploy quando você aprovar. Vou preparar tudo quando você confirmar.",
+        ] {
+            assert!(!announces_without_acting(text), "{text}");
+        }
+        assert!(announces_without_acting("Vou fazer o commit agora."));
+        assert!(announces_without_acting("I'll run the tests now."));
+    }
+
+    #[test]
+    fn a_follow_up_never_makes_an_irreversible_or_forbidden_action() {
+        // R02's rule, applied to announcements too: the gateway never originates a push, and never what the user forbade
+        let r = req(&["corrija o bug"]);
+        assert_eq!(announces_guarded(&r, "Vou fazer o push agora."), Some("push"));
+        assert_eq!(announces_guarded(&r, "I'll deploy it now."), Some("deploy"));
+        let forbidden = req(&["Corrija o bug e faça commit, mas NÃO faça push."]);
+        assert_eq!(announces_guarded(&forbidden, "Vou fazer o commit e o push agora."), Some("push"));
+        let no_tests = req(&["ajuste o README, não rode os testes"]);
+        assert_eq!(announces_guarded(&no_tests, "Vou rodar os testes agora."), Some("tests"));
+        // allowed: an ordered commit, tests the user did not forbid, an announcement that names no action
+        assert_eq!(announces_guarded(&forbidden, "Vou fazer o commit agora."), None);
+        assert_eq!(announces_guarded(&r, "Vou rodar os testes agora."), None);
+        assert_eq!(announces_guarded(&r, "Vou ler o arquivo a.py."), None);
+    }
+
+    #[test]
+    fn a_write_with_new_content_is_not_a_repeated_call() {
+        // two writes to one file both answer "File written": a third with new content is progress, not a loop
+        let write = |id: &str, content: &str| ToolCall {
+            id: id.into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": "a.py", "content": content}),
+        };
+        let mut r = req(&["write a.py until it is right"]);
+        ran(&mut r, "c1", "write_file", serde_json::json!({"path": "a.py", "content": "v1"}), "File written");
+        ran(&mut r, "c2", "write_file", serde_json::json!({"path": "a.py", "content": "v2"}), "File written");
+        assert!(!repeats_itself(&r, &write("c9", "v3")));
+        ran(&mut r, "c3", "write_file", serde_json::json!({"path": "a.py", "content": "v3"}), "File written");
+        ran(&mut r, "c4", "write_file", serde_json::json!({"path": "a.py", "content": "v3"}), "File written");
+        assert!(repeats_itself(&r, &write("c9", "v3"))); // the very same write twice, same result: a loop
     }
 }

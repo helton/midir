@@ -58,6 +58,40 @@ fn a_401_from_the_agent_renews_the_token_once() {
 }
 
 #[test]
+fn ready_does_not_hammer_idm_when_credentials_are_bad() {
+    // review 2026-10-05 (F04): an open /ready polled in a loop posted the client secret to idm on every hit
+    let rig = Rig::new();
+    rig.upstream.set_token_status(401);
+    for _ in 0..5 {
+        assert_eq!(rig.http.get("/ready").status, 503);
+    }
+    assert_eq!(rig.upstream.token_calls(), 1);
+}
+
+#[test]
+fn a_401_wave_renews_the_token_once() {
+    // review 2026-10-05 (F04): four requests refused together renew the token once, not four times
+    let rig = Rig::new();
+    assert_eq!(rig.http.get("/ready").status, 200); // tok1
+    for _ in 0..4 {
+        // the four first attempts are in flight together before any 401 comes back: one wave
+        rig.upstream.add(Reply::status(401, json!({"message": "expired"})).delay(0.3));
+    }
+    for _ in 0..4 {
+        rig.upstream.add("ok");
+    }
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let http = Http::new(&rig.server.url);
+            std::thread::spawn(move || http.post("/v1/chat/completions", &json!({"model": "gpt-5.1", "messages": user("hi")})).status)
+        })
+        .collect();
+    let statuses: Vec<u16> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(statuses, vec![200; 4]);
+    assert_eq!(rig.upstream.token_calls(), 2);
+}
+
+#[test]
 fn idm_failure_is_401_to_the_client() {
     let rig = Rig::new();
     rig.upstream.set_token_status(401);
@@ -79,6 +113,43 @@ fn persistent_5xx_is_502_with_the_upstream_message() {
     let a = messages(&rig);
     assert_eq!(a.status, 502);
     assert_eq!(a.json()["error"]["type"], "api_error");
+}
+
+#[test]
+fn an_error_before_the_first_byte_is_an_http_error_on_streams_too() {
+    // review 2026-10-05 (F41): a streaming request that fails before any content was a 200 with an error event, so
+    // SDKs never retried a 429
+    let rig = Rig::new();
+    rig.upstream.set_default(Reply::status(429, rate()));
+    for (path, body) in [
+        ("/v1/chat/completions", json!({"model": "gpt-5.1", "messages": user("hi"), "stream": true})),
+        ("/v1/responses", json!({"model": "gpt-5.1", "input": "hi", "stream": true})),
+        ("/v1/messages", json!({"model": "claude-opus-4-5", "max_tokens": 9, "messages": user("hi"), "stream": true})),
+    ] {
+        let r = rig.http.post(path, &body);
+        assert_eq!(r.status, 429, "{path}: {}", r.text);
+        assert!(!r.is_sse(), "{path}");
+        assert!(r.header("retry-after").is_some(), "{path}");
+    }
+    let a = rig.http.post("/v1/messages", &json!({"model": "claude-opus-4-5", "max_tokens": 9, "messages": user("hi"), "stream": true}));
+    assert_eq!(a.json()["error"]["type"], "rate_limit_error");
+    // a client error is not retried and keeps its status
+    let rig = Rig::new();
+    rig.upstream.set_default(Reply::status(400, json!({"message": "bad"})));
+    let r = rig.http.post("/v1/chat/completions", &json!({"model": "gpt-5.1", "messages": user("hi"), "stream": true}));
+    assert_eq!(r.status, 400, "{}", r.text);
+    assert_eq!(rig.upstream.calls().len(), 1);
+}
+
+#[test]
+fn a_slow_first_byte_still_streams_with_keepalives() {
+    // the wait for the first answer is bounded (four keepalive intervals): a slow backend gets the 200 and keepalives
+    let rig = Rig::with(&toml_with_server("keepalive_s = 0.1"), &[]);
+    rig.upstream.add(Reply::text("ok").delay(0.6));
+    let lines = rig.http.post_lines("/v1/chat/completions", &json!({"model": "gpt-5.1", "messages": user("hi"), "stream": true}));
+    let first_keepalive = lines.iter().position(|(_, l)| l.starts_with(':')).expect("a keepalive");
+    let first_content = lines.iter().position(|(_, l)| l.contains("\"ok\"")).expect("the text");
+    assert!(first_keepalive < first_content, "{lines:?}");
 }
 
 #[test]

@@ -5,6 +5,27 @@ release may change configuration or behavior.
 
 ## Unreleased
 
+Fixes from the 2026-10-05 review (`.internal`, findings F-numbered):
+- **Follow-ups never act for the user**: an announcement that leaves the action to the user's approval ("I'll push as
+  soon as you confirm", "assim que você confirmar"), or that names push, merge, deploy, install or an action the
+  user's latest message forbids, no longer gets a follow-up that appends the call (it appended a `git push`). The
+  forgotten-commit follow-up only applies to the task of the current instruction (it committed during a later,
+  unrelated answer). The loop guard compares whole calls: a second write to the same file with new content is no
+  longer dropped as a repeat. A follow-up whose backend call fails leaves the reply it followed (it turned a delivered
+  answer into an error); a JSON reply cut by `max_tokens` is no longer repaired under the same cap.
+- **Streaming errors carry an HTTP status**: a streaming request that fails before its first byte (a backend 429
+  that outlasted the retries, a full queue, a refusal) answers the protocol's HTTP error with `Retry-After`, as a
+  non-streaming one does, so SDKs retry; it was a 200 with an error event. The first answer is awaited for up to four
+  keepalive intervals; a slower backend gets the 200 and keepalives as before.
+- **A burst of 429s halves the local budget once**: requests in flight that hit the account's limit together counted
+  as one halving each (90 → 10 requests per minute for over an hour); they now extend the pause. The backend's
+  `Retry-After` sets the pause when longer than the cooldown (up to 5 minutes).
+- **Connections that never finish their request are closed**: headers must arrive within `[server] read_timeout_s`
+  (30 s, `MIDIR_READ_TIMEOUT_S`) and a body may not stall longer between chunks; at most 4096 connections are open at
+  once. Before, a half-sent request held its connection forever.
+- **Token renewals are shared**: a wave of 401s renews the StackSpot token once, and a failed renewal is answered
+  again for 5 s, so an open `/ready` polled in a loop no longer posts the client secret to idm on every hit.
+
 - **Documentation**: a new README (logo, diagram, highlights, quick start, measured performance) and the reference
   material in guides: [configuration](configuration.md), [API compatibility](compatibility.md),
   [operations](operations.md) and [development](development.md).

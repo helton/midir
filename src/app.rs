@@ -117,6 +117,31 @@ pub fn with_keepalive(events: EventStream, interval: f64) -> EventStream {
     })
 }
 
+/// The engine's stream once its first answer is known. An error before any content (a backend refusal, a 429 that
+/// outlasted the retries, a full queue) becomes the request's own HTTP error, with the status, type and `Retry-After`
+/// that SDKs retry on, instead of a 200 whose body holds an error event. Content, or a backend slower than `wait`,
+/// commits the stream as before (keepalives then cover the wait).
+async fn first_answer(mut events: EventStream, wait: Duration) -> Result<EventStream, Error> {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut seen = vec![];
+    loop {
+        match tokio::time::timeout_at(deadline, events.next()).await {
+            Ok(Some(Ok(e @ (Event::Prompt { .. } | Event::Keepalive)))) => seen.push(Ok(e)),
+            Ok(Some(Ok(e))) => {
+                seen.push(Ok(e));
+                break;
+            }
+            Ok(Some(Err(e))) => return Err(e),
+            Ok(None) => break,
+            Err(_) => {
+                seen.push(Ok(Event::Keepalive)); // the 200 goes out now, with a keepalive the client sees at once
+                break;
+            }
+        }
+    }
+    Ok(Box::pin(futures::stream::iter(seen).chain(events)))
+}
+
 /// What a panic says, for the log.
 fn panic_text(err: &(dyn std::any::Any + Send)) -> &str {
     err.downcast_ref::<String>().map(String::as_str).or_else(|| err.downcast_ref::<&str>().copied()).unwrap_or("unknown")
@@ -289,6 +314,13 @@ impl App {
         self.gateway.config.server.keepalive_s
     }
 
+    /// How long a streaming request waits for its first answer before the 200 is committed: four keepalive intervals
+    /// (60 s by default), long enough for the backend's own retries of a 429.
+    fn first_answer_wait(&self) -> Duration {
+        let keepalive = self.keepalive_s();
+        Duration::from_secs_f64(if keepalive > 0.0 { keepalive * 4.0 } else { 60.0 })
+    }
+
     fn health(&self) -> Response {
         let cfg = &self.gateway.config;
         let backends: Map<String, Value> =
@@ -364,7 +396,9 @@ impl App {
             let r = observe_complete(&tel, p.runner.complete(p.req.clone(), cid), &p.req, cid).await?;
             return Ok(json_response(200, &chat_completions::response(&r, cid, created, &p.model)));
         }
-        let events = with_keepalive(observe(tel, p.runner.run(p.req.clone(), cid.to_string()), &p.req, cid), self.keepalive_s());
+        let events =
+            first_answer(observe(tel, p.runner.run(p.req.clone(), cid.to_string()), &p.req, cid), self.first_answer_wait()).await?;
+        let events = with_keepalive(events, self.keepalive_s());
         let stream = chat_completions::stream(events, cid.to_string(), created, p.model, include_usage);
         Ok(sse_response(guarded(stream, cid.to_string(), Flavor::OpenAi)))
     }
@@ -380,7 +414,9 @@ impl App {
             let r = observe_complete(&tel, p.runner.complete(p.req.clone(), rid), &p.req, rid).await?;
             return Ok(json_text(200, responses::complete_response(stored, r, &store).await));
         }
-        let events = with_keepalive(observe(tel, p.runner.run(p.req.clone(), rid.to_string()), &p.req, rid), self.keepalive_s());
+        let events =
+            first_answer(observe(tel, p.runner.run(p.req.clone(), rid.to_string()), &p.req, rid), self.first_answer_wait()).await?;
+        let events = with_keepalive(events, self.keepalive_s());
         let stream = responses::stream(events, stored, store);
         Ok(sse_response(guarded(stream, rid.to_string(), Flavor::Responses)))
     }
@@ -402,7 +438,9 @@ impl App {
             let r = observe_complete(&tel, p.runner.complete(p.req.clone(), mid), &p.req, mid).await?;
             return Ok(json_response(200, &messages::response(&r, mid, &p.model)));
         }
-        let events = with_keepalive(observe(tel, p.runner.run(p.req.clone(), mid.to_string()), &p.req, mid), self.keepalive_s());
+        let events =
+            first_answer(observe(tel, p.runner.run(p.req.clone(), mid.to_string()), &p.req, mid), self.first_answer_wait()).await?;
+        let events = with_keepalive(events, self.keepalive_s());
         Ok(sse_response(guarded(messages::stream(events, mid.to_string(), p.model), mid.to_string(), Flavor::Anthropic)))
     }
 

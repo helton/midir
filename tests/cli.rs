@@ -313,3 +313,35 @@ fn the_key_may_come_in_either_header_and_healthcheck_reads_string_ports() {
     let toml = "[server]\nport = \"${HC_PORT}\"\n";
     assert!(run(&["--healthcheck"], Some(toml), &[("HC_PORT", port.as_str())]).status.success());
 }
+
+#[test]
+fn a_half_sent_request_is_closed_after_the_read_timeout() {
+    // review 2026-10-05 (F01): hyper's header timeout never applied (no timer), so a half-sent request held its
+    // connection forever
+    use std::io::{Read, Write};
+    let rig = Rig::with(&toml_with_server("read_timeout_s = 1"), &[]);
+    let addr = rig.server.url.trim_start_matches("http://").to_string();
+    let mut buf = [0u8; 256];
+    // headers that never end
+    let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+    write!(sock, "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n").unwrap();
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    let t0 = std::time::Instant::now();
+    let n = sock.read(&mut buf).expect("the server closes the connection before the client's own timeout");
+    assert!(t0.elapsed() < std::time::Duration::from_secs(4), "{:?}", t0.elapsed());
+    let _ = n; // 0 (closed) or a 408 written before closing: both end the connection
+    // a body that stalls: the request ends (an error answer or a closed connection) instead of waiting forever
+    let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+    write!(
+        sock,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{{\"model\""
+    )
+    .unwrap();
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    let t0 = std::time::Instant::now();
+    let n = sock.read(&mut buf).expect("the server answers or closes before the client's own timeout");
+    assert!(t0.elapsed() < std::time::Duration::from_secs(4), "{:?}", t0.elapsed());
+    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+    assert!(n == 0 || head.starts_with("HTTP/1.1 4"), "{head}");
+    assert_eq!(rig.http.get("/health").status, 200);
+}

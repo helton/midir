@@ -46,7 +46,7 @@ request's `model` picks one. Backend-specific setup: [backends/stackspot.md](bac
 ## Environment variables
 
 **The environment wins over the file**, so Docker and other machines override without editing it: `MIDIR_PORT`,
-`MIDIR_CONFIG`, `MIDIR_API_KEY`, `MIDIR_REQUESTS_PER_MINUTE`, `MIDIR_MAX_CONCURRENT`, `MIDIR_FOLLOWUPS`,
+`MIDIR_CONFIG`, `MIDIR_API_KEY`, `MIDIR_READ_TIMEOUT_S`, `MIDIR_REQUESTS_PER_MINUTE`, `MIDIR_MAX_CONCURRENT`, `MIDIR_FOLLOWUPS`,
 `OTEL_EXPORTER_OTLP_ENDPOINT`, the StackSpot credentials `STACKSPOT_REALM`, `STACKSPOT_CLIENT_ID`,
 `STACKSPOT_CLIENT_SECRET`, `STACKSPOT_CA_BUNDLE`, and the rest listed in `midir --help`. The queue limits and the
 `STACKSPOT_*` variables apply to every backend (of that type): a second StackSpot account goes in its own

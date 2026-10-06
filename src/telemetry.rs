@@ -612,6 +612,7 @@ impl Telemetry {
                 ("midir.tool_calls".into(), AttrValue::Int(resp.map_or(0, |r| r.tool_calls.len() as i64))),
                 ("midir.finish".into(), s(resp.map_or("error", |r| r.finish.as_str()))),
                 ("midir.followups".into(), AttrValue::Int(meta.followups)),
+                ("midir.followup_errors".into(), AttrValue::Int(meta.followup_errors)),
                 ("midir.parse_errors".into(), AttrValue::Int(meta.parse_errors)),
                 ("midir.repairs".into(), AttrValue::Int(meta.repairs)),
                 ("midir.upstream_calls".into(), AttrValue::Int(meta.upstream_calls)),

@@ -47,6 +47,9 @@ impl State {
     }
 }
 
+/// The longest pause a backend's `Retry-After` can impose.
+const MAX_RETRY_AFTER_S: f64 = 300.0;
+
 pub struct UpstreamLimiter {
     pub max_concurrent: i64,
     pub rpm: i64,
@@ -135,19 +138,27 @@ impl UpstreamLimiter {
         ((wait + 0.999) as i64).max(1)
     }
 
-    pub fn on_429(&self) {
+    /// The backend answered 429: pause new requests for the cooldown (or the backend's `Retry-After`, up to five
+    /// minutes, when longer) and halve the local budget, once per episode. Requests in flight that hit the same limit
+    /// in the same window only extend the pause: one burst on a shared account is one halving, not one per attempt.
+    pub fn on_429(&self, retry_after: Option<f64>) {
         let now = Instant::now();
         let mut st = self.lock();
-        let until = now + Duration::from_secs_f64(self.cooldown.max(0.0));
+        let pause = self.cooldown.max(0.0).max(retry_after.unwrap_or(0.0).clamp(0.0, MAX_RETRY_AFTER_S));
+        let until = now + Duration::from_secs_f64(pause);
         st.paused_until = Some(st.paused_until.map_or(until, |p| p.max(until)));
         if self.rpm > 0 {
+            let window = Duration::from_secs_f64(self.cooldown.max(1.0));
+            if st.budget.is_some() && now < st.budget_at + window {
+                tracing::debug!("{} 429 again within the same episode: pause extended to {pause:.0}s, budget unchanged", self.backend);
+                return;
+            }
             let b = (self.effective(&mut st, now) / 2).max(10);
             st.budget = Some(b);
             st.budget_at = now;
             tracing::warn!(
-                "{} 429: pausing {:.0}s and lowering the local budget to {b} requests/minute (recovers 1/min)",
-                self.backend,
-                self.cooldown
+                "{} 429: pausing {pause:.0}s and lowering the local budget to {b} requests/minute (recovers 1/min)",
+                self.backend
             );
         }
     }
@@ -251,7 +262,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_429_pauses_new_starts() {
         let lim = limiter(100, 2, 600.0, 15.0);
-        lim.on_429();
+        lim.on_429(None);
         let t = Instant::now();
         lim.start(lim.deadline()).await.unwrap();
         assert!(t.elapsed().as_secs_f64() >= 15.0);
@@ -263,11 +274,12 @@ mod tests {
         // another gateway or client on the same account shares the 100/min: after a 429 the local budget halves,
         // then grows back by one request per quiet minute
         let lim = limiter(90, 2, 600.0, 15.0);
-        lim.on_429();
+        lim.on_429(None);
         assert_eq!(lim.state()["effective_rpm"], 45);
-        lim.on_429();
+        tokio::time::advance(Duration::from_secs(16)).await; // a second episode
+        lim.on_429(None);
         let low = lim.state()["effective_rpm"].as_i64().unwrap();
-        assert!(low >= 10);
+        assert_eq!(low, 22);
         tokio::time::advance(Duration::from_secs(600)).await; // ten quiet minutes
         assert_eq!(lim.state()["effective_rpm"].as_i64().unwrap(), (low + 10).min(90));
         tokio::time::advance(Duration::from_secs(3600)).await;
@@ -296,5 +308,29 @@ mod tests {
         let t = Instant::now();
         let Error::Backend(e) = lim.acquire_slot(lim.deadline()).await.unwrap_err() else { panic!("not a queue timeout") };
         assert!(e.queue_timeout && (t.elapsed().as_secs_f64() - 2.0).abs() < 0.1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_429s_halve_the_budget_once() {
+        // review 2026-10-05 (F02): eight requests in flight hit the account's limit together; one episode, one halving
+        let lim = limiter(90, 8, 600.0, 15.0);
+        for _ in 0..8 {
+            lim.on_429(None);
+        }
+        assert_eq!(lim.state()["effective_rpm"], 45);
+        tokio::time::advance(Duration::from_secs(16)).await;
+        lim.on_429(None);
+        assert_eq!(lim.state()["effective_rpm"], 22);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_backends_retry_after_sets_a_longer_pause() {
+        // review 2026-10-05 (F03): the backend asks for 60 s; the cooldown is 15 s
+        let lim = limiter(90, 8, 600.0, 15.0);
+        lim.on_429(Some(60.0));
+        assert!(lim.state()["paused_s"].as_f64().unwrap() > 59.0, "{}", lim.state());
+        let lim = limiter(90, 8, 600.0, 15.0);
+        lim.on_429(Some(3600.0)); // capped at five minutes
+        assert!(lim.state()["paused_s"].as_f64().unwrap() <= 300.0);
     }
 }

@@ -22,7 +22,8 @@ OpenAI clients use `http://127.0.0.1:18880/v1`; Anthropic clients use `http://12
 
 All message roles; function tools with schemas, parallel calls (or one call with `parallel_tool_calls: false`) and
 results; `tool_choice` auto/none/required/named; streaming in each protocol's own event format; real token usage;
-errors in each protocol's format; `previous_response_id` chains that survive restarts (30 days, 500 MB cap) and
+errors in each protocol's format, with the HTTP status SDKs retry on also for a streaming request that fails before
+its first byte; `previous_response_id` chains that survive restarts (30 days, 500 MB cap) and
 `item_reference` to their output items.
 
 ## With caveats
@@ -35,9 +36,11 @@ Search the code for `CAVEAT` to find each of these.
 - **Automatic follow-ups**: a reply that only announces an action, denies an ability a tool provides, or leaves
   pending an action the user ordered gets a hidden follow-up (two at most) whose calls are appended to the same
   response. A follow-up only confirms a commit or a test run the user explicitly ordered (and did not forbid,
-  condition or keep for themselves); push, merge, deploy and install are never confirmed for the user. A reply that
-  reports a failed call (a 403 after trying the fetch tool) is left as it is, and no follow-up makes again a call
-  whose last two runs returned the same result. `followups = false` in `[server]` or a model (`MIDIR_FOLLOWUPS=0`)
+  condition or keep for themselves); push, merge, deploy and install are never confirmed for the user, and an
+  announcement that leaves the action to the user's approval ("assim que você confirmar"), or names one of those
+  actions or one the user forbade, is left as the answer. A reply that reports a failed call (a 403 after trying the
+  fetch tool) is left as it is, and no follow-up makes again a call (same tool, same arguments) whose last two runs
+  returned the same result. A follow-up whose backend call fails leaves the reply it followed as it was. `followups = false` in `[server]` or a model (`MIDIR_FOLLOWUPS=0`)
   turns these follow-ups off; a forced `tool_choice` is still asked for again.
 - Structured JSON is prompt + validation + one repair, not streamed incrementally.
 - `max_tokens` and `stop` are applied after generation; `count_tokens` is an estimate (4 characters per token).
@@ -54,8 +57,10 @@ Search the code for `CAVEAT` to find each of these.
 
 - Input up to **272,000 tokens**.
 - **100 requests per minute per account**, shared by every agent and client. Midir queues instead of failing
-  (`[backends.stackspot.limits]`: 8 concurrent, 90 per minute by default); a backend 429 pauses new requests and
-  halves the local budget, which recovers by one request per minute, so a second Midir or StackSpot's own chat on the
+  (`[backends.stackspot.limits]`: 8 concurrent, 90 per minute by default); a backend 429 pauses new requests (for
+  the cooldown, or the backend's `Retry-After` when longer, up to 5 minutes) and halves the local budget once per
+  episode (requests in flight that hit the same limit only extend the pause); the budget recovers by one request per
+  minute, so a second Midir or StackSpot's own chat on the
   same account is absorbed. Midir's own 429s carry `Retry-After`.
 - GPT 5.x counts its reasoning as output tokens; time to first byte is 1.5-8 s depending on prompt size and model.
 

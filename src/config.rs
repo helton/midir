@@ -88,6 +88,8 @@ pub struct ServerSettings {
     pub responses_retention_days: f64,
     pub responses_max_mb: f64,
     pub keepalive_s: f64,
+    /// a request's headers must arrive within this, and its body may not stall longer between chunks
+    pub read_timeout_s: f64,
     pub retry_backoff_s: f64,
     /// memory budget of the Responses cache (misses are rebuilt from disk)
     pub responses_memory_mb: f64,
@@ -203,6 +205,8 @@ struct ServerFile {
     responses_max_mb: Option<f64>,
     #[serde(deserialize_with = "num")]
     keepalive_s: Option<f64>,
+    #[serde(deserialize_with = "num")]
+    read_timeout_s: Option<f64>,
     #[serde(deserialize_with = "num")]
     retry_backoff_s: Option<f64>,
     #[serde(deserialize_with = "num")]
@@ -538,6 +542,7 @@ fn server_settings(f: &ServerFile, env: &EnvLookup, root: &Path) -> R<ServerSett
         responses_retention_days: env.parse("MIDIR_RESPONSES_RETENTION_DAYS")?.or(f.responses_retention_days).unwrap_or(30.0),
         responses_max_mb: env.parse("MIDIR_RESPONSES_MAX_MB")?.or(f.responses_max_mb).unwrap_or(500.0),
         keepalive_s: env.parse("MIDIR_KEEPALIVE_S")?.or(f.keepalive_s).unwrap_or(15.0),
+        read_timeout_s: env.parse("MIDIR_READ_TIMEOUT_S")?.or(f.read_timeout_s).unwrap_or(30.0),
         retry_backoff_s: env.parse("MIDIR_RETRY_BACKOFF_S")?.or(f.retry_backoff_s).unwrap_or(1.0),
         responses_memory_mb: env.parse("MIDIR_RESPONSES_MEMORY_MB")?.or(f.responses_memory_mb).unwrap_or(64.0),
         shutdown_grace_s: env.parse("MIDIR_SHUTDOWN_GRACE_S")?.or(f.shutdown_grace_s).unwrap_or(25.0),

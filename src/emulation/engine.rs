@@ -153,6 +153,12 @@ fn act_request(req: &CanonicalRequest, reply: &Reply, history: &[(String, String
     } else if followups::promise_only(req, &reply.resp, &reply.text, &reply.calls) {
         // CAVEAT: the model announced an action and stopped without a <tool_call>
         let confirm = followups::redundant_confirmation(req, &reply.text);
+        if confirm.is_none()
+            && let Some(action) = followups::announces_guarded(req, &reply.text)
+        {
+            tracing::info!("response announces '{action}', which a follow-up never makes for the user; the reply stands");
+            return None;
+        }
         let note = confirm.map_or(String::new(), |c| format!(" [asked to confirm '{c}', already requested]"));
         tracing::warn!("response only announces an action without a tool call; requesting the calls{note}");
         let prompt = match confirm {
@@ -179,6 +185,12 @@ fn act_request(req: &CanonicalRequest, reply: &Reply, history: &[(String, String
     follow.add_text("assistant", &reply.text);
     follow.add_text("user", &prompt);
     Some(FollowUp { req: follow, suffix: format!("{suffix}{again}"), prompt })
+}
+
+/// A follow-up whose backend call failed: counted and logged; the reply it followed stands as it is.
+fn followup_failed(req: &CanonicalRequest, rid: &str, suffix: &str, e: &Error) {
+    req.meta().followup_errors += 1;
+    tracing::warn!("{rid}/{suffix} follow-up failed ({e}); the reply stands");
 }
 
 /// `parallel_tool_calls: false`: the first call goes through, later ones are dropped (and counted).
@@ -283,7 +295,15 @@ impl EmulationEngine {
                 let mut usage = None;
                 let mut s = this.stream_once(Arc::new(follow.req), format!("{rid}/{}", follow.suffix));
                 while let Some(ev) = s.next().await {
-                    match ev? {
+                    let ev = match ev {
+                        Ok(ev) => ev,
+                        Err(e) => {
+                            // a follow-up is an improvement on a reply already given: its failure leaves that reply
+                            followup_failed(&req, &rid, &follow.suffix, &e);
+                            break;
+                        }
+                    };
+                    match ev {
                         Event::ToolCall(c) => {
                             if gate.open() && filter.accept(&c) && gate.pass() {
                                 reply.calls.push(c.clone());
@@ -308,9 +328,18 @@ impl EmulationEngine {
                 let prompt = follow.prompt;
                 let mut next = Reply::default();
                 let mut repeated = 0;
+                let mut failed = false;
                 let mut s = this.stream_once(Arc::new(follow.req), format!("{rid}/{}", follow.suffix));
                 while let Some(ev) = s.next().await {
-                    match ev? {
+                    let ev = match ev {
+                        Ok(ev) => ev,
+                        Err(e) => {
+                            followup_failed(&req, &rid, &follow.suffix, &e);
+                            failed = true;
+                            break;
+                        }
+                    };
+                    match ev {
                         Event::ToolCall(c) => {
                             if followups::repeats_itself(&req, &c) {
                                 repeated += 1;
@@ -326,6 +355,10 @@ impl EmulationEngine {
                 }
                 drop(s);
                 reply.resp.usage = add_usage(&reply.resp.usage, Some(next.resp.usage));
+                if failed {
+                    reply.calls.extend(next.calls.iter().cloned());
+                    break;
+                }
                 if repeated > 0 {
                     // CAVEAT: the same call already returned the same result twice in this turn; asking for it again
                     // is a loop the client cannot leave
@@ -394,6 +427,9 @@ impl EmulationEngine {
             let (normalized, errs) = check_json(&reply.text, &schema);
             if let Some(n) = normalized {
                 resp.text = n;
+            } else if resp.finish == Finish::Length {
+                // the client's max_tokens cut the JSON: a repair under the same cap would be cut again
+                resp.text = reply.text;
             } else {
                 let joined = errs.join("; ");
                 tracing::warn!("{rid} invalid JSON ({}); one repair attempt", prefix(&joined, 200));
@@ -410,14 +446,22 @@ impl EmulationEngine {
                     "user",
                     &format!("Your previous response was not valid: {}. Respond again with only the JSON value, no fences, no prose.", prefix(&joined, 500)),
                 );
-                let mut repaired = collect(this.stream_once(Arc::new(repair), format!("{rid}/repair"))).await?;
-                let (normalized, errs) = check_json(&repaired.text, &schema);
-                repaired.usage = resp.usage.add(&repaired.usage);
-                match normalized {
-                    Some(n) => repaired.text = n,
-                    None => tracing::error!("{rid} JSON still invalid after repair: {}", prefix(&errs.join("; "), 200)),
+                match collect(this.stream_once(Arc::new(repair), format!("{rid}/repair"))).await {
+                    Ok(mut repaired) => {
+                        let (normalized, errs) = check_json(&repaired.text, &schema);
+                        repaired.usage = resp.usage.add(&repaired.usage);
+                        match normalized {
+                            Some(n) => repaired.text = n,
+                            None => tracing::error!("{rid} JSON still invalid after repair: {}", prefix(&errs.join("; "), 200)),
+                        }
+                        resp = repaired;
+                    }
+                    Err(e) => {
+                        // the same outcome as a repair that stays invalid: the model's text as it was
+                        followup_failed(&req, &rid, "repair", &e);
+                        resp.text = reply.text;
+                    }
                 }
-                resp = repaired;
             }
             if !resp.text.is_empty() {
                 yield Event::Text(resp.text.clone());

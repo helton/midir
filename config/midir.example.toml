@@ -12,6 +12,7 @@ tool_desc_max = 0            # truncate tool descriptions to N chars (0 = off): 
 followups = true             # hidden follow-ups for replies that announce an action without its call, deny an ability a
                              # tool provides, or forget an ordered commit (false = the reply is returned as the model wrote it)
 keepalive_s = 15             # an idle stream gets an SSE keepalive this often (0 = off)
+read_timeout_s = 30          # a request's headers must arrive within this; its body may not stall longer between chunks
 responses_dir = "data/gateway/responses"   # previous_response_id store (one small file per response, owner-only); "" = memory only
 responses_retention_days = 30   # fixed from creation; purged hourly; a later previous_response_id to a purged response gets a 404
 responses_max_mb = 500          # above this, blobs no response uses go first, then the oldest responses
