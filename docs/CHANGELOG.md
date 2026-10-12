@@ -3,6 +3,13 @@
 All notable changes are listed here. Versions follow [Semantic Versioning](https://semver.org/); before 1.0.0 a minor
 release may change configuration or behavior.
 
+## Unreleased
+
+- **StackSpot errors after an empty answer**: when an agent fails, StackSpot may send the final event first (no tokens)
+  and its error message after it ("An unexpected error occurred, please try again later.", seen with a Gemini 3
+  agent); clients got an empty answer with 200. It is now the backend's error: a 502 `upstream_500` with that message,
+  and a FAIL in `midir check --agents`.
+
 ## 0.2.0 (2026-10-06)
 
 Fixes from a full review of the project (2026-10-05), a compact tool listing and `midir check`:

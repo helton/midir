@@ -395,3 +395,26 @@ fn an_event_with_a_lone_surrogate_keeps_its_text() {
     let r = chat(&rig);
     assert_eq!(r.json()["choices"][0]["message"]["content"], format!("ok {} done", char::REPLACEMENT_CHARACTER));
 }
+
+#[test]
+fn an_error_after_an_empty_final_event_is_an_error() {
+    // 2026-10-12, a Gemini 3 agent: StackSpot sent the final event with 0 tokens, then its error message; clients got
+    // an empty answer with 200
+    let rig = Rig::new();
+    let broken = "data: {\"stop_reason\": \"stop\", \"tokens\": {\"input\": 0, \"output\": 0}, \"message_id\": \"m1\"}\n\n\
+                  data: {\"message\": \"An unexpected error occurred, please try again later.\", \"tokens\": {}}\n\n";
+    for stream in [false, true] {
+        rig.upstream.add(Reply::raw(broken));
+        let r = rig.http.post("/v1/chat/completions", &json!({"model": "gpt-5.1", "messages": user("hi"), "stream": stream}));
+        assert_eq!(r.status, 502, "{}", r.text);
+        assert!(r.text.contains("An unexpected error occurred"), "{}", r.text);
+    }
+    // an answer that is really empty stays an empty answer
+    rig.upstream.add(Reply::raw("data: {\"stop_reason\": \"stop\", \"tokens\": {\"input\": 0, \"output\": 0}}\n\n"));
+    let r = rig.http.post("/v1/chat/completions", &json!({"model": "gpt-5.1", "messages": user("hi")}));
+    assert_eq!(r.status, 200, "{}", r.text);
+    // text after a normal final event is not an error
+    rig.upstream.add(Reply::raw("data: {\"message\": \"Hello!\"}\n\ndata: {\"stop_reason\": \"stop\", \"tokens\": {\"input\": 5, \"output\": 2}}\n\ndata: {\"message\": \"late\"}\n\n"));
+    let r = rig.http.post("/v1/chat/completions", &json!({"model": "gpt-5.1", "messages": user("hi")}));
+    assert_eq!((r.status, s(&r.json()["choices"][0]["message"]["content"]).to_string()), (200, "Hello!".to_string()), "{}", r.text);
+}

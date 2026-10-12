@@ -325,7 +325,7 @@ impl StackSpotBackend {
                 Err(e) => return Err(e),
             }
         };
-        Ok(read_sse(r, slot))
+        Ok(read_sse(r, slot, self.name.clone()))
     }
 }
 
@@ -485,7 +485,9 @@ fn parse_line(line: &str) -> Line {
             return Line::Skip;
         }
     };
-    if ev.stop_reason.is_some() || ev.tokens.is_some() {
+    // `"tokens": {}` alone is no final event: StackSpot's error message after one carries it
+    let counted = ev.tokens.as_ref().is_some_and(|t| t.as_object().is_none_or(|m| !m.is_empty()));
+    if ev.stop_reason.is_some() || counted {
         let message_id = ev.message_id.as_ref().and_then(Value::as_str).map(String::from);
         return Line::Done(Completion { usage: usage_from(ev.tokens.as_ref()), message_id });
     }
@@ -502,12 +504,68 @@ fn parse_line(line: &str) -> Line {
 
 /// SSE events: deltas carry only `message`; the final one carries stop_reason, message_id and tokens. The slot is
 /// released when the stream is dropped.
-fn read_sse(r: reqwest::Response, slot: crate::limiter::SlotGuard) -> ItemStream {
+/// Where an event stream stands: text seen, and a final event held back because it came first with nothing in it.
+#[derive(Default)]
+struct Answer {
+    texted: bool,
+    done: bool,
+    /// a final event with no text before it and no tokens: StackSpot's error message may follow it
+    held: Option<Completion>,
+}
+
+impl Answer {
+    /// What one parsed line gives the client: items, or the error StackSpot reported after an empty final event (seen
+    /// with a Gemini agent: `stop_reason` with 0 tokens, then "An unexpected error occurred, please try again later.").
+    fn take(&mut self, line: Line, backend: &str) -> Result<Vec<Item>, Error> {
+        match line {
+            Line::Item(Item::Text(t)) if self.done => {
+                if self.held.is_some() && !t.trim().is_empty() {
+                    let body = serde_json::json!({"message": t});
+                    return Err(Error::Backend(Box::new(BackendError::new(500, body, "agent", backend))));
+                }
+                if !t.is_empty() {
+                    tracing::warn!("text after the final event ignored ({} chars)", t.chars().count());
+                }
+                Ok(vec![])
+            }
+            Line::Item(i) => {
+                if matches!(&i, Item::Text(t) if !t.is_empty()) {
+                    self.texted = true;
+                }
+                Ok(vec![i])
+            }
+            Line::Done(c) => {
+                self.done = true;
+                let empty = c.usage.is_none_or(|u| u.prompt_tokens == 0 && u.completion_tokens == 0);
+                if !self.texted && empty {
+                    self.held = Some(c);
+                    return Ok(vec![]);
+                }
+                Ok(vec![Item::Completion(c)])
+            }
+            Line::Skip => Ok(vec![]),
+        }
+    }
+
+    /// The end of the stream: the held final event, or one made up when none came.
+    fn end(&mut self) -> Option<Item> {
+        if let Some(c) = self.held.take() {
+            return Some(Item::Completion(c));
+        }
+        if !self.done {
+            tracing::warn!("stream ended without a final event");
+            return Some(Item::Completion(Completion::default()));
+        }
+        None
+    }
+}
+
+fn read_sse(r: reqwest::Response, slot: crate::limiter::SlotGuard, backend: String) -> ItemStream {
     Box::pin(async_stream::try_stream! {
         let _slot = slot;
         let mut body = r.bytes_stream();
         let mut lines = Lines::default();
-        let mut done = false;
+        let mut answer = Answer::default();
         loop {
             let chunk = match body.next().await {
                 Some(Ok(c)) => c,
@@ -523,29 +581,18 @@ fn read_sse(r: reqwest::Response, slot: crate::limiter::SlotGuard) -> ItemStream
                 }))?;
             }
             for line in lines.feed(&chunk) {
-                match parse_line(&line) {
-                    Line::Item(i) => yield i,
-                    Line::Done(c) => {
-                        done = true;
-                        yield Item::Completion(c);
-                    }
-                    Line::Skip => {}
+                for item in answer.take(parse_line(&line), &backend)? {
+                    yield item;
                 }
             }
         }
         for line in lines.finish() {
-            match parse_line(&line) {
-                Line::Item(i) => yield i,
-                Line::Done(c) => {
-                    done = true;
-                    yield Item::Completion(c);
-                }
-                Line::Skip => {}
+            for item in answer.take(parse_line(&line), &backend)? {
+                yield item;
             }
         }
-        if !done {
-            tracing::warn!("stream ended without a final event");
-            yield Item::Completion(Completion::default());
+        if let Some(item) = answer.end() {
+            yield item;
         }
     })
 }
@@ -583,6 +630,7 @@ mod tests {
         assert!(
             matches!(parse_line("data: {\"tokens\": {\"input\": \"7\", \"output\": 2}}"), Line::Done(c) if c.usage == Some(Usage::new(7, 2)))
         );
+        assert!(matches!(parse_line("data: {\"message\": \"failed\", \"tokens\": {}}"), Line::Item(Item::Text(t)) if t == "failed"));
         for skipped in ["data: [1]", "data: nope", "event: x", "data: {\"message\": {\"a\": 1}}", "data: {\"message\": null}"] {
             assert!(matches!(parse_line(skipped), Line::Skip), "{skipped}");
         }
