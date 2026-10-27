@@ -46,7 +46,11 @@ Notes
   quality gain. o4-mini, gpt-4.1-mini and o3-mini fail the hard task. The Tool-Oriented planner adds 50% latency.
 - StackSpot's own agents of the account (named "flex" and "ai codegen" here) run GPT 4.1 with their own system prompts
   and can be exposed too (`STACKSPOT_FLEX_AGENT_ID`). Measured: "flex" finishes agent tasks as well as GPT 5.1 at
-  about twice the speed; "ai codegen" is less reliable.
+  about twice the speed; "ai codegen" is less reliable. "flex" cuts the opening `<tool_call ...>` tag off about half
+  of the replies that start with a call (the stream begins with `\n{"name": ...` or with a tail of the tag such as
+  `_call id="call_1">`; a second call in the same reply keeps its tag; measured 2026-10-26 by replaying one prompt to
+  the agent directly: 2 of 4). The parser puts the tag back (`parser.rs`, `cut_open`), so such a reply is a call and
+  not text that ends the session after its first turn (25 of 90 bench sessions did, before).
 - The "API integration" tab of the portal (Return Knowledge Sources, Keep conversation, ...) only affects StackSpot's
   own chat; it does not change the Agent API Midir uses.
 - Credentials: a Client Key (client id/secret) of the realm, stored in `.env`.

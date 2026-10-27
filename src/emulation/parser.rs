@@ -18,6 +18,11 @@ static LOOKS_LIKE_CALL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#""(name|arguments|parameters|input|tool|function)"\s*:"#).unwrap());
 static SALVAGE_NAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""name"\s*:\s*"([^"]+)""#).unwrap());
 static SALVAGE_ARGS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""(?:arguments|parameters|input)"\s*:\s*"#).unwrap());
+/// What may stand before the JSON of a call whose opening tag the backend cut: nothing, or the tail of the tag
+/// (`_call id="call_1">`, `_1">`).
+static CUT_TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"^\s*(?:[\w"=.\- ]{0,30}>)?\s*$"#).unwrap());
+/// A reply start that may still turn out to be such a tail (nothing decided before the first `{` or more text)
+static CUT_TAG_SO_FAR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"^\s*[\w"=.\- ]{0,30}>?\s*$"#).unwrap());
 
 /// The text without a surrounding Markdown code fence (```json ... ```).
 pub fn strip_fences(s: &str) -> String {
@@ -62,6 +67,36 @@ struct Scan {
     escaped: bool,
 }
 
+/// Whether a reply opens with a call whose `<tool_call ...>` tag the backend cut off: StackSpot's Flex agent
+/// delivers about half of the replies that start with a call as `\n{"name": ...}\n</tool_call>` or with a tail of
+/// the tag (`_call id="call_1">`), while a second call in the same reply keeps its tag (2026-10-26, 25 of 90 bench
+/// sessions ended on the first turn with the call passed on as text).
+enum CutOpen {
+    /// the tag was cut: the JSON starts at this byte offset
+    Call(usize),
+    /// too little text to tell
+    Wait,
+    No,
+}
+
+/// `buf` is the whole reply so far, nothing sent yet.
+fn cut_open(buf: &str) -> CutOpen {
+    let Some(k) = buf.find('{') else {
+        return if buf.chars().count() < 40 && CUT_TAG_SO_FAR_RE.is_match(buf) { CutOpen::Wait } else { CutOpen::No };
+    };
+    if !CUT_TAG_RE.is_match(&buf[..k]) {
+        return CutOpen::No;
+    }
+    let body = &buf[k..];
+    if LOOKS_LIKE_CALL_RE.is_match(body) {
+        CutOpen::Call(k)
+    } else if body.chars().count() < 80 {
+        CutOpen::Wait
+    } else {
+        CutOpen::No
+    }
+}
+
 impl ToolCallParser {
     pub fn new(tools: Arc<[ToolSpec]>) -> Self {
         ToolCallParser {
@@ -79,11 +114,33 @@ impl ToolCallParser {
         }
     }
 
+    /// Nothing sent yet in a reply that may hold calls: where a cut opening tag can still be put back.
+    fn at_start(&self) -> bool {
+        !self.saw_call && !self.text_since_call && !self.tools.is_empty()
+    }
+
+    /// The reply opens with the JSON of a call (at byte `k`) whose tag was cut: the tag goes back in its place.
+    fn put_tag_back(&mut self, k: usize) {
+        self.buf.replace_range(..k, "<tool_call>");
+        self.in_call = true;
+        self.errors.push("a call without its opening tag (put back)".into());
+    }
+
     pub fn feed(&mut self, delta: &str) -> Vec<Parsed> {
         self.buf.push_str(delta);
         let mut out = vec![];
         loop {
             if !self.in_call {
+                if self.at_start() {
+                    match cut_open(&self.buf) {
+                        CutOpen::Call(k) => {
+                            self.put_tag_back(k);
+                            continue;
+                        }
+                        CutOpen::Wait => return out,
+                        CutOpen::No => {}
+                    }
+                }
                 // `</tool_call>` where a call should open, followed by its JSON: the model wrote the wrong tag
                 let open_at = self.buf.find(OPEN_TAG);
                 let mut stray_hold = None;
@@ -201,6 +258,9 @@ impl ToolCallParser {
 
     pub fn finish(&mut self) -> Vec<Parsed> {
         let mut out = vec![];
+        if !self.in_call && self.at_start() && let CutOpen::Call(k) = cut_open(&self.buf) {
+            self.put_tag_back(k);
+        }
         if self.in_call && self.buf.contains(CLOSE_TAG) {
             // CAVEAT: no `</tool_call>` outside a string (an unescaped quote in the JSON): the first one ends the block
             self.lenient = true;
@@ -476,6 +536,8 @@ mod tests {
             Just("<tool_cal".to_string()),
             Just("</tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"s\"}}\n</tool_call>".to_string()),
             Just("</tool_call>".to_string()),
+            Just("\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"s\"}}\n</tool_call>".to_string()),
+            Just("_call id=\"call_1\">\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"s\"}}\n</tool_call>".to_string()),
             Just("<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"a\nb\"}}\n</tool_call>".to_string()),
             Just(
                 "<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"doc </tool_call> \\\"q\\\" end\"}}\n</tool_call>"
@@ -490,6 +552,31 @@ mod tests {
             let text: String = pieces.concat();
             prop_assert_eq!(meaning(&text, &cuts), meaning(&text, &[]));
         }
+    }
+
+    #[test]
+    fn a_call_whose_opening_tag_was_cut_is_still_a_call() {
+        // StackSpot's Flex agent: the reply starts with the JSON, or with the tail of the tag
+        let json = "{\"name\": \"read_file\", \"arguments\": {\"path\": \"tests/test_cli.py\"}}";
+        for reply in [
+            format!("\n{json}\n</tool_call>"),
+            format!("_call id=\"call_1\">\n{json}\n</tool_call>"),
+            format!("_1\">\n{json}\n</tool_call>"),
+            format!("{json}\n</tool_call>\n<tool_call id=\"call_2\">\n{json}\n</tool_call>"),
+            format!("\n{json}"), // the close tag cut too (the stream ended)
+        ] {
+            for cuts in [vec![], vec![1], vec![3, 9, 30], vec![2, 14, 15, 16, 17, 60, 61, 62]] {
+                let m = meaning(&reply, &cuts);
+                assert!(m.iter().all(|e| e.starts_with("call:read_file:")) && !m.is_empty(), "{reply:?} cuts {cuts:?}: {m:?}");
+            }
+        }
+        // text that merely opens with a brace, or a JSON answer with no tools offered, stays text
+        assert_eq!(meaning("{\"total\": 3} is the answer", &[]), vec!["text:{\"total\": 3} is the answer"]);
+        assert_eq!(meaning("All tests pass.", &[2, 5]), vec!["text:All tests pass."]);
+        let mut p = ToolCallParser::new(vec![].into());
+        let mut events = p.feed("{\"name\": \"x\"}");
+        events.extend(p.finish());
+        assert!(matches!(events.as_slice(), [Parsed::Text(t)] if t == "{\"name\": \"x\"}"), "{events:?}");
     }
 
     #[test]

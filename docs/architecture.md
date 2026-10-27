@@ -20,7 +20,7 @@ client ──HTTP──▶ protocols ──CanonicalRequest──▶ gateway (ro
    | Module | Role |
    |---|---|
    | `emulation/prompt.rs` | conversation, tools and output format rendered as one prompt; above the cap the oldest turns are dropped, then the largest tool results and messages cut in the middle (computed in linear time) |
-   | `emulation/parser.rs` | incremental parser of `<tool_call>` blocks in the model's text (tolerant of raw control characters and trailing commas) |
+   | `emulation/parser.rs` | incremental parser of `<tool_call>` blocks in the model's text (tolerant of raw control characters, trailing commas, a call opened with the close tag, and a cut opening tag) |
    | `emulation/followups.rs` | detectors for replies that need an automatic follow-up (announce and stop, false incapacity, redundant confirmation), what the user's latest instructions order or forbid, and the calls a follow-up must not make again |
    | `emulation/jsonmode.rs` | JSON output validation and repair |
    | `emulation/output.rs` | stop sequences and `max_tokens` applied to the streamed text |
