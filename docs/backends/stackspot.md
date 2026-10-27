@@ -50,7 +50,10 @@ Notes
   of the replies that start with a call (the stream begins with `\n{"name": ...` or with a tail of the tag such as
   `_call id="call_1">`; a second call in the same reply keeps its tag; measured 2026-10-26 by replaying one prompt to
   the agent directly: 2 of 4). The parser puts the tag back (`parser.rs`, `cut_open`), so such a reply is a call and
-  not text that ends the session after its first turn (25 of 90 bench sessions did, before).
+  not text that ends the session after its first turn (25 of 90 bench sessions did, before). The same agent also
+  drops whole replies: 0 characters delivered with 130-4096 output tokens counted (19 of 471 calls; gpt-5.1: 6 of
+  2564); replaying the prompt gives the reply, so the engine asks once more when a reply is empty with output
+  tokens counted.
 - The "API integration" tab of the portal (Return Knowledge Sources, Keep conversation, ...) only affects StackSpot's
   own chat; it does not change the Agent API Midir uses.
 - Credentials: a Client Key (client id/secret) of the realm, stored in `.env`.

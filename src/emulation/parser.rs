@@ -258,7 +258,10 @@ impl ToolCallParser {
 
     pub fn finish(&mut self) -> Vec<Parsed> {
         let mut out = vec![];
-        if !self.in_call && self.at_start() && let CutOpen::Call(k) = cut_open(&self.buf) {
+        if !self.in_call
+            && self.at_start()
+            && let CutOpen::Call(k) = cut_open(&self.buf)
+        {
             self.put_tag_back(k);
         }
         if self.in_call && self.buf.contains(CLOSE_TAG) {

@@ -303,7 +303,9 @@ async fn upstream_handler(State(state): State<Arc<Mutex<UpstreamState>>>, uri: U
         let chars: Vec<char> = reply.text.chars().collect();
         let mut evs: Vec<Value> = chars.chunks(reply.chunk.max(1)).map(|c| json!({"message": c.iter().collect::<String>()})).collect();
         evs.push(reply.final_event.clone().unwrap_or_else(|| {
-            json!({"stop_reason": "stop", "message_id": "up-msg-1", "tokens": {"input": prompt.chars().count() / 4, "output": (chars.len() / 4).max(1)}})
+            // an empty reply counts no output tokens: one that counts some was dropped on the way (the engine asks again)
+            let output = if chars.is_empty() { 0 } else { (chars.len() / 4).max(1) };
+            json!({"stop_reason": "stop", "message_id": "up-msg-1", "tokens": {"input": prompt.chars().count() / 4, "output": output}})
         }));
         evs
     });

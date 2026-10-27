@@ -192,6 +192,26 @@ fn tool_choice_required_retry_has_no_empty_assistant_turn() {
 }
 
 #[test]
+fn an_empty_reply_that_counts_output_tokens_is_asked_once_more() {
+    // StackSpot's Flex agent drops about 4% of the replies on the way (0 characters, output tokens counted)
+    let rig = Rig::new();
+    let dropped = Reply::text("").final_event(json!({"stop_reason": "stop", "message_id": "up-1", "tokens": {"input": 100, "output": 132}}));
+    rig.upstream.add(dropped).add(tool_call_text("read_file", json!({"path": "a.py"})));
+    let r = chat(&rig, json!({"tools": chat_tools()}));
+    assert_eq!(r["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(r["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "read_file");
+    assert_eq!(rig.upstream.prompts().len(), 2);
+    assert_eq!(rig.upstream.prompt(0), rig.upstream.prompt(1), "the same prompt, asked again");
+    // asked once: a second drop is the empty reply it is
+    let rig = Rig::new();
+    let drop = || Reply::text("").final_event(json!({"stop_reason": "stop", "message_id": "up-1", "tokens": {"input": 100, "output": 9}}));
+    rig.upstream.add(drop()).add(drop()).add("never asked");
+    let r = chat(&rig, json!({"tools": chat_tools()}));
+    assert_eq!(r["choices"][0]["message"]["content"], "");
+    assert_eq!(rig.upstream.prompts().len(), 2);
+}
+
+#[test]
 fn named_tool_choice_in_prompt() {
     let rig = Rig::new();
     rig.upstream.add(tool_call_text("run_command", json!({"command": "ls"})));

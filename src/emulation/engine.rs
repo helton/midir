@@ -543,7 +543,8 @@ impl EmulationEngine {
                     Err(e) => Err(e)?,
                 }
             }
-            let (head, stream) = opened.unwrap_or((None, None));
+            let (mut head, mut stream) = opened.unwrap_or((None, None));
+            for round in 1..=2 {
             let mut parser = ToolCallParser::new(req.tools.clone());
             let mut limiter = OutputLimiter::new(req.stop.clone(), req.max_tokens.map(|m| (m as f64 * CHARS_PER_TOKEN) as usize));
             let mut calls: Vec<ToolCall> = vec![];
@@ -552,8 +553,8 @@ impl EmulationEngine {
             let mut received = 0usize;
             let mut first = true;
             let mut stopped = false;
-            if let Some(head) = head {
-                let mut stream = stream;
+            if let Some(head) = head.take() {
+                let mut stream = stream.take();
                 let mut next: Option<Item> = Some(head);
                 while let Some(item) = next.take() {
                     match item {
@@ -625,6 +626,22 @@ impl EmulationEngine {
                 tracing::warn!("{rid} parser: {}", parser.errors.join("; "));
                 req.meta().parse_errors += parser.errors.len() as i64;
             }
+            // CAVEAT: a reply that arrives empty while the backend counts output tokens was generated and dropped on
+            // the way (StackSpot's Flex agent: 4% of calls; gpt-5.1: 0.2%; replaying the prompt gives the reply):
+            // asked once more, as nothing went to the client
+            let generated = final_.usage.as_ref().map_or(0, |u| u.completion_tokens);
+            if round == 1 && received == 0 && calls.is_empty() && generated > 0 {
+                tracing::warn!("{rid} empty reply with {generated} output tokens reported: asking once more");
+                req.meta().upstream_calls += 1;
+                let mut s = this.backend.stream(&prompt, &target, Some(req.meta.clone())).await?;
+                head = match s.next().await {
+                    Some(Ok(item)) => Some(item),
+                    Some(Err(e)) => Err(e)?,
+                    None => None,
+                };
+                stream = Some(s);
+                continue;
+            }
             let finish = if !calls.is_empty() && limiter.finish == Finish::Stop { Finish::ToolCalls } else { limiter.finish };
             let usage = match final_.usage {
                 Some(u) => u,
@@ -648,6 +665,8 @@ impl EmulationEngine {
             };
             tracing::info!("{rid} ok in {:.1}s, {emitted} chars, {} tool calls, finish={finish}, usage={}", t0.elapsed().as_secs_f64(), calls.len(), resp.usage);
             yield Event::Done(resp);
+            break;
+            }
         });
         self.telemetry.trace_call(call, &meta, self.backend.kind(), &label)
     }
