@@ -20,7 +20,7 @@ static SALVAGE_NAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""name"\
 static SALVAGE_ARGS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""(?:arguments|parameters|input)"\s*:\s*"#).unwrap());
 /// What may stand before the JSON of a call whose opening tag the backend cut: nothing, or the tail of the tag
 /// (`_call id="call_1">`, `_1">`).
-static CUT_TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"^\s*(?:[\w"=.\- ]{0,30}>)?\s*$"#).unwrap());
+static CUT_TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"^\s*(?:[\w"=.\- ]{0,30}>|_\w{0,8}"?)?\s*$"#).unwrap());
 /// A reply start that may still turn out to be such a tail (nothing decided before the first `{` or more text)
 static CUT_TAG_SO_FAR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"^\s*[\w"=.\- ]{0,30}>?\s*$"#).unwrap());
 
@@ -565,6 +565,7 @@ mod tests {
             format!("\n{json}\n</tool_call>"),
             format!("_call id=\"call_1\">\n{json}\n</tool_call>"),
             format!("_1\">\n{json}\n</tool_call>"),
+            format!("_1\n{json}\n</tool_call>"), // the cut took the `>` too
             format!("{json}\n</tool_call>\n<tool_call id=\"call_2\">\n{json}\n</tool_call>"),
             format!("\n{json}"), // the close tag cut too (the stream ended)
         ] {
