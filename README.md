@@ -132,7 +132,7 @@ Ready-to-use configurations live in [examples/clients/](examples/clients/):
 
 | Client | API | Configuration |
 |---|---|---|
-| **Claude Code** | Anthropic Messages | [`claude-code/settings.json`](examples/clients/claude-code/settings.json): Opus, Sonnet and Haiku mapped to gpt-5.1, flex and gpt-4.1 |
+| **Claude Code** | Anthropic Messages | [`claude-code/`](examples/clients/claude-code/): Opus, Sonnet and Haiku mapped to gpt-5.1, flex and gpt-4.1; run it with `--tools Read,Edit,Write,Bash,Grep,Glob` (see its README) |
 | **GitHub Copilot** (VS Code) | OpenAI Responses | [`copilot/`](examples/clients/copilot/): one provider with every model |
 | **Hermes Agent** | Chat Completions | [`hermes/`](examples/clients/hermes/) |
 | **DeepSeek Harness** (`dsh`) | Chat Completions | [`deepseek-harness/`](examples/clients/deepseek-harness/) |
@@ -141,6 +141,13 @@ Ready-to-use configurations live in [examples/clients/](examples/clients/):
 Validated end to end with Claude Code, GitHub Copilot CLI, Hermes Agent, DeepSeek Harness and OpenClaw on every
 model (multi-file edits, test runs and commits); GitHub Copilot in VS Code is in daily use. Agents running on top of
 Midir can read [docs/agent-brief.md](docs/agent-brief.md) to learn what the emulation means for them.
+
+**Fewer tools, same work.** Every tool a client offers is listed in every prompt, and the model pays for the listing
+on every step. Measured on 270 Claude Code sessions per model (15 coding tasks, 3 runs): starting Claude Code with
+`--tools Read,Edit,Write,Bash,Grep,Glob` (the six a coding task uses, instead of its ~24) cuts input tokens by
+56% on gpt-5.1 at the same score, by 62% on gpt-4.1 with 11 points more tasks passed, and by 60% on flex; the
+compact tool listing (`tool_schema = "compact"`) takes another 10-27%. Nothing else measured (best-of-3 sessions,
+tests written first, skills, hooks, a judge model) raised gpt-5.1's score on those tasks.
 
 ## Configuration
 

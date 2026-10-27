@@ -53,7 +53,9 @@ default) lists each tool as one line of JSON with its schema. `tool_schema = "co
 `### name` heading, its description and one line per parameter (`- path (string, required): description`, nested
 fields indented); what that form cannot say (`$ref`, `allOf`, ...) stays JSON Schema. The descriptions are the same in
 both forms, so the gain is the schema syntax: about 10% fewer tokens in the tool listing of Copilot's 75 tools (5-8%
-of the whole prompt). Set it in `[server]`, per model, or with `MIDIR_TOOL_SCHEMA`. `tool_desc_max` cuts
+of the whole prompt). Set it in `[server]`, per model, or with `MIDIR_TOOL_SCHEMA`. The larger saving is on the
+client's side: a client that offers fewer tools (Claude Code with `--tools Read,Edit,Write,Bash,Grep,Glob`) sends
+half the input tokens for the same work; see [examples/clients/claude-code/](../examples/clients/claude-code/). `tool_desc_max` cuts
 descriptions in both forms.
 
 ## Environment variables
