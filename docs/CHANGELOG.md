@@ -21,6 +21,9 @@ out of that bench:
 - **Docs: fewer tools in Claude Code** (`--tools Read,Edit,Write,Bash,Grep,Glob`): the one change that paid on
   every model, measured on 270 sessions per model: -56% input tokens on gpt-5.1 at the same score, -62% and +11 points pass on gpt-4.1, -60% on flex. Test-time compute (best of 3, tests first), skills,
   hooks and a judge did not raise gpt-5.1's score on these tasks.
+- **Dependencies**: rustls 0.23.46, rustls-webpki 0.103.16, webpki-root-certs 1.0.11 and tokio 1.54.1, for the
+  RustSec advisories 2026-0346..0349, 0382, 0383 and 0386 (the TLS client and the runtime; none reachable from
+  Midir's use, but `cargo deny` gates the release).
 - **StackSpot errors after an empty answer**: when an agent fails, StackSpot may send the final event first (no tokens)
   and its error message after it ("An unexpected error occurred, please try again later.", seen with a Gemini 3
   agent); clients got an empty answer with 200. It is now the backend's error: a 502 `upstream_500` with that message,
