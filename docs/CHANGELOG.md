@@ -3,8 +3,24 @@
 All notable changes are listed here. Versions follow [Semantic Versioning](https://semver.org/); before 1.0.0 a minor
 release may change configuration or behavior.
 
-## Unreleased
+## 0.2.1 (2026-10-27)
 
+Two transport defects of StackSpot's Flex agent, measured on a 90-session bench (15 coding tasks, 3 runs; the same
+sessions passed 30/45 before and 39/45 after, ahead of gpt-4.1 on the same tasks), and the recommendation that came
+out of that bench:
+- **A call whose opening tag the backend cut is still a call**: the Flex agent delivers about half of the replies
+  that start with a tool call without the opening `<tool_call ...>` tag (the stream begins with the JSON, or with
+  a tail of the tag such as `_call id="call_1">`), while a second call in the same reply keeps its tag. The parser
+  took the JSON as text and Claude Code ended the session after its first turn (25 of 90 sessions). Nothing sent to
+  the client yet and the reply opening with an object that names a tool: the tag is put back (at most 40 characters
+  held before the first brace). Not seen with the gpt-5.1 or gpt-4.1 agents.
+- **An empty reply that counts output tokens is asked once more**: the Flex agent drops about 4% of the replies on
+  the way (0 characters delivered, 130-4096 output tokens counted; gpt-5.1: 0.2%); replaying the prompt gives the
+  reply. Nothing went to the client, so the backend is asked once more with the same prompt; a second empty reply
+  is the empty reply it is.
+- **Docs: fewer tools in Claude Code** (`--tools Read,Edit,Write,Bash,Grep,Glob`): the one change that paid on
+  every model, measured on 270 sessions per model: -56% input tokens on gpt-5.1 at the same score, -62% and +11 points pass on gpt-4.1, -60% on flex. Test-time compute (best of 3, tests first), skills,
+  hooks and a judge did not raise gpt-5.1's score on these tasks.
 - **StackSpot errors after an empty answer**: when an agent fails, StackSpot may send the final event first (no tokens)
   and its error message after it ("An unexpected error occurred, please try again later.", seen with a Gemini 3
   agent); clients got an empty answer with 200. It is now the backend's error: a 502 `upstream_500` with that message,
