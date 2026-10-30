@@ -3,7 +3,7 @@
 All notable changes are listed here. Versions follow [Semantic Versioning](https://semver.org/); before 1.0.0 a minor
 release may change configuration or behavior.
 
-## Unreleased
+## 0.3.0 (2026-10-30)
 
 - **MCP server with web tools** (`[mcp] enabled = true`, `POST /mcp` on the same port, the Streamable HTTP
   transport without sessions): `web_search`, answered by a backend agent that has the platform's web tools
