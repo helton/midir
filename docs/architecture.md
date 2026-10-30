@@ -34,6 +34,7 @@ Around them:
 | `store.rs` | the Responses API store for `previous_response_id`: a memory cache capped by bytes, where a response shares its history with the one it continues, and one JSON file per response with content-addressed blobs (disk work on the blocking pool) |
 | `telemetry.rs`, `otlp.rs` | a SERVER span per request with a CLIENT child per backend call, and a few metrics, exported over OTLP/HTTP protobuf (hand-written encoder, no SDK) or served at `/metrics` |
 | `app.rs` | HTTP routes, errors in each protocol's format, the optional API key, SSE keepalive, `/health`, `/ready` and `/metrics`, panics turned into a 500 or an error event |
+| `mcp/` | `POST /mcp`: an MCP server (JSON-RPC over HTTP, stateless) with `web_search` (asked of a backend agent that has the platform's web tools) and `web_fetch` (a page downloaded by Midir, its HTML reduced to text by `mcp/html.rs`, the agent as the fallback for pages that need a browser) |
 | `main.rs`, `buildinfo.rs`, `log.rs` | the `midir` command (clap): arguments, banner, `.env` (dotenvy), build identification, logging (tracing, `MIDIR_LOG`), graceful stop |
 | `json.rs` | what JSON clients send made decodable (lone UTF-16 surrogates, `NaN`), tolerant decoding of model JSON, and the JSON text Midir writes into prompts |
 | `text.rs` | character-based string helpers |

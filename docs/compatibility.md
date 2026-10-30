@@ -15,6 +15,7 @@ emulation works inside: [architecture.md](architecture.md). What it means for an
 | `GET /health` | version, model mapping, backends and their queues, the Responses memory cache (liveness) |
 | `GET /ready` | each backend's readiness: credentials, network and TLS, without spending model quota (503 on failure) |
 | `GET /metrics` | the metrics in Prometheus format, with `[telemetry] prometheus = true` |
+| `POST /mcp` | an MCP server (Streamable HTTP, stateless) with the `web_search` and `web_fetch` tools, with `[mcp] enabled = true` ([configuration.md](configuration.md#mcp-web-tools)) |
 
 OpenAI clients use `http://127.0.0.1:18880/v1`; Anthropic clients use `http://127.0.0.1:18880`.
 

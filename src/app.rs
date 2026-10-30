@@ -28,6 +28,7 @@ use crate::emulation::prompt::render_prompt;
 use crate::errors::{ClientError, Error};
 use crate::gateway::Gateway;
 use crate::json;
+use crate::mcp::Mcp;
 use crate::protocols::common::RequestInfo;
 use crate::protocols::responses::Envelope;
 use crate::protocols::{chat_completions, messages, responses};
@@ -289,9 +290,16 @@ struct Prepared {
 
 pub struct App {
     pub gateway: Arc<Gateway>,
+    /// `POST /mcp`, when `[mcp]` is on
+    pub mcp: Option<Arc<Mcp>>,
 }
 
 impl App {
+    pub fn new(gateway: Arc<Gateway>) -> App {
+        let mcp = Mcp::new(&gateway.config, &gateway.backends);
+        App { gateway, mcp }
+    }
+
     fn error_response(&self, flavor: Flavor, e: Error, rid: Option<&str>) -> Response {
         let error_body = |flavor, status, message: &str, typ, code: Option<&str>| error_body_for(flavor, status, message, typ, code, rid);
         match e {
@@ -388,7 +396,8 @@ impl App {
             200,
             &json!({"ok": true, "version": buildinfo::full_version(), "build": buildinfo::build().as_json(), "config": cfg.source, "default": cfg.default.name,
                     "models": self.gateway.describe_models(), "backends": backends, "responses_cache": self.gateway.store.stats(),
-                    "protocols": ["chat-completions", "responses", "messages"]}),
+                    "protocols": ["chat-completions", "responses", "messages"],
+                    "mcp": self.mcp.as_ref().map_or(json!({"enabled": false}), |m| json!({"enabled": true, "tools": m.tool_names()}))}),
         )
     }
 
@@ -569,6 +578,25 @@ async fn model(State(app): AppState, headers: HeaderMap, Path(id): Path<String>)
     app.model(&headers, &id)
 }
 
+/// `POST /mcp`: a JSON-RPC message (or batch) in, its reply out; a notification gets a 202 with no body.
+async fn mcp_post(State(app): AppState, raw: Bytes) -> Response {
+    let Some(mcp) = &app.mcp else {
+        return json_response(
+            404,
+            &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32601, "message": "MCP is off: set [mcp] enabled = true (or MIDIR_MCP=true) in Midir's configuration"}}),
+        );
+    };
+    match mcp.handle(&raw).await {
+        (status, Some(body)) => json_response(status, &body),
+        (status, None) => Response::builder().status(status).body(Body::empty()).unwrap_or_default(),
+    }
+}
+
+/// The transport's other methods: no server-initiated streams (GET) and no sessions to end (DELETE).
+async fn mcp_other() -> Response {
+    Response::builder().status(405).header("allow", "POST").body(Body::empty()).unwrap_or_default()
+}
+
 async fn embeddings(State(app): AppState) -> Response {
     let e = ClientError::with_status(
         "embeddings are not available: no configured backend provides them (this gateway serves /v1/chat/completions, /v1/responses and /v1/messages)",
@@ -680,6 +708,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/responses/{id}", get(get_response))
         .route("/v1/messages", post(create_message))
         .route("/v1/messages/count_tokens", post(count_tokens))
+        .route("/mcp", post(mcp_post).get(mcp_other).delete(mcp_other))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(app.clone(), authorize))

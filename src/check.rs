@@ -212,6 +212,24 @@ pub async fn run(env: indexmap::IndexMap<String, String>, root: &Path, dotenv: O
         r.row(key, &value, &from);
     }
 
+    r.section("MCP (POST /mcp)");
+    let m = &cfg.mcp;
+    let agent = match &m.web_agent {
+        Some(a) => format!("{}:{}", m.backend, gw.backends.get(&m.backend).map_or(a.clone(), |b| b.describe_target(a))),
+        None => "- (web_search off, web_fetch without fallback)".into(),
+    };
+    let rows = [
+        ("enabled", "MIDIR_MCP", m.enabled.to_string()),
+        ("web_agent", "MIDIR_MCP_WEB_AGENT", agent),
+        ("fetch_max_chars", "MIDIR_MCP_FETCH_MAX_CHARS", m.fetch_max_chars.to_string()),
+        ("timeout_s", "MIDIR_MCP_TIMEOUT_S", num(m.timeout_s)),
+        ("ca_bundle", "MIDIR_MCP_CA_BUNDLE", m.ca_bundle.clone().unwrap_or_else(|| "-".into())),
+    ];
+    for (key, var, value) in rows {
+        let from = source(var, &["mcp", key]);
+        r.row(key, &value, &from);
+    }
+
     for (name, b) in &gw.backends {
         r.section(&format!("Backend {name} ({})", b.kind()));
         for (key, var, value) in b.options() {
@@ -276,6 +294,9 @@ pub async fn run(env: indexmap::IndexMap<String, String>, root: &Path, dotenv: O
         Ok(()) => r.ok("every backend that serves a model has its credentials"),
         Err(e) => r.fail(&e.to_string()),
     }
+    if cfg.mcp.enabled && cfg.mcp.web_agent.is_none() {
+        r.warn("mcp: no web_agent ([mcp] web_agent or MIDIR_MCP_WEB_AGENT): web_search is not offered");
+    }
     match &cfg.server.responses_dir {
         Some(d) => match ResponseStore::probe(d) {
             None => r.ok(&format!("responses store: {} is writable", d.display())),
@@ -298,6 +319,28 @@ pub async fn run(env: indexmap::IndexMap<String, String>, root: &Path, dotenv: O
     if !opts.agents {
         r.skip("agents: not asked (midir check --agents sends each model one short prompt, from the account's quota)");
         return finish(r);
+    }
+    if let (true, Some(agent)) = (cfg.mcp.enabled, cfg.mcp.web_agent.clone()) {
+        let mcp = crate::mcp::Mcp::new(&cfg, &gw.backends);
+        let t0 = Instant::now();
+        match mcp {
+            Some(mcp) => {
+                match tokio::time::timeout(Duration::from_secs_f64(cfg.mcp.timeout_s), mcp.web_search("StackSpot AI documentation", 3))
+                    .await
+                {
+                    Ok(Ok((_, found))) if found > 0 => {
+                        r.ok(&format!("mcp web_search: the web agent found {found} results ({:.1} s)", t0.elapsed().as_secs_f64()))
+                    }
+                    Ok(Ok((text, _))) => r.fail(&format!(
+                        "mcp web_search: no URL in the web agent's reply ({:?}); has it the web search tool?",
+                        prefix(text.trim(), 120)
+                    )),
+                    Ok(Err(e)) => r.fail(&format!("mcp web_search ({}): {}", prefix(&agent, 6), prefix(&describe(&e), 400))),
+                    Err(_) => r.fail(&format!("mcp web_search: no answer within {} s", cfg.mcp.timeout_s)),
+                }
+            }
+            None => r.skip("mcp: off"),
+        }
     }
     let mut asked: Vec<(String, String)> = vec![];
     for m in cfg.exposed_models() {

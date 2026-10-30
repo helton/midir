@@ -58,11 +58,65 @@ client's side: a client that offers fewer tools (Claude Code with `--tools Read,
 half the input tokens for the same work; see [examples/clients/claude-code/](../examples/clients/claude-code/). `tool_desc_max` cuts
 descriptions in both forms.
 
+## MCP: web tools
+
+Claude Code's own web search runs on Anthropic's servers and never works through Midir; Copilot's depends on the
+editor. With `[mcp]` on, Midir serves an MCP server on the same port, `POST /mcp` (the Streamable HTTP transport,
+stateless: no sessions, no server-initiated streams), with two tools:
+
+- **`web_search(query, max_results)`**: answered by `web_agent`, a backend agent that has the platform's own web
+  tools (StackSpot: an agent with **Web Search** and **Web Extraction**, set up as in
+  [backends/stackspot.md](backends/stackspot.md#web-tools-agent)). The search leaves from the platform, not from your
+  network: no proxy, certificate, anti-bot wall or API key to deal with. Midir asks for distinct URLs, removes the
+  tracking parameter the agent appends and the duplicates, and returns one `title | url | snippet` line per result.
+  A search takes 30-45 s on a gpt-5.1 agent. Keep that agent on gpt-5.1: measured 2026-10-30, gpt-4.1 answered in
+  5-15 s with one or two invented URLs out of five per query, gpt-5.1 with 10 of 10 real.
+- **`web_fetch(url, max_chars)`**: the page downloaded by Midir itself, through the same proxy and trust store as the
+  backends (`HTTPS_PROXY`, the system store, `SSL_CERT_FILE`, `[mcp] ca_bundle`), so internal pages (a wiki, an
+  artifact registry) work too; HTML is reduced to its main content as text, cut at `fetch_max_chars` with a note
+  (2 MB downloaded at most, 0.1-0.8 s). A page that is built by JavaScript, or that Midir cannot reach (a proxy's
+  403), is read by `web_agent` instead, and the text says so. A 404 or a binary file is an error for the model.
+
+Why an agent and not a search engine: without an API key, none survives a corporate network. Measured 2026-10-30
+from such a network: DuckDuckGo and Brave answer 403, Bing's RSS answers results unrelated to the query (a bot
+wall), Mojeek 403, Google a consent page; SearXNG only aggregates those same engines.
+
+```toml
+[mcp]
+enabled = true
+web_agent = "${STACKSPOT_WEB_TOOLS_AGENT_ID}"   # optional: without it, web_fetch alone, with no fallback
+# backend = "stackspot"          # the backend that serves web_agent (the only one when there is one)
+# fetch_max_chars = 8000
+# timeout_s = 90
+# ca_bundle = "/etc/ssl/certs/corporate-ca.pem"
+```
+
+Environment: `MIDIR_MCP`, `MIDIR_MCP_WEB_AGENT`, `MIDIR_MCP_FETCH_MAX_CHARS`, `MIDIR_MCP_TIMEOUT_S`,
+`MIDIR_MCP_CA_BUNDLE`. `GET /health` shows `mcp.tools`; `midir check` shows the settings and, with `--agents`,
+runs one search on the web agent. Calls go through the backend's queue like any request and are logged
+(`mcp web_search "...": 5 results (41.2 s)`); with `MIDIR_API_KEY` set, `/mcp` wants the key like the APIs
+(clients send it as a header).
+
+Clients ([examples/clients/](../examples/clients/)):
+
+```bash
+claude mcp add --transport http midir http://127.0.0.1:18880/mcp        # Claude Code (user scope), or a .mcp.json
+```
+
+```jsonc
+// VS Code: .vscode/mcp.json (Copilot agent mode), or the user's mcp.json
+{"servers": {"midir": {"type": "http", "url": "http://127.0.0.1:18880/mcp"}}}
+```
+
+Every tool a client offers is listed in every prompt (see [Tool listing](#tool-listing)); these are two short ones.
+Measured end to end (Claude Code on gpt-5.1 through Midir, 2026-10-30): "find the reqwest 0.13 release notes and
+read them" took 3 turns and 40 s.
+
 ## Environment variables
 
 **The environment wins over the file**, so Docker and other machines override without editing it: `MIDIR_PORT`,
 `MIDIR_CONFIG`, `MIDIR_API_KEY`, `MIDIR_READ_TIMEOUT_S`, `MIDIR_REQUESTS_PER_MINUTE`, `MIDIR_MAX_CONCURRENT`, `MIDIR_FOLLOWUPS`,
-`OTEL_EXPORTER_OTLP_ENDPOINT`, the StackSpot credentials `STACKSPOT_REALM`, `STACKSPOT_CLIENT_ID`,
+`OTEL_EXPORTER_OTLP_ENDPOINT`, `MIDIR_MCP` and `MIDIR_MCP_WEB_AGENT`, the StackSpot credentials `STACKSPOT_REALM`, `STACKSPOT_CLIENT_ID`,
 `STACKSPOT_CLIENT_SECRET`, `STACKSPOT_CA_BUNDLE`, and the rest listed in `midir --help`. The queue limits and the
 `STACKSPOT_*` variables apply to every backend (of that type): a second StackSpot account goes in its own
 `[backends.<name>]` options, with those variables unset.

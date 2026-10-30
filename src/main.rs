@@ -45,12 +45,14 @@ const DETAILS: &str = "Endpoints (http://<host>:<port>)
   GET  /v1/models                 configured models (unknown names go to the default model)
   GET  /health, GET /ready        liveness (mapping, queues) and readiness (backend credentials and network)
   GET  /metrics                   Prometheus metrics (with [telemetry] prometheus = true)
+  POST /mcp                       MCP server (Streamable HTTP): web_search and web_fetch tools (with [mcp] enabled = true)
 
 Configuration: config/midir.toml under the working directory (or MIDIR_CONFIG=<path>); format in
 config/midir.example.toml. Secrets live in .env (working directory) and are referenced as ${NAME}. Environment
 variables win over the file: MIDIR_PORT, MIDIR_API_KEY, MIDIR_MAX_PROMPT_CHARS, MIDIR_TAIL_REMINDER,
 MIDIR_TOOL_DESC_MAX, MIDIR_TOOL_SCHEMA, MIDIR_FOLLOWUPS, MIDIR_RESPONSES_DIR, MIDIR_RESPONSES_RETENTION_DAYS, MIDIR_RESPONSES_MAX_MB,
 MIDIR_RESPONSES_MEMORY_MB, MIDIR_KEEPALIVE_S, MIDIR_READ_TIMEOUT_S, MIDIR_RETRY_BACKOFF_S, MIDIR_SHUTDOWN_GRACE_S, MIDIR_PROMETHEUS,
+MIDIR_MCP, MIDIR_MCP_WEB_AGENT, MIDIR_MCP_FETCH_MAX_CHARS, MIDIR_MCP_TIMEOUT_S, MIDIR_MCP_CA_BUNDLE,
 OTEL_EXPORTER_OTLP_ENDPOINT (or _TRACES_ENDPOINT and _METRICS_ENDPOINT), OTEL_EXPORTER_OTLP_HEADERS,
 OTEL_SERVICE_NAME, OTEL_RESOURCE_ATTRIBUTES; for every backend, MIDIR_MAX_CONCURRENT, MIDIR_REQUESTS_PER_MINUTE,
 MIDIR_QUEUE_TIMEOUT, MIDIR_COOLDOWN_ON_429 and MIDIR_MAX_WAITING; for every StackSpot backend, STACKSPOT_REALM, STACKSPOT_CLIENT_ID,
@@ -298,9 +300,10 @@ async fn run(args: Args, cwd: PathBuf) -> ExitCode {
         .collect();
     let backends: Vec<String> = gw.backends.iter().map(|(n, b)| format!("{n} ({})", b.kind())).collect();
     tracing::info!(
-        "midir {} at http://{}:{port}/v1 (chat/completions, responses, messages); config {}; backends {}; default {}; models: {} (max prompt {} chars)",
+        "midir {} at http://{}:{port}/v1 (chat/completions, responses, messages){}; config {}; backends {}; default {}; models: {} (max prompt {} chars)",
         buildinfo::full_version(),
         args.host,
+        if cfg.mcp.enabled { " and /mcp (web tools)" } else { "" },
         cfg.source,
         backends.join(", "),
         cfg.default.name,
@@ -326,7 +329,7 @@ async fn run(args: Args, cwd: PathBuf) -> ExitCode {
         });
     }
     // "/v1/chat/completions/" is "/v1/chat/completions"
-    let service = NormalizePathLayer::trim_trailing_slash().layer(app::router(Arc::new(app::App { gateway: gw.clone() })));
+    let service = NormalizePathLayer::trim_trailing_slash().layer(app::router(Arc::new(app::App::new(gw.clone()))));
     let read_timeout = Duration::from_secs_f64(cfg.server.read_timeout_s.max(0.1));
     // a body that stalls longer than the read timeout between chunks ends the request
     let service = tower_http::timeout::RequestBodyTimeoutLayer::new(read_timeout).layer(service);

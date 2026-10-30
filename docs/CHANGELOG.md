@@ -3,6 +3,22 @@
 All notable changes are listed here. Versions follow [Semantic Versioning](https://semver.org/); before 1.0.0 a minor
 release may change configuration or behavior.
 
+## Unreleased
+
+- **MCP server with web tools** (`[mcp] enabled = true`, `POST /mcp` on the same port, the Streamable HTTP
+  transport without sessions): `web_search`, answered by a backend agent that has the platform's web tools
+  (StackSpot: an agent with Web Search and Web Extraction, `web_agent = "${STACKSPOT_WEB_TOOLS_AGENT_ID}"`), so the
+  search leaves from the platform and needs no proxy, certificate or API key; the agent's results come back one
+  `title | url | snippet` line per distinct URL, without the tracking parameter it appends. `web_fetch`, the page
+  downloaded by Midir itself through the backends' proxy and trust store (internal pages too), its HTML reduced to
+  the main content as text and cut at `fetch_max_chars`; a page built by JavaScript or out of Midir's reach is
+  read by the web agent, and the text says so. Settings `backend`, `fetch_max_chars`, `timeout_s`, `ca_bundle`
+  (`MIDIR_MCP_*`); `GET /health` lists the tools; `midir check` shows the settings and, with `--agents`, runs one
+  search. Why an agent: measured from a corporate network, no key-free search engine answers (DuckDuckGo, Brave,
+  Mojeek 403; Bing's RSS a bot wall; Google a consent page); why gpt-5.1 on it: gpt-4.1 invented one or two URLs
+  out of five per query. Client examples: `claude mcp add --transport http midir http://127.0.0.1:18880/mcp`,
+  `examples/clients/claude-code/.mcp.json`, `examples/clients/copilot/mcp.json`.
+
 ## 0.2.1 (2026-10-27)
 
 Two transport defects of StackSpot's Flex agent, measured on a 90-session bench (15 coding tasks, 3 runs; the same

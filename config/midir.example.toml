@@ -28,6 +28,20 @@ retry_backoff_s = 1             # first wait before retrying a backend 429 or 5x
 service_name = "midir"
 prometheus = false                           # GET /metrics in Prometheus format, for setups without an OTLP collector
 
+# ---- MCP: web tools for agents without web access (docs/configuration.md#mcp-web-tools) ----
+# POST /mcp on the same port (MCP Streamable HTTP, no sessions): web_search, answered by a StackSpot agent that has
+# the platform's Web Search and Web Extraction tools, and web_fetch, a page downloaded by Midir itself (same proxy
+# and trust store as the backends, so internal pages work) and reduced to text; that agent reads the pages that
+# need a browser. Each tool is listed in every prompt of the client: turn it on when the work needs the web.
+
+[mcp]
+enabled = false
+web_agent = "${STACKSPOT_WEB_TOOLS_AGENT_ID}"   # without it, web_search is not offered and web_fetch has no fallback
+# backend = "stackspot"          # the backend that serves web_agent (the only backend, when there is one)
+# fetch_max_chars = 8000         # where web_fetch cuts a page's text, unless the call says otherwise
+# timeout_s = 90                 # the longest a tool call may take (the agent needs 30-45 s for a search)
+# ca_bundle = "/etc/ssl/certs/corporate-ca.pem"   # a CA for web_fetch that the system store lacks
+
 # ---- backends: what serves the models (one today: StackSpot AI agents, docs/backends/stackspot.md) ----
 
 [backends.stackspot]

@@ -126,6 +126,23 @@ pub struct ServerSettings {
     pub api_key: Option<String>,
 }
 
+/// `[mcp]`: the MCP endpoint (`POST /mcp`) with the web tools.
+#[derive(Debug, Clone)]
+pub struct McpSettings {
+    pub enabled: bool,
+    /// the backend that serves `web_agent`
+    pub backend: String,
+    /// the target (StackSpot: agent id) of an agent with the platform's web search and web extraction tools; without
+    /// it `web_search` is not offered and `web_fetch` has no fallback
+    pub web_agent: Option<String>,
+    /// `web_fetch` cuts a page's text here unless the call says otherwise
+    pub fetch_max_chars: i64,
+    /// the longest a tool call may take (a web agent needs 30-40 s for a search)
+    pub timeout_s: f64,
+    /// a PEM bundle added to the trusted roots for `web_fetch` (corporate TLS)
+    pub ca_bundle: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TelemetrySettings {
     pub otlp_endpoint: String,
@@ -153,6 +170,7 @@ pub struct Config {
     pub source: String,
     pub server: ServerSettings,
     pub telemetry: TelemetrySettings,
+    pub mcp: McpSettings,
     pub backends: IndexMap<String, BackendSettings>,
     pub models: Vec<Arc<ModelSpec>>,
     pub default: Arc<ModelSpec>,
@@ -217,8 +235,23 @@ struct FileConfig {
     default_model: Option<String>,
     server: ServerFile,
     telemetry: TelemetryFile,
+    mcp: McpFile,
     backends: IndexMap<String, BackendFile>,
     models: Vec<ModelFile>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct McpFile {
+    #[serde(deserialize_with = "flag")]
+    enabled: Option<bool>,
+    backend: Option<String>,
+    web_agent: Option<String>,
+    #[serde(deserialize_with = "num")]
+    fetch_max_chars: Option<i64>,
+    #[serde(deserialize_with = "num")]
+    timeout_s: Option<f64>,
+    ca_bundle: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -388,12 +421,14 @@ impl Config {
             prometheus: lookup.flag("MIDIR_PROMETHEUS")?.or(file.telemetry.prometheus).unwrap_or(false),
         };
         let backends = backend_settings(file.backends, &lookup)?;
+        let mcp = mcp_settings(&file.mcp, &lookup, &backends)?;
         let mut cfg = Config {
             env: env.clone(),
             config_file,
             source: if is_file { file_name } else { "env".into() },
             server,
             telemetry,
+            mcp,
             backends,
             models: vec![],
             default: Arc::new(ModelSpec::simple("", "", "", "")),
@@ -550,6 +585,33 @@ impl Config {
             followups: spec.followups.unwrap_or(s.followups),
         }
     }
+}
+
+/// `[mcp]`: off unless `enabled` (or MIDIR_MCP) says so. `web_agent` (MIDIR_MCP_WEB_AGENT) is the target of an agent
+/// with the platform's web tools on `backend` (the only backend when there is one).
+fn mcp_settings(f: &McpFile, env: &EnvLookup, backends: &IndexMap<String, BackendSettings>) -> R<McpSettings> {
+    let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let web_agent = clean(env.str("MIDIR_MCP_WEB_AGENT").or_else(|| f.web_agent.clone()));
+    let backend = match clean(f.backend.clone()) {
+        Some(b) => b,
+        None => backends.keys().next().cloned().unwrap_or_default(),
+    };
+    let settings = McpSettings {
+        enabled: env.flag("MIDIR_MCP")?.or(f.enabled).unwrap_or(false),
+        backend,
+        web_agent,
+        fetch_max_chars: env.parse("MIDIR_MCP_FETCH_MAX_CHARS")?.or(f.fetch_max_chars).unwrap_or(8000),
+        timeout_s: env.parse("MIDIR_MCP_TIMEOUT_S")?.or(f.timeout_s).unwrap_or(90.0),
+        ca_bundle: clean(env.str("MIDIR_MCP_CA_BUNDLE").or_else(|| f.ca_bundle.clone())),
+    };
+    if settings.web_agent.is_some() && !backends.contains_key(&settings.backend) {
+        let mut names: Vec<&str> = backends.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        return Err(ConfigError(format!("[mcp] backend must be one of {} (got {:?})", names.join(", "), settings.backend)));
+    }
+    in_range("[mcp] fetch_max_chars", settings.fetch_max_chars as f64, 200.0, "at least 200")?;
+    in_range("[mcp] timeout_s", settings.timeout_s, f64::MIN_POSITIVE, "above 0")?;
+    Ok(settings)
 }
 
 /// Environment overrides: a set, non-empty variable wins over the file.

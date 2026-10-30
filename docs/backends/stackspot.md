@@ -58,6 +58,22 @@ Notes
   own chat; it does not change the Agent API Midir uses.
 - Credentials: a Client Key (client id/secret) of the realm, stored in `.env`.
 
+## Web tools agent
+
+For `[mcp]` (`docs/configuration.md#mcp-web-tools`): one more agent, cloned from the gpt-5.1 one, with the
+platform's **Web Search** and **Web Extraction** tools enabled, its id in `STACKSPOT_WEB_TOOLS_AGENT_ID`. Keep the
+web tools out of the agents that serve models: a model with web search in its own system prompt searches when it
+should not, and pays the tool's instructions on every step. Measured 2026-10-30 (3 runs per agent and task):
+
+| agent | model | search | fetch | URLs verified |
+|---|---|---|---|---|
+| Web Search + Web Extraction | gpt-5.1 | 26-43 s | 12-17 s | 10 of 10 real |
+| the two tools in separate agents | gpt-5.1 | 31-39 s | 12-17 s | the same (no measurable difference) |
+| Web Search + Web Extraction | gpt-4.1 | 5-16 s | 8-11 s | 1-2 of 5 invented per query (404 blog posts, forum ids of other threads) |
+
+The agent appends `?utm_source=stackspot` to every URL (Midir removes it) and, asked for N results without the word
+"distinct", repeats the same page; Midir's prompt asks for distinct URLs and drops the duplicates that remain.
+
 ## Measured API contract
 
 What the gateway relies on, measured against the live API (2026-09/10):

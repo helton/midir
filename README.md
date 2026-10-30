@@ -45,6 +45,9 @@ side), and the request's `model` picks which one answers.
   lenient JSON parsing and a repair round for broken calls, so agents run multi-step tasks end to end.
 - **Agents that finish the job**: hidden follow-ups when a model announces an action without doing it, with strict
   rules: never confirming for the user what they did not order, never looping on a failed call.
+- **Web for agents that have none**: an MCP server on the same port with `web_search` (a backend agent that has
+  the platform's web tools, so the search leaves from the platform, not from your network) and `web_fetch` (pages
+  read by Midir through your proxy and certificates, internal ones included, reduced to text).
 - **Built for shared quotas**: a queue per backend with concurrency and rate limits, backoff on 429, and keepalives
   for backends that take a minute to start.
 - **Observable**: OpenTelemetry traces and metrics, a ready-made Grafana dashboard and a proxy view of every request
@@ -148,6 +151,14 @@ on every step. Measured on 270 Claude Code sessions per model (15 coding tasks, 
 56% on gpt-5.1 at the same score, by 62% on gpt-4.1 with 11 points more tasks passed, and by 60% on flex; the
 compact tool listing (`tool_schema = "compact"`) takes another 10-27%. Nothing else measured (best-of-3 sessions,
 tests written first, skills, hooks, a judge model) raised gpt-5.1's score on those tasks.
+
+**Web access, when the work needs it.** Claude Code's web search runs on Anthropic's servers and cannot go through
+Midir, and no key-free search engine survives a corporate proxy. With `[mcp] enabled = true`, Midir serves
+`POST /mcp` next to the APIs, with two tools: `web_search`, answered by a StackSpot agent that has the platform's Web
+Search and Web Extraction tools (30-45 s, real URLs on gpt-5.1), and `web_fetch`, the page read by Midir itself
+through the same proxy and trust store as the backends (internal pages too, 0.1-0.8 s) and by that agent when the
+page needs a browser. One line connects a client: `claude mcp add --transport http midir http://127.0.0.1:18880/mcp`,
+or `.vscode/mcp.json` for Copilot. Details: [docs/configuration.md](docs/configuration.md#mcp-web-tools).
 
 ## Configuration
 

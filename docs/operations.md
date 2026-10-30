@@ -96,6 +96,11 @@ when a check fails.
   examples); images become placeholders on purpose.
 - **A setting is "unknown ... ignored"**: a typo, or the running build is older than the setting; check the version in
   `GET /health` (and the registry mirror note above).
+- **`POST /mcp` answers 404**: `[mcp] enabled` is off (or `MIDIR_MCP`); with it on, `GET /health` lists `mcp.tools`.
+  `web_search` missing from the list: no `web_agent`. A `web_search` whose results have no URL, or that invents
+  them: the agent lacks the Web Search tool, or runs gpt-4.1 (keep it on gpt-5.1). `web_fetch` reading every page
+  "by the web agent": Midir's own client cannot leave the network (proxy credentials in `HTTPS_PROXY`, the CA in
+  `SSL_CERT_FILE` or `[mcp] ca_bundle`); `midir check` shows the proxy variables it sees.
 - **Corporate TLS**: Midir trusts the system's certificate store (and `SSL_CERT_FILE`); for a CA that is not there,
   set `STACKSPOT_CA_BUNDLE` to a PEM bundle with it (added to the trusted roots). Cargo itself honors
   `CARGO_HTTP_CAINFO`.

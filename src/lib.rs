@@ -16,6 +16,7 @@ pub mod gateway;
 pub mod json;
 pub mod limiter;
 pub mod log;
+pub mod mcp;
 pub mod otlp;
 pub mod protocols;
 pub mod store;

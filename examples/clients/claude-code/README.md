@@ -31,6 +31,27 @@ a first session, skills and hooks with extra instructions, a judge model on the 
 of fully specified tasks on its own; what it still loses is the odd early stop ("Continuing to inspect the other
 modules...") and the fewer tools do not change that.
 
+## Web search and fetch through Midir
+
+Claude Code's built-in WebSearch runs on Anthropic's servers and never works through Midir; WebFetch does, but
+only in Claude Code. With `[mcp] enabled = true` on the Midir side (and a StackSpot agent with the Web Search and
+Web Extraction tools in `STACKSPOT_WEB_TOOLS_AGENT_ID`, see `docs/configuration.md`), Midir serves the `web_search`
+and `web_fetch` tools over MCP on its own port. Connect once:
+
+```bash
+claude mcp add --transport http midir http://127.0.0.1:18880/mcp
+# with MIDIR_API_KEY set on Midir:
+claude mcp add --transport http midir http://127.0.0.1:18880/mcp --header "Authorization: Bearer <key>"
+```
+
+or put `.mcp.json` from this folder in the project (`claude --mcp-config .mcp.json` for one session). The tools
+appear as `mcp__midir__web_search` and `mcp__midir__web_fetch`; the six-tools alias above keeps working, since
+`--tools` filters the built-in tools only. Two short tool descriptions are added to every prompt: connect the
+server for the projects whose work needs the web.
+
+Measured 2026-10-30 (gpt-5.1 through Midir): "find the reqwest 0.13 release notes and read them" took 3 turns and 40 s,
+with one `web_search` (28 s) and one `web_fetch` (0.6 s).
+
 ## Which model for what
 
 - **gpt-5.1** (Opus): long autonomous and multi-file tasks. The quality reference.
