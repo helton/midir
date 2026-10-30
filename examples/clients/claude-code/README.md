@@ -44,10 +44,13 @@ claude mcp add --transport http midir http://127.0.0.1:18880/mcp
 claude mcp add --transport http midir http://127.0.0.1:18880/mcp --header "Authorization: Bearer <key>"
 ```
 
-or put `.mcp.json` from this folder in the project (`claude --mcp-config .mcp.json` for one session). The tools
-appear as `mcp__midir__web_search` and `mcp__midir__web_fetch`; the six-tools alias above keeps working, since
-`--tools` filters the built-in tools only. Two short tool descriptions are added to every prompt: connect the
-server for the projects whose work needs the web.
+Servers cannot go in `settings.json`; that command stores it in `~/.claude.json` for the current project
+(`--scope user`: for every project, since Midir is always at the same address). Per project instead: `.mcp.json`
+from this folder at the project root, with `"enableAllProjectMcpServers": true` in the project's
+`.claude/settings.local.json` so it loads without the approval prompt; or `--mcp-config .mcp.json` in the alias,
+for one session at a time. The tools appear as `mcp__midir__web_search` and `mcp__midir__web_fetch`; the six-tools
+alias above keeps working, since `--tools` filters the built-in tools only. Two short tool descriptions are added
+to every prompt: connect the server for the projects whose work needs the web.
 
 Measured 2026-10-30 (gpt-5.1 through Midir): "find the reqwest 0.13 release notes and read them" took 3 turns and 40 s,
 with one `web_search` (28 s) and one `web_fetch` (0.6 s).
