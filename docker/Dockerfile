@@ -6,7 +6,7 @@
 # variables (compose env_file) and config/midir.toml as a compose config.
 
 # pinned by digest (Dependabot updates it); the tag must match rust-toolchain.toml's channel (CI checks it)
-FROM rust:1.99.0-alpine@sha256:0cce0a5e0e8ba67b455257a3a02a1d99005f382748789d6464460028810f1627 AS build
+FROM rust:1.100.0-alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33 AS build
 # make: jemalloc (the allocator) is built from source
 RUN apk add --no-cache musl-dev make ca-certificates tzdata
 WORKDIR /src
